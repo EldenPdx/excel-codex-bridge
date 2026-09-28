@@ -7,9 +7,17 @@ the same on the signed-in session: a JSON prompt to
 ``.../basispoints/api/images/generations``, or a form with the picture to
 ``.../images/edits``, always asking gpt-image-2 for a PNG.  This turns Codex's
 requests into the add-in's, within the choices the add-in allows.
+
+Codex always asks for gpt-image-2 and does not tell the model which image
+model drew a picture.  ``EXCEL_BRIDGE_IMAGE_MODEL`` (``--image-model``) names
+another one for the bridge to ask the backend for instead; the bridge window
+shows the model each picture was asked from.
 """
 
 from __future__ import annotations
+
+import os
+import re
 
 from . import excel_upstream
 from .images import EXTENSIONS, decode_data_url
@@ -17,7 +25,10 @@ from .images import EXTENSIONS, decode_data_url
 _BASE = excel_upstream.RESPONSES_URL.rsplit("/", 1)[0]
 GENERATIONS_URL = _BASE + "/images/generations"
 EDITS_URL = _BASE + "/images/edits"
+# The add-in's, and the one Codex asks for.
 MODEL = "gpt-image-2"
+MODEL_ENV = "EXCEL_BRIDGE_IMAGE_MODEL"
+_MODEL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 SIZES = ("auto", "1024x1024", "1536x1024", "1024x1536", "1280x720")
 QUALITIES = ("auto", "low", "medium", "high")
 BACKGROUNDS = ("auto", "opaque")
@@ -26,6 +37,20 @@ MAX_PICTURES = 3
 
 class Refused(ValueError):
     """A request the add-in would not make; the message goes back to Codex."""
+
+
+def valid_model(name: str) -> bool:
+    return bool(_MODEL_NAME.fullmatch(name))
+
+
+def model() -> str:
+    """The image model the bridge asks the backend for."""
+    name = os.environ.get(MODEL_ENV, "").strip()
+    if not name:
+        return MODEL
+    if not valid_model(name):
+        raise Refused(f"{MODEL_ENV}={name!r} is not an image model name; fix it and restart the bridge.")
+    return name
 
 
 def _choice(request: dict, key: str, allowed: tuple[str, ...]) -> str:
@@ -41,9 +66,14 @@ def _fields(request: dict) -> dict:
     prompt = request.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise Refused("prompt is required.")
-    model = request.get("model")
-    if model not in (None, MODEL):
-        raise Refused(f"model {model!r} is not available through the Excel add-in; it draws with {MODEL}.")
+    drawing = model()
+    asked = request.get("model")
+    # Codex always asks for gpt-image-2; the configured model stands in for it.
+    if asked not in (None, MODEL, drawing):
+        raise Refused(
+            f"model {asked!r} is not available through the Excel bridge; it draws with {drawing} "
+            f"(the user can choose another with --image-model or {MODEL_ENV})."
+        )
     if request.get("background") == "transparent":
         raise Refused(
             "Transparent backgrounds are not available through the Excel add-in. "
@@ -53,7 +83,7 @@ def _fields(request: dict) -> dict:
         raise Refused("The Excel add-in returns PNG pictures only.")
     fields = {
         "background": _choice(request, "background", BACKGROUNDS),
-        "model": MODEL,
+        "model": drawing,
         "output_format": "png",
         "prompt": prompt,
         "quality": _choice(request, "quality", QUALITIES),

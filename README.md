@@ -112,8 +112,8 @@ exe 没有代码签名，首次运行时 SmartScreen 可能拦一下，点"更�
 常用写法（`--` 之后的参数原样交给 Codex）：
 
 ```
-excel-codex                                   交互式 Codex，默认 gpt-5.6-sol-excel
-excel-codex --model gpt-5.6-terra-excel       换模型
+excel-codex                                   交互式 Codex，默认 gpt-5.6-sol（Excel 链路）
+excel-codex --model gpt-6-sol-1m-excel        换模型
 excel-codex -- -c model_reasoning_effort=high 调推理强度
 excel-codex -- exec "给 README 加一个目录"      非交互执行
 excel-codex -- resume --last                  继续上次会话
@@ -121,10 +121,12 @@ excel-codex status                            看当前用哪份登录、是否�
 excel-codex --login codex                      只用 Codex 自己的登录（不碰 Excel）
 excel-codex login                             打开 Excel 的 ChatGPT 面板登录或续期
 excel-codex desktop                           让 Codex 桌面版 / IDE 插件走 Excel 链路
+excel-codex threads migrate                   把 0.5.3 及更早版本的桥接对话并进共享列表
 ```
 
-启动器自己的选项：`--login <auto|codex|excel>`、`--model`、`--proxy`、`--port`、`--codex <路径>`、
-`--webview-dir <目录>`、`--skip-session-check`、`--no-auto-signin`。
+启动器自己的选项：`--login <auto|codex|excel>`、`--model`、`--proxy`、`--timezone <auto|off>`、
+`--image-model <模型名>`、`--port`、`--codex <路径>`、`--webview-dir <目录>`、`--skip-session-check`、
+`--no-auto-signin`。
 
 ## 模型
 
@@ -132,12 +134,16 @@ excel-codex desktop                           让 Codex 桌面版 / IDE 插件�
 
 | 272k 版 | 1M 版 | 上游模型 |
 | --- | --- | --- |
-| `gpt-5.6-sol-excel`（默认） | `gpt-5.6-sol-1m-excel` | `gpt-5.6-sol` |
-| `gpt-5.6-terra-excel` | `gpt-5.6-terra-1m-excel` | `gpt-5.6-terra` |
-| `gpt-5.6-luna-excel` | `gpt-5.6-luna-1m-excel` | `gpt-5.6-luna` |
-| `gpt-6-sol-excel` | `gpt-6-sol-1m-excel` | `gpt-6-sol` |
-| `gpt-6-luna-excel` | `gpt-6-luna-1m-excel` | `gpt-6-luna` |
-| `gpt-6-astra-excel` | `gpt-6-astra-1m-excel` | `gpt-6-astra` |
+| `gpt-5.6-sol`（默认） | `gpt-5.6-sol-1m-excel` | `gpt-5.6-sol` |
+| `gpt-5.6-terra` | `gpt-5.6-terra-1m-excel` | `gpt-5.6-terra` |
+| `gpt-5.6-luna` | `gpt-5.6-luna-1m-excel` | `gpt-5.6-luna` |
+| `gpt-6-sol` | `gpt-6-sol-1m-excel` | `gpt-6-sol` |
+| `gpt-6-luna` | `gpt-6-luna-1m-excel` | `gpt-6-luna` |
+| `gpt-6-astra` | `gpt-6-astra-1m-excel` | `gpt-6-astra` |
+
+- 从 0.5.4 起，272k 版在 Codex 里用和 OpenAI 官方一样的名字（模型列表里显示为「6-Sol Excel」这样），
+  这样对话在开着桥接和关掉桥接时都能接着用，见[会话互通](#会话互通)。以前的 `gpt-6-sol-excel`
+  这类名字照样能用，只是不再出现在模型列表里。1M 版官方没有，名字不变。
 
 - **272k 版**：上下文 272k，Codex 在 180k 时自动压缩。
 - **1M 版**：上下文 918k，Codex 在约 826k 时自动压缩。918k 是真实后端的实测上限：一次最多接受约 918k
@@ -180,9 +186,10 @@ TLS 证书校验始终开启。Codex 到桥接走 `127.0.0.1`，启动器会自�
 
 1. 双击免安装包里的 **`excel-codex-desktop.cmd`**（或运行 `excel-codex desktop`），
    它会检查会话（需要时自动登录）、把 `config.toml` 指向桥接，并在 `127.0.0.1:8765` 上运行桥接。
-2. **完全退出再打开 Codex 桌面版**（IDE 插件则重新加载窗口），模型列表里就是 `*-excel` 模型。
-   请**新建对话**来用：之前建的对话会一直沿用当时的账号。
+2. **完全退出再打开 Codex 桌面版**（IDE 插件则重新加载窗口），模型列表里就是桥接的模型（显示名带 Excel）。
+   Codex 登录过的话，以前的对话也在列表里，可以直接接着聊，见[会话互通](#会话互通)。
 3. 用的时候保持这个窗口开着（可以最小化）。**关掉窗口或按 Ctrl+C，`config.toml` 按原样恢复。**
+4. 在 Windows 上，这个窗口还会把系统时区对到 Codex 的出口时区，见[出口时区](#出口时区)。
 
 细节：
 
@@ -191,25 +198,87 @@ TLS 证书校验始终开启。Codex 到桥接走 `127.0.0.1`，启动器会自�
 - `config.toml` 是所有 Codex 客户端共用的，窗口开着期间在终端直接运行 `codex` 也会走 Excel 链路。
 - 想长期保持：`excel-codex desktop --keep-config`，之后用 `excel-codex desktop --off` 恢复
   （窗口意外被杀、配置没还原时也用它）。
-- 换模型：`excel-codex desktop --model gpt-5.6-terra-excel`；换端口：`--port`。
+- 换模型：`excel-codex desktop --model gpt-5.6-terra`；换端口：`--port`。
 
-**报错 `The '…-excel' model is not supported when using Codex with a ChatGPT account`**
+**报错 `The '…' model is not supported when using Codex with a ChatGPT account`**
 （在 Codex 里退出登录后会变成 `401 Unauthorized: Missing bearer or basic authentication`，
 地址是 `api.openai.com/v1/responses`）：这条对话的请求没有经过桥接，直接发给了 OpenAI 官方，
-所以退出登录解决不了。桌面版在新建对话时读取 `config.toml` 决定发往哪里，这个对话之后一直沿用；
-模型列表却只在桌面版启动时读一次。所以列表里还有 `*-excel` 模型，对话却绑在 OpenAI 官方服务上。
-常见原因：
+所以退出登录解决不了。官方没有的模型（1M 版，或 0.5.3 及更早版本里的 `*-excel` 名字）就会这样报错。
+桌面版只在启动时读取 `config.toml` 和模型列表，常见原因：
 
-- 桥接窗口已经关了（`config.toml` 已恢复），桌面版却没重启；
-- 这条对话是在开启桌面版模式之前建的，在里面换成 Excel 模型也没用；
+- 桥接窗口已经关了（`config.toml` 已恢复），桌面版却没重启，列表里还留着桥接的模型；
+- 关掉桥接后接着用一条 1M 版的对话：在模型菜单里换一个官方模型即可；
+- Codex 没登录时（桥接是独立的 provider），这条对话是在开启桌面版模式之前建的；
 - Cockpit Tools 这类工具把 Codex 切回了 ChatGPT 账号。
 
 解决：打开 `excel-codex-desktop.cmd`，完全退出桌面版（文件 → 退出，或从托盘退出；只关窗口它可能
-还在后台运行）再打开，然后**新建对话**。发消息时桥接窗口里会出现 `"POST /v1/responses HTTP/1.1" 200`
+还在后台运行）再打开。发消息时桥接窗口里会出现 `"POST /v1/responses HTTP/1.1" 200`
 这样的一行（0.4.2 起）；没有就说明请求还是没经过桥接。
 
 也可以全手动：`excel-codex serve` 常驻桥接，再把 `excel-codex print-config` 输出的片段加进
 `config.toml`，不用时删掉。
+
+## 会话互通
+
+Codex 按对话建立时用的 provider 列出和继续对话。0.5.3 及更早版本的桥接是一个独立的 provider
+（`excel-bridge`），所以开着桥接时看不到官方链路的旧对话，关掉桥接后桥接建的对话也接不上。
+
+从 0.5.4 起，**只要 Codex 自己登录过**（`codex login`，ChatGPT 账号或 API key 都行），桌面版模式和
+`excel-codex` 启动的 Codex 都改为把 Codex 自带的 `openai` provider 指到桥接（`openai_base_url`），
+模型也用官方的名字。于是：
+
+- 开着桥接：官方链路建的旧对话都在列表里，接着聊就走 Excel 链路。
+- 关掉桥接：开着桥接时建的对话照样在列表里，接着聊就走官方链路。1M 版的对话需要先在模型菜单里
+  换成官方有的模型。
+- 两个后端各自加密的推理内容（reasoning）不一定互认。Excel 后端不认官方那份时，桥接会去掉这些
+  推理内容再发一次，对话文字不受影响（桥接窗口里会有一行说明）。反过来官方后端是否认 Excel 后端
+  那份还没有实测；如果关掉桥接后某条对话报错，新建一条对话即可。
+- 用 `codex exec` 时会看到一行 `failed to connect to websocket: 426`：Codex 自带的 provider 先试
+  WebSocket，桥接只讲 HTTP，回 426 让它马上改用 HTTP，属于正常现象。
+
+Codex 没登录时，自带的 provider 会先要求登录，所以桥接仍是独立的 `excel-bridge` provider，行为和
+以前一样：开着桥接建的对话只在开着桥接时出现在列表里。
+
+### 0.5.3 及更早版本建的桥接对话
+
+这些对话记在 `excel-bridge` 名下，不在共享列表里。`excel-codex threads` 列出它们，
+`excel-codex threads migrate` 把它们并进共享列表：
+
+1. 先完全退出 Codex 桌面版（IDE 插件则关掉窗口），Codex 登录过（`codex login`）才能迁移。
+2. 运行 `excel-codex threads migrate`。它把这些对话改记到 `openai` 名下，模型名换成官方的
+   （`gpt-6-sol-excel` → `gpt-6-sol`，1M 版不变）。
+3. 重新打开 Codex，这些对话就和其他对话在同一个列表里了。
+
+- 只改 Codex 的对话索引（`~/.codex/state_<n>.sqlite` 里的 threads 表），不碰对话内容
+  （`~/.codex/sessions` 下的文件）。改之前先把索引复制一份，存为同目录下的
+  `state_<n>.sqlite.before-excel-codex-<时间>`。
+- `excel-codex threads undo` 撤销：把迁移改过、之后没再被 Codex 改过的对话放回 `excel-bridge` 名下。
+- 迁移后还没接着聊过的对话，如果在 Codex 里改名或归档，Codex 会按对话文件重建这一条，它又会回到
+  `excel-bridge` 名下；再运行一次 `excel-codex threads migrate` 即可。接着聊过一次后就不会了。
+- 不想迁移的话，开着桥接时仍然可以在终端用 `excel-codex -- resume <会话 ID>` 接着聊
+  （会话 ID 在 `~/.codex/sessions` 下的文件名里）。
+- Codex 登录过时，`excel-codex-desktop.cmd` 发现有这类对话会提示一句。
+
+## 出口时区
+
+Codex 会把本机的时区和日期写进每个对话（`<environment_context>` 里的 `<timezone>`、`<current_date>`）。
+请求从代理出口发出，本机时区和出口所在地对不上时，模型会以为你在另一个时区。
+
+- **经过桥接的请求**：桥接先查出口 IP（`https://bps.openai.com/cdn-cgi/trace`），再查这个 IP 的时区
+  （ipwho.is，查不到再用 ipapi.co），把请求里的时区和当天日期换成出口那边的。每 5 分钟看一次出口 IP
+  有没有变。
+- **官方 ChatGPT 登录**（Windows）：这条链路不经过桥接，而 Codex 读的是 Windows 的系统时区。
+  `excel-codex-desktop.cmd` 打开期间会按 Codex 选代理的方式（`HTTPS_PROXY` / `ALL_PROXY`，
+  否则用 Windows 的代理设置，不支持 PAC 脚本）查 `chatgpt.com`（API key 登录则是 `api.openai.com`）的出口时区，启动时和之后每分钟
+  用 `tzutil` 把系统时区对上。不需要另外运行别的程序或计划任务。
+
+注意：
+
+- 改的是整台电脑的时区。`excel-codex timezone restore` 恢复第一次修改前的时区。
+- 只把出口 IP 发给 ipwho.is / ipapi.co 查时区，走的也是同一个代理，不发送别的信息。同一个 IP
+  的结果会缓存。
+- `--timezone off`（或环境变量 `EXCEL_BRIDGE_TIMEZONE=off`）关掉以上两项。
+- `excel-codex timezone` 查看出口时区和当前状态；`excel-codex timezone sync --probe` 只查不改。
 
 ## macOS / WSL（实验性）
 
@@ -284,6 +353,13 @@ Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图�
   尺寸 `auto`、`1024x1024`、`1536x1024`、`1024x1536`、`1280x720`。
 - 不支持透明背景（加载项本身也不支持）。模型要透明背景时会收到说明，可以改用普通背景再画。
 - 生图额度按你的 ChatGPT 套餐算。后端拒绝时，Codex 里会显示后端给的原因。
+- **指定生图模型**：Codex 的生图工具固定请求 gpt-image-2，也不会把实际用的模型告诉对话里的模型，所以
+  在对话里问「用的是不是某某模型」得不到确切答案。想用别的模型（比如 `gpt-image-2.5`），启动时加
+  `--image-model gpt-image-2.5`（或设环境变量 `EXCEL_BRIDGE_IMAGE_MODEL`），桥接会改为向后端请求这个模型。
+  桥接窗口启动时显示当前的生图模型，每次生图还会记一行 `image generations with gpt-image-2.5: 1 picture(s) came back`，
+  以这里为准。后端是否接受这个模型名由后端决定，不接受时 Codex 里会显示后端给的原因。
+- 用 Codex 自己的 ChatGPT 登录共享会话时（见[会话互通](#会话互通)），Codex 对自带 provider 本来就提供
+  这个工具；用 API key 登录时 Codex 不提供。
 - 用 Cockpit Tools 这类工具管理 Codex 时，provider 是它写的，需要在它的供应商配置里自己加上
   `http_headers = { "x-openai-actor-authorization" = "excel-codex-bridge" }`。
 
@@ -326,6 +402,8 @@ Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图�
 | `EXCEL_BRIDGE_HOME` | 状态目录：模型目录 JSON、`bridge.log`、登录用工作簿，以及让重启后仍能原样回放历史工具调用的 `tool-calls.sqlite3`（保留 60 天）。默认 `%LOCALAPPDATA%\excel-codex-bridge` 或 `~/.excel-codex-bridge` |
 | `EXCEL_BRIDGE_AUTO_SIGNIN` | 设为 `0` 时不自动打开 Excel（同 `--no-auto-signin`） |
 | `EXCEL_BRIDGE_UPDATE_CHECK` | 设为 `0` 时不检查更新 |
+| `EXCEL_BRIDGE_TIMEZONE` | `auto`（默认）/ `off`，同 `--timezone`，见[出口时区](#出口时区) |
+| `EXCEL_BRIDGE_IMAGE_MODEL` | 生图工具向后端请求的模型，默认 `gpt-image-2`（同 `--image-model`），见[生图](#生图) |
 | `CODEX_HOME` | Codex 配置目录，`desktop` 改写其中的 `config.toml`。默认 `~/.codex` |
 | `GHCP_EXCEL_WEBVIEW2_DATA_DIR` | Windows WebView2 数据根目录（同 `--webview-dir`） |
 | `GHCP_EXCEL_WEBKIT_WEBSITE_DATA_DIR` | macOS WebKit 数据目录 |

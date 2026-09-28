@@ -3,7 +3,7 @@
 The Codex desktop app and IDE extension take no ``-c`` overrides, so
 ``excel-codex desktop`` writes two marked blocks into ``config.toml`` and
 comments out the user's own ``model`` / ``model_provider`` /
-``model_catalog_json`` lines with a marker prefix.  Removing the blocks and the
+``model_catalog_json`` / ``openai_base_url`` lines with a marker prefix.  Removing the blocks and the
 prefix gives back the original text byte for byte; ``enable`` checks that
 before writing anything, and keeps a copy of the original next to it.
 """
@@ -28,7 +28,7 @@ DISABLED_PREFIX = "# excel-codex-bridge disabled: "
 BACKUP_SUFFIX = ".before-excel-codex"
 
 _TABLE_HEADER = re.compile(r"\s*\[")
-_OWN_KEYS = re.compile(r"\s*(model_provider|model|model_catalog_json)\s*=")
+_OWN_KEYS = re.compile(r"\s*(model_provider|model|model_catalog_json|openai_base_url)\s*=")
 # The provider's table and any of its sub-tables, such as its http_headers.
 _OWN_TABLE = re.compile(
     rf"\s*\[\s*model_providers\s*\.\s*([\"']?){re.escape(codex_config.PROVIDER_ID)}\1\s*[.\]]"
@@ -96,8 +96,13 @@ def _comment_out_conflicts(text: str) -> str:
     return "".join(out)
 
 
-def enable(text: str, *, port: int, catalog: Path, model: str) -> str:
-    """``text`` with the bridge made the default provider for every Codex client."""
+def enable(text: str, *, port: int, catalog: Path, model: str, shared: bool = False) -> str:
+    """``text`` with the bridge made the default provider for every Codex client.
+
+    ``shared`` points Codex's own ``openai`` provider at the bridge, so the
+    conversation list is the same with the bridge on or off (see
+    ``codex_config``).  The ``excel-bridge`` provider is defined either way.
+    """
     base = strip_managed(text)
     nl = "\r\n" if "\r\n" in base else "\n"
     body = _comment_out_conflicts(base)
@@ -105,8 +110,9 @@ def enable(text: str, *, port: int, catalog: Path, model: str) -> str:
     toml = codex_config._toml_string
     top = [
         TOP_START,
-        f"model_provider = {toml(codex_config.PROVIDER_ID)}",
-        f"model = {toml(model)}",
+        f"model_provider = {toml(codex_config.provider_for(shared))}",
+        *([f"openai_base_url = {toml(codex_config.base_url(port))}"] if shared else []),
+        f"model = {toml(codex_config.codex_model(model))}",
         f"model_catalog_json = {toml(str(catalog))}",
         TOP_END,
     ]
@@ -170,10 +176,10 @@ class ConfigError(RuntimeError):
     pass
 
 
-def enable_file(path: Path, *, port: int, catalog: Path, model: str) -> Path | None:
+def enable_file(path: Path, *, port: int, catalog: Path, model: str, shared: bool = False) -> Path | None:
     """Enable in ``path``; returns the backup made of the original, if any."""
     text, bom = _read(path)
-    new = enable(text, port=port, catalog=catalog, model=model)
+    new = enable(text, port=port, catalog=catalog, model=model, shared=shared)
     original = strip_managed(text)
     if strip_managed(new) != original:
         raise ConfigError(f"{path} has a layout this tool cannot undo exactly; edit it by hand instead")
@@ -182,9 +188,10 @@ def enable_file(path: Path, *, port: int, catalog: Path, model: str) -> Path | N
     except ValueError as exc:
         raise ConfigError(f"{path} would not be valid TOML ({exc}); is it valid now?") from exc
     if data is not None and (
-        data.get("model_provider") != codex_config.PROVIDER_ID
+        data.get("model_provider") != codex_config.provider_for(shared)
         or data.get("model_providers", {}).get(codex_config.PROVIDER_ID, {}).get("base_url")
         != codex_config.base_url(port)
+        or (shared and data.get("openai_base_url") != codex_config.base_url(port))
     ):
         raise ConfigError(f"could not point {path} at the bridge")
     backup = None

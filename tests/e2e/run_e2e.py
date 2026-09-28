@@ -29,6 +29,12 @@ the bridge must use it rather than the Excel session.  With
 ``--codex-login refused`` the backend refuses it, and the bridge must retry
 with the Excel session and keep that one.
 
+``--shared`` signs Codex itself in (a made-up API key in its ``auth.json``):
+the bridge must then stand in for Codex's own ``openai`` provider, so that
+the conversation is filed under ``openai`` with the model's official name,
+the way the official sign-in files it.  Codex tries a WebSocket first there;
+the bridge's 426 must send it to HTTP.
+
 ``--images`` also attaches a picture (``codex exec -i``).  Like the real
 backend, the fake one refuses a user message with an inline picture; the
 bridge must then upload it once to the attachments endpoint, the way the
@@ -39,14 +45,18 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime as dt
 import itertools
 import json
 import os
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
+import re
+import shlex
 import tempfile
 import threading
 import time
@@ -59,9 +69,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 import uvicorn  # noqa: E402
 from fastapi import FastAPI, Request  # noqa: E402
-from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse  # noqa: E402
 
-from excel_codex_bridge import excel_upstream  # noqa: E402
+from excel_codex_bridge import codex_config, excel_upstream, exit_timezone  # noqa: E402
 from helpers import write_codex_login, write_webview_session  # noqa: E402
 
 USER_PYTHONPATH = "e2e-user-pythonpath"
@@ -72,6 +82,8 @@ CODEX_ARGS = [
     "-c", "model_reasoning_effort=high",
     "Run the check.",
 ]
+# Carries the conversation above on (Codex lists only its current provider's).
+RESUME_ARGS = [*CODEX_ARGS[:-1], "resume", "--last", "Carry on."]
 PYTHON = "python" if sys.platform == "win32" else "python3"
 # Prints a marker only a real execution can produce, plus the PYTHONPATH Codex
 # gave the command.  Works in bash, PowerShell and cmd alike.
@@ -142,11 +154,21 @@ def transport_call(n: int, name: str, arguments: dict) -> dict:
 
 
 IMAGE_PROMPT = "a blue whale in a spreadsheet"
+EXIT_IP = "1.1.1.1"
+
+
+def exit_zone_for(now: dt.datetime) -> str:
+    """A proxy exit whose day is not today in UTC, so moving the date shows."""
+    return "Pacific/Kiritimati" if now.hour >= 10 else "Pacific/Pago_Pago"
 
 
 class FakeExcelBackend:
-    def __init__(self, parallel: bool = False, imagegen: bool = False, refuse: str | None = None) -> None:
+    def __init__(self, parallel: bool = False, imagegen: bool = False, refuse: str | None = None,
+                 exit_zone: str = "Pacific/Kiritimati") -> None:
         self.requests: list[dict] = []
+        # The proxy exit the bridge finds: this IP, in this timezone.
+        self.exit_zone = exit_zone
+        self.lookups: list[str] = []
         # The account of every request, and the one this backend refuses to serve.
         self.accounts: list[str] = []
         self.refuse = refuse
@@ -173,8 +195,20 @@ class FakeExcelBackend:
             return JSONResponse({"created": 1, "background": "opaque", "output_format": "png",
                                  "data": [{"b64_json": self.drawn}]})
 
+        @app.get("/cdn-cgi/trace")
+        async def trace():
+            return PlainTextResponse(f"fl=1\nh=127.0.0.1\nip={EXIT_IP}\nts=1\n")
+
+        @app.get("/geo/{ip}")
+        async def geo(ip: str):
+            self.lookups.append(ip)
+            # No offset: the day there must come from the bundled timezone data.
+            return JSONResponse({"ip": ip, "timezone": self.exit_zone})
+
         @app.middleware("http")
         async def check_sign_in(request: Request, call_next):
+            if not request.url.path.startswith("/basispoints/"):
+                return await call_next(request)
             account = request.headers.get("chatgpt-account-id", "")
             self.accounts.append(account)
             if account == self.refuse:
@@ -301,6 +335,8 @@ def run_desktop(launcher, args, root: Path, webview: Path, project: Path, env: d
     config = Path(env["CODEX_HOME"]) / "config.toml"
     config.write_bytes(USER_CONFIG.encode())
     port = free_port()
+    # On Windows, desktop also sets the system timezone to the exit's; put back afterwards.
+    windows_zone = tzutil("/g") if sys.platform == "win32" else None
     command = [*launcher, "desktop", "--webview-dir", str(webview), "--model", args.model, "--port", str(port)]
     print("$", subprocess.list2cmdline(command), "&", flush=True)
     group = (
@@ -320,7 +356,10 @@ def run_desktop(launcher, args, root: Path, webview: Path, project: Path, env: d
             time.sleep(0.5)
         checks.append((healthy(port), "the desktop bridge did not come up"))
         enabled = config.read_text(encoding="utf-8")
-        checks.append(("model_provider = 'excel-bridge'" in enabled, "config.toml was not pointed at the bridge"))
+        provider = "openai" if args.shared else "excel-bridge"
+        checks.append((f"model_provider = '{provider}'" in enabled
+                       and (f"openai_base_url = 'http://127.0.0.1:{port}/v1'" in enabled) == args.shared,
+                       "config.toml was not pointed at the bridge"))
         codex = shutil.which("codex", path=env.get("PATH"))
         if codex and healthy(port):
             codex_env = dict(env)
@@ -350,7 +389,71 @@ def run_desktop(launcher, args, root: Path, webview: Path, project: Path, env: d
         (config.read_bytes() == USER_CONFIG.encode(), "config.toml was not restored exactly"),
         (backup.exists() and backup.read_bytes() == USER_CONFIG.encode(), "no exact backup of config.toml"),
     ]
+    if windows_zone is not None:
+        changed = "Windows timezone changed from" in desktop_output
+        restored = run([*launcher, "timezone", "restore"], cwd=project, env=env, timeout=120)
+        now = tzutil("/g")
+        if now != windows_zone:
+            tzutil("/s", windows_zone)
+        checks += [
+            (changed, "desktop did not set the Windows timezone to the exit's"),
+            (restored.returncode == 0 and now == windows_zone,
+             f"`timezone restore` left {now} instead of {windows_zone}"),
+        ]
     return output, checks
+
+
+def sign_codex_in(home: Path) -> None:
+    """A made-up API key sign-in for Codex itself: the bridge then stands in for its openai provider."""
+    (home / "auth.json").write_text(
+        json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-e2e-not-a-key"}), encoding="utf-8")
+
+
+def migrate_then_resume(launcher, args, webview: Path, project: Path, env: dict) -> tuple[str, list]:
+    """A conversation filed the 0.5.3 way, moved by `threads migrate`, then carried on shared."""
+    home = Path(env["CODEX_HOME"])
+    first = shlex.split(args.first_launcher) if args.first_launcher else launcher
+    output, checks = run_launcher(first, args, webview, project, env)
+    args.first_requests = len(args.backend.requests)
+    before = codex_threads(home)
+    checks.append((len(before) == 1 and before[0][0] == "excel-bridge",
+                   f"the first conversation should be filed under excel-bridge, got {before}"))
+    sign_codex_in(home)
+    moved = run([*launcher, "threads", "migrate"], cwd=project, env=env, timeout=120)
+    print(moved.stdout)
+    after = codex_threads(home)
+    official = codex_config.codex_model(args.model)
+    checks += [
+        (moved.returncode == 0 and "Moved 1 conversation(s)" in moved.stdout,
+         "`threads migrate` did not move the conversation"),
+        (after == [("openai", official)], f"`threads migrate` should file it as ('openai', {official}), got {after}"),
+        (len(list(home.glob("state_*.sqlite.before-excel-codex-*"))) == 1, "no copy of Codex's index"),
+    ]
+    args.shared = True
+    args.codex_args = list(RESUME_ARGS)
+    output, resumed = run_launcher(launcher, args, webview, project, env)
+    carried = args.backend.requests[args.first_requests:]
+    checks += resumed + [
+        (len(carried) == 1 and "bridge-e2e-42" in json.dumps(carried[0]),
+         "`resume --last` did not carry the migrated conversation on"),
+    ]
+    return output, checks
+
+
+def codex_threads(home: Path) -> list[tuple[str, str]]:
+    """(provider, model) of each conversation in this run's own Codex home."""
+    found = []
+    for path in sorted(home.glob("state_*.sqlite")):
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            found += connection.execute("SELECT model_provider, model FROM threads").fetchall()
+        finally:
+            connection.close()
+    return found
+
+
+def tzutil(*args: str) -> str:
+    return subprocess.run(["tzutil", *args], capture_output=True, text=True, check=True).stdout.strip()
 
 
 def _desktop_log(root: Path) -> str:
@@ -367,6 +470,12 @@ def main() -> int:
     parser.add_argument("--imagegen", action="store_true", help="answer with a call to Codex's image tool")
     parser.add_argument("--codex-login", nargs="?", const="accepted", choices=["accepted", "refused"],
                         help="also sign Codex in with ChatGPT; `refused` makes the backend turn it down")
+    parser.add_argument("--shared", action="store_true",
+                        help="sign Codex itself in, so the bridge stands in for its openai provider")
+    parser.add_argument("--migrate", action="store_true",
+                        help="file a conversation the 0.5.3 way, `threads migrate` it, then carry it on shared")
+    parser.add_argument("--first-launcher",
+                        help="with --migrate: the command that starts that conversation, e.g. a 0.5.3 checkout's")
     parser.add_argument("--timeout", type=int, default=900, help="seconds for each long step")
     parser.add_argument("launcher", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -384,8 +493,11 @@ def main() -> int:
     codex_auth = root / "codex-login" / "auth.json"
     if args.codex_login:
         write_codex_login(codex_auth, time.time() + 3 * 86400, account="e2e-codex-account")
+    started_at = dt.datetime.now(dt.timezone.utc)
+    exit_zone = exit_zone_for(started_at)
     backend = FakeExcelBackend(parallel=args.parallel, imagegen=args.imagegen,
-                               refuse="e2e-codex-account" if args.codex_login == "refused" else None)
+                               refuse="e2e-codex-account" if args.codex_login == "refused" else None,
+                               exit_zone=exit_zone)
     server, port = start_server(backend.app)
 
     env = dict(os.environ)
@@ -394,25 +506,44 @@ def main() -> int:
         EXCEL_BRIDGE_CODEX_AUTH=str(codex_auth),
         EXCEL_BRIDGE_HOME=str(root / "bridge-home"),
         GHCP_EXCEL_RESPONSES_URL=f"http://127.0.0.1:{port}/basispoints/api/responses",
+        EXCEL_BRIDGE_TIMEZONE="auto",
+        EXCEL_BRIDGE_TIMEZONE_LOOKUP=f"http://127.0.0.1:{port}/geo/{{ip}}",
+        EXCEL_BRIDGE_TIMEZONE_TRACE=f"http://127.0.0.1:{port}/cdn-cgi/trace",
         PYTHONPATH=USER_PYTHONPATH,
     )
     Path(env["CODEX_HOME"]).mkdir()
+    if args.shared and not args.migrate:
+        sign_codex_in(Path(env["CODEX_HOME"]))
     args.codex_args = list(CODEX_ARGS)
+    args.backend, args.first_requests = backend, 0
     picture = png()
     if args.images:
         (project / "picture.png").write_bytes(picture)
         # -i takes every argument after it, so it goes last.
         args.codex_args += ["-i", str(project / "picture.png")]
     started = time.monotonic()
-    if args.desktop:
+    if args.migrate:
+        output, checks = migrate_then_resume(launcher, args, webview, project, env)
+    elif args.desktop:
         output, checks = run_desktop(launcher, args, root, webview, project, env)
     else:
         output, checks = run_launcher(launcher, args, webview, project, env)
     server.should_exit = True
 
     upstream_model = excel_upstream.EXCEL_MODEL_UPSTREAMS[args.model]
+    # A --first-launcher from before 0.5.4 does not move the timezone.
+    sent = json.dumps(backend.requests[args.first_requests if args.first_launcher else 0:])
+    zones = set(re.findall(r"<timezone>([^<]*)</timezone>", sent))
+    dates = set(re.findall(r"<current_date>([^<]*)</current_date>", sent))
+    exit_days = {exit_timezone.today_in(exit_zone, now=when)
+                 for when in (started_at, dt.datetime.now(dt.timezone.utc))}
     checks += [
-        ("provider: excel-bridge" in output, "Codex did not use the excel-bridge provider"),
+        # The bridge looks the exit up once; on Windows desktop's system sync does too.
+        (0 < len(backend.lookups) <= 2 and set(backend.lookups) == {EXIT_IP},
+         f"expected the exit IP looked up once or twice, got {backend.lookups}"),
+        (zones == {exit_zone}, f"Codex's timezone should be the exit's ({exit_zone}), got {zones}"),
+        (bool(dates) and dates <= exit_days, f"Codex's date should be the day at the exit {exit_days}, got {dates}"),
+        (f"provider: {'openai' if args.shared else 'excel-bridge'}" in output, "Codex used another provider"),
         ("done: tool output seen" in output, "the tool output did not reach the model"),
         (len(backend.requests) >= 2, f"expected 2+ upstream requests, got {len(backend.requests)}"),
         (all(r.get("model") == upstream_model for r in backend.requests),
@@ -433,6 +564,11 @@ def main() -> int:
         served = served[1:]
     checks.append((bool(served) and set(served) == {signed_in},
                    f"expected every request on {signed_in}, got {backend.accounts}"))
+    if args.shared:
+        threads = codex_threads(Path(env["CODEX_HOME"]))
+        official = codex_config.codex_model(args.model)
+        checks.append((threads == [("openai", official)],
+                       f"the conversation should be filed as the official sign-in files it, got {threads}"))
     if args.parallel and len(backend.requests) >= 2:
         replayed = [(item.get("type"), item.get("call_id") if item.get("type") == "function_call_output"
                      else item.get("id"))
@@ -487,6 +623,7 @@ def main() -> int:
           f"{time.monotonic() - started:.0f}s")
     for body in backend.requests:
         print("   ", body.get("model"), "reasoning_effort=", body.get("reasoning_effort"))
+    print(f"    exit timezone {exit_zone}: Codex's context said {sorted(zones)} {sorted(dates)}")
     if failures:
         log = root / "bridge-home" / "bridge.log"
         if log.exists():

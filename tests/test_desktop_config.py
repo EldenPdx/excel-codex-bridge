@@ -41,7 +41,8 @@ class EnableTests(unittest.TestCase):
     def assert_points_at_bridge(self, text: str) -> dict:
         data = tomllib.loads(text)
         self.assertEqual(data["model_provider"], "excel-bridge")
-        self.assertEqual(data["model"], "gpt-5.6-sol-excel")
+        self.assertNotIn("openai_base_url", data)
+        self.assertEqual(data["model"], "gpt-5.6-sol")
         self.assertEqual(data["model_catalog_json"], str(CATALOG))
         provider = data["model_providers"]["excel-bridge"]
         self.assertEqual(provider["base_url"], "http://127.0.0.1:8765/v1")
@@ -91,6 +92,24 @@ class EnableTests(unittest.TestCase):
         self.assertEqual(data["model_providers"]["excel-bridge-old"], {"name": "kept"})
         self.assertEqual(desktop_config.strip_managed(enabled), original)
 
+    def test_shared_mode_stands_in_for_codex_own_provider(self):
+        original = USER_CONFIG.replace("[history]", 'openai_base_url = "https://example.test/v1"\n\n[history]')
+        original = 'openai_base_url = "https://proxy.test/v1"\n' + original
+        for text in (original, original.replace("\n", "\r\n"), original.rstrip("\n")):
+            with self.subTest(text=text[-12:]):
+                enabled = enable(text, shared=True)
+                data = tomllib.loads(enabled)
+                self.assertEqual(data["model_provider"], "openai")
+                self.assertEqual(data["openai_base_url"], "http://127.0.0.1:8765/v1")
+                self.assertEqual(data["model"], "gpt-5.6-sol")
+                # Still defined, for conversations started as excel-bridge.
+                self.assertEqual(data["model_providers"]["excel-bridge"]["base_url"], "http://127.0.0.1:8765/v1")
+                self.assertIn(desktop_config.DISABLED_PREFIX + 'openai_base_url = "https://proxy.test/v1"', enabled)
+                self.assertEqual(desktop_config.strip_managed(enabled), text)
+                # Switching modes (signed in or out in between) still comes back exactly.
+                self.assertEqual(desktop_config.strip_managed(enable(enabled)), text)
+                self.assertEqual(enable(enable(text), shared=True), enabled)
+
     def test_nested_model_keys_are_left_alone(self):
         original = '[profiles.fast]\nmodel = "gpt-5.5"\n'
         enabled = enable(original)
@@ -130,6 +149,14 @@ class FileTests(unittest.TestCase):
         self.assertIsNone(self.enable_file())
         self.assertTrue(desktop_config.disable_file(self.path))
         self.assertEqual(self.path.read_text(), "")
+
+    def test_shared_round_trip(self):
+        self.path.write_text(USER_CONFIG)
+        desktop_config.enable_file(self.path, port=8765, catalog=CATALOG, model="gpt-6-sol-excel", shared=True)
+        data = tomllib.loads(self.path.read_text())
+        self.assertEqual((data["model_provider"], data["model"]), ("openai", "gpt-6-sol"))
+        self.assertTrue(desktop_config.disable_file(self.path))
+        self.assertEqual(self.path.read_text(), USER_CONFIG)
 
     def test_invalid_toml_is_left_untouched(self):
         self.path.write_text("approval_policy = \n")
@@ -173,6 +200,25 @@ class DesktopCommandTests(unittest.TestCase):
         data = tomllib.loads(seen["config"])
         self.assertEqual(data["model_providers"]["excel-bridge"]["base_url"], "http://127.0.0.1:8799/v1")
         self.assertEqual(self.config.read_text(), USER_CONFIG)
+
+    def test_signed_in_codex_shares_its_conversations(self):
+        (self.config.parent / "auth.json").write_text('{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test"}')
+        with mock.patch.object(cli, "_print") as printed:
+            code, seen = self.run_desktop("--port", "8799", "--model", "gpt-6-astra-excel")
+        self.assertEqual(code, 0)
+        data = tomllib.loads(seen["config"])
+        self.assertEqual(data["model_provider"], "openai")
+        self.assertEqual(data["openai_base_url"], "http://127.0.0.1:8799/v1")
+        self.assertEqual(data["model"], "gpt-6-astra")
+        self.assertIn(cli._SHARED, [call.args[0] for call in printed.call_args_list])
+        self.assertEqual(self.config.read_text(), USER_CONFIG)
+
+    def test_without_codex_sign_in_the_bridge_is_its_own_provider(self):
+        with mock.patch.object(cli, "_print") as printed:
+            code, seen = self.run_desktop()
+        self.assertEqual(code, 0)
+        self.assertEqual(tomllib.loads(seen["config"])["model_provider"], "excel-bridge")
+        self.assertIn(cli._SEPARATE, [call.args[0] for call in printed.call_args_list])
 
     def test_keep_config_then_off(self):
         code, _ = self.run_desktop("--keep-config")

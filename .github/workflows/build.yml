@@ -71,6 +71,12 @@ jobs:
         run: python tests/e2e/run_e2e.py --codex-login -- ./excel-codex.sh
       - name: e2e (excel-codex.sh desktop, Codex's sign-in refused)
         run: python tests/e2e/run_e2e.py --desktop --codex-login refused -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh, conversations shared with Codex's own sign-in)
+        run: python tests/e2e/run_e2e.py --shared -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh desktop, conversations shared with Codex's own sign-in)
+        run: python tests/e2e/run_e2e.py --desktop --shared -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh, conversations from 0.5.3 and earlier moved by threads migrate)
+        run: python tests/e2e/run_e2e.py --migrate -- ./excel-codex.sh
 
   windows:
     needs: test
@@ -86,11 +92,13 @@ jobs:
       - run: npm install -g @openai/codex@${{ env.CODEX_VERSION }}
       - run: python -m pip install -r requirements.txt pyinstaller
 
+      # Windows has no zoneinfo of its own: bundle tzdata.
       - name: Build excel-codex.exe
         run: >-
           python -m PyInstaller --noconfirm --clean --onedir --console
           --name excel-codex --paths src
           --collect-submodules uvicorn --hidden-import anyio._backends._asyncio
+          --collect-all tzdata
           packaging/entry.py
 
       - name: SUB2API command (excel-codex.exe)
@@ -114,6 +122,12 @@ jobs:
         run: python tests/e2e/run_e2e.py --codex-login -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.exe desktop, Codex's sign-in refused)
         run: python tests/e2e/run_e2e.py --desktop --codex-login refused -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe, conversations shared with Codex's own sign-in)
+        run: python tests/e2e/run_e2e.py --shared -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe desktop, conversations shared with Codex's own sign-in)
+        run: python tests/e2e/run_e2e.py --desktop --shared -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe, conversations from 0.5.3 and earlier moved by threads migrate)
+        run: python tests/e2e/run_e2e.py --migrate -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.cmd)
         run: python tests/e2e/run_e2e.py -- excel-codex.cmd
 
@@ -184,6 +198,8 @@ jobs:
         run: python tests/e2e/run_e2e.py --codex-login -- dist/excel-codex/excel-codex
       - name: e2e (excel-codex desktop, Codex's sign-in refused)
         run: python tests/e2e/run_e2e.py --desktop --codex-login refused -- dist/excel-codex/excel-codex
+      - name: e2e (excel-codex desktop, conversations shared with Codex's own sign-in)
+        run: python tests/e2e/run_e2e.py --desktop --shared -- dist/excel-codex/excel-codex
 
       - name: Package
         run: |

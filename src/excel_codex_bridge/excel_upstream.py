@@ -1631,6 +1631,18 @@ def translate_input_items(
     return result
 
 
+def without_encrypted_reasoning(body: dict) -> dict:
+    """``body`` without its encrypted reasoning items; ``body`` itself when it has none."""
+    items = body.get("input")
+    if not isinstance(items, list):
+        return body
+    kept = [
+        item for item in items
+        if not (isinstance(item, dict) and item.get("type") == "reasoning" and item.get("encrypted_content"))
+    ]
+    return body if len(kept) == len(items) else {**body, "input": kept}
+
+
 def _conversation_fingerprint(input_items: list) -> str:
     """Stable conversation identity for clients that send no cache key.
 

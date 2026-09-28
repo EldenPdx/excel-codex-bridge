@@ -127,6 +127,97 @@ class LocalOnlyGuardTests(unittest.TestCase):
         self.assertEqual(harness.request("GET", "/docs").status_code, 404)
 
 
+class SharedProviderTests(unittest.TestCase):
+    """Codex's own ``openai`` provider pointed at the bridge (``openai_base_url``)."""
+
+    UPGRADE = {"upgrade": "websocket", "connection": "Upgrade", "sec-websocket-version": "13",
+               "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ=="}
+
+    def test_websocket_upgrade_is_answered_426_so_codex_uses_http(self):
+        harness = BridgeHarness(ok_stream)
+        response = harness.request("GET", "/v1/responses", headers=self.UPGRADE)
+        self.assertEqual(response.status_code, 426)
+        self.assertEqual(harness.upstream_requests, [])
+
+    def test_websocket_scope_is_denied(self):
+        harness = BridgeHarness(ok_stream)
+
+        def run(extensions):
+            sent = []
+
+            async def receive():
+                return {"type": "websocket.connect"}
+
+            async def send(message):
+                sent.append(message)
+
+            scope = {"type": "websocket", "path": "/v1/responses", "client": ("127.0.0.1", 50000),
+                     "headers": [(b"host", b"127.0.0.1:8765")], "extensions": extensions}
+            asyncio.run(harness.app(scope, receive, send))
+            return sent
+
+        sent = run({"websocket.http.response": {}})
+        self.assertEqual((sent[0]["type"], sent[0]["status"]), ("websocket.http.response.start", 426))
+        self.assertEqual(run({})[0]["type"], "websocket.close")
+
+    def test_codex_own_sign_in_stays_here(self):
+        harness = BridgeHarness(ok_stream)
+        response = harness.request(
+            "POST", "/v1/responses",
+            headers={"authorization": "Bearer codex-own-token", "chatgpt-account-id": "codex-own-account"},
+            json={"model": "gpt-6-sol", "input": "hi", "stream": True},
+        )
+        self.assertEqual(response.status_code, 200)
+        sent = harness.upstream_requests[0].headers
+        self.assertNotIn("codex-own-token", sent.get("authorization", ""))
+        self.assertNotEqual(sent.get("chatgpt-account-id"), "codex-own-account")
+
+    def conversation(self):
+        return {
+            "model": "gpt-6-luna", "stream": True,
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "reasoning", "summary": [], "encrypted_content": "gAAAA-from-another-backend"},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "hello"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "again"}]},
+            ],
+        }
+
+    def test_reasoning_another_backend_encrypted_is_left_out_once(self):
+        answers = iter([
+            httpx.Response(400, json={"error": {
+                "message": "The encrypted content for item rs_1 could not be verified.",
+                "code": "invalid_encrypted_content"}}),
+            ok_stream(None),
+        ])
+        harness = BridgeHarness(lambda _r: next(answers))
+        with self.assertLogs("excel_codex_bridge", "WARNING"):
+            response = harness.request("POST", "/v1/responses", json=self.conversation())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(harness.upstream_requests), 2)
+        kinds = [[item.get("type") for item in harness.upstream_json(i)["input"]] for i in (0, 1)]
+        self.assertIn("reasoning", kinds[0])
+        self.assertNotIn("reasoning", kinds[1])
+        texts = json.dumps(harness.upstream_json(1)["input"])
+        self.assertIn("hello", texts)
+        self.assertIn("again", texts)
+
+    def test_other_400s_are_not_retried(self):
+        harness = BridgeHarness(lambda _r: httpx.Response(400, json={"error": {"message": "bad input"}}))
+        response = harness.request("POST", "/v1/responses", json=self.conversation())
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(len(harness.upstream_requests), 1)
+
+    def test_no_reasoning_means_no_retry(self):
+        body = self.conversation()
+        body["input"] = [item for item in body["input"] if item["type"] != "reasoning"]
+        harness = BridgeHarness(lambda _r: httpx.Response(400, json={"error": {
+            "message": "Encrypted content could not be decrypted."}}))
+        response = harness.request("POST", "/v1/responses", json=body)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(len(harness.upstream_requests), 1)
+
+
 class ResponsesRouteTests(unittest.TestCase):
     def test_non_excel_model_is_rejected_before_upstream(self):
         harness = BridgeHarness(ok_stream)

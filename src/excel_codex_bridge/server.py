@@ -23,6 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from . import excel_upstream
+from . import exit_timezone
 from . import image_generation
 from . import images
 from . import session
@@ -83,6 +84,9 @@ class LocalOnly:
             reason = "the Host header must name a loopback address"
         elif "origin" in headers:
             reason = "browser-originated requests are not accepted"
+        if reason is None and (scope["type"] == "websocket" or headers.get("upgrade", "").lower() == "websocket"):
+            await _refuse_websocket(scope, receive, send)
+            return
         if reason is None:
             await self.app(scope, receive, send)
             return
@@ -91,6 +95,20 @@ class LocalOnly:
             return
         response = sse.openai_error_response(403, f"Forbidden: {reason}.")
         await response(scope, receive, send)
+
+
+async def _refuse_websocket(scope, receive, send) -> None:
+    """Codex's own provider tries a WebSocket first; 426 sends it straight to HTTP."""
+    response = sse.openai_error_response(426, "This bridge speaks HTTP only; use POST /v1/responses.")
+    if scope["type"] == "http":
+        await response(scope, receive, send)
+        return
+    await receive()  # websocket.connect
+    if "websocket.http.response" not in scope.get("extensions", {}):
+        await send({"type": "websocket.close", "code": 1003})
+        return
+    await send({"type": "websocket.http.response.start", "status": 426, "headers": response.raw_headers})
+    await send({"type": "websocket.http.response.body", "body": bytes(response.body)})
 
 
 def _zstd_decompress(raw: bytes) -> bytes:
@@ -230,6 +248,7 @@ class Bridge:
         self._client_factory = client_factory
         self._client: httpx.AsyncClient | None = None
         self.pictures = images.Pictures()
+        self.timezone = exit_timezone.ExitTimezone(lambda: self.client)
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -238,6 +257,7 @@ class Bridge:
         return self._client
 
     async def aclose(self) -> None:
+        await self.timezone.aclose()
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -309,12 +329,13 @@ class Bridge:
     async def _draw(self, operation: str, url: str, send: dict, headers: dict) -> Response:
         if "files" in send:
             headers = {key: value for key, value in headers.items() if key.lower() != "content-type"}
+        model = (send.get("json") or send.get("data") or {}).get("model")
         try:
             upstream = await self.client.post(url, headers=headers, timeout=IMAGE_TIMEOUT, **send)
         except httpx.RequestError as exc:
             return _request_error_response(exc, IMAGE_TIMEOUT)
         if upstream.status_code >= 400:
-            log.warning("image %s: upstream returned HTTP %s", operation, upstream.status_code)
+            log.warning("image %s with %s: upstream returned HTTP %s", operation, model, upstream.status_code)
             # The session was just checked, so this is about pictures, not signing in.
             return _upstream_error_response(upstream, refused="the image request")
         try:
@@ -324,7 +345,8 @@ class Bridge:
         if not isinstance(payload, dict):
             return sse.openai_error_response(502, "The Excel backend's image answer was not JSON.")
         pictures = payload.get("data")
-        log.info("image %s: %d picture(s) came back", operation, len(pictures) if isinstance(pictures, list) else 0)
+        log.info("image %s with %s: %d picture(s) came back",
+                 operation, model, len(pictures) if isinstance(pictures, list) else 0)
         return JSONResponse(content=payload)
 
     async def _send_with_pictures(self, headers: dict, body: dict) -> Response:
@@ -361,6 +383,25 @@ class Bridge:
         return response
 
     async def _send(self, headers: dict, body: dict, original: dict) -> Response:
+        response = await self._send_once(headers, body, original)
+        if response.status_code != 400 or "encrypted content" not in _error_text(response).lower():
+            return response
+        # A conversation that went on with the bridge off carries reasoning another
+        # backend encrypted; without it the history still reads the same.
+        kept = excel_upstream.without_encrypted_reasoning(body)
+        if kept is body:
+            return response
+        log.warning(
+            "the Excel backend could not read reasoning from another backend (%s); "
+            "sending the conversation without it",
+            _error_text(response),
+        )
+        return await self._send_once(headers, kept, original)
+
+    async def _send_once(self, headers: dict, body: dict, original: dict) -> Response:
+        zone = await self.timezone.current()
+        if zone is not None:
+            body = exit_timezone.rewrite_body(body, zone)
         upstream_body = excel_upstream.prepare_responses_body(
             body,
             tools_version_id=self.reader.store.tools_version_id(),

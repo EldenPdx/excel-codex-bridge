@@ -6,6 +6,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path, PureWindowsPath
+from unittest import mock
 
 from excel_codex_bridge import codex_config, excel_upstream
 from excel_codex_bridge import cli
@@ -26,10 +27,17 @@ def parse_overrides(args: list[str]) -> dict:
 IMAGE_TOOL = {"x-openai-actor-authorization": "excel-codex-bridge"}
 
 
+OFFICIAL = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra")
+
+
 class CatalogTests(unittest.TestCase):
     def test_catalog_lists_the_excel_models_with_pictures(self):
-        models = codex_config.catalog_payload()["models"]
-        self.assertEqual({m["slug"] for m in models}, set(excel_upstream.MODEL_IDS))
+        models = [m for m in codex_config.catalog_payload()["models"] if m["visibility"] == "list"]
+        # OpenAI's own names where it has them, so conversations carry on with the bridge off.
+        self.assertEqual(
+            {m["slug"] for m in models},
+            set(OFFICIAL) | {m for m in excel_upstream.MODEL_IDS if m.endswith("-1m-excel")},
+        )
         for model in models:
             self.assertEqual(model["input_modalities"], ["text", "image"])
             self.assertTrue(model["supports_parallel_tool_calls"])
@@ -40,17 +48,35 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(len(windows), 12)
         for base in ("5.6-sol", "5.6-terra", "5.6-luna", "6-sol", "6-luna", "6-astra"):
             with self.subTest(base=base):
-                self.assertEqual(windows[f"gpt-{base}-excel"], 272_000)
+                self.assertEqual(windows[f"gpt-{base}"], 272_000)
                 self.assertEqual(windows[f"gpt-{base}-1m-excel"], 918_000)
         self.assertEqual(
             {m["slug"]: m["display_name"] for m in models if m["slug"].startswith("gpt-6-sol")},
-            {"gpt-6-sol-excel": "6-Sol Excel", "gpt-6-sol-1m-excel": "6-Sol Excel 1M"},
+            {"gpt-6-sol": "6-Sol Excel", "gpt-6-sol-1m-excel": "6-Sol Excel 1M"},
         )
         self.assertFalse(any("experimental" in m["description"] for m in models))
 
+    def test_old_names_stay_for_conversations_started_with_them(self):
+        models = {m["slug"]: m for m in codex_config.catalog_payload()["models"]}
+        self.assertEqual(len(models), 18)
+        for base in OFFICIAL:
+            with self.subTest(base=base):
+                old = models[f"{base}-excel"]
+                self.assertEqual(old["visibility"], "hide")
+                self.assertEqual({**old, "slug": base, "visibility": "list", "priority": 0},
+                                 {**models[base], "priority": 0})
+
+    def test_codex_model_names(self):
+        self.assertEqual(codex_config.codex_model("gpt-6-sol-excel"), "gpt-6-sol")
+        self.assertEqual(codex_config.codex_model("GPT-6-Sol-Excel"), "gpt-6-sol")
+        self.assertEqual(codex_config.codex_model("gpt-6-sol-1m-excel"), "gpt-6-sol-1m-excel")
+        self.assertEqual(codex_config.codex_model("gpt-6-sol"), "gpt-6-sol")
+        self.assertEqual(codex_config.codex_model("something-else"), "something-else")
+        self.assertEqual(codex_config.DEFAULT_MODEL, "gpt-5.6-sol")
+
     def test_long_context_aliases_compact_near_their_window(self):
         models = {m["slug"]: m for m in codex_config.catalog_payload()["models"]}
-        self.assertEqual(models["gpt-6-sol-excel"]["auto_compact_token_limit"], 180_000)
+        self.assertEqual(models["gpt-6-sol"]["auto_compact_token_limit"], 180_000)
         self.assertEqual(models["gpt-6-sol-1m-excel"]["auto_compact_token_limit"], 826_000)
         self.assertEqual(models["gpt-6-sol-1m-excel"]["max_context_window"], 918_000)
         self.assertIn("918,000 token context", models["gpt-6-sol-1m-excel"]["description"])
@@ -69,13 +95,43 @@ class OverrideTests(unittest.TestCase):
         catalog = Path("/tmp/catalog.json")
         args = codex_config.codex_overrides(4321, catalog)
         parsed = parse_overrides(args)
-        self.assertEqual(parsed["model"], "gpt-5.6-sol-excel")
+        self.assertEqual(parsed["model"], "gpt-5.6-sol")
         self.assertEqual(parsed["model_provider"], "excel-bridge")
+        self.assertNotIn("openai_base_url", parsed)
         self.assertEqual(parsed["model_providers.excel-bridge.base_url"], "http://127.0.0.1:4321/v1")
         self.assertEqual(parsed["model_providers.excel-bridge.wire_api"], "responses")
         # The header Codex wants before it offers its image tool to a provider.
         self.assertEqual(parsed["model_providers.excel-bridge.http_headers"], IMAGE_TOOL)
         self.assertEqual(parsed["model_catalog_json"], str(catalog))
+
+    def test_shared_overrides_stand_in_for_codex_own_provider(self):
+        catalog = Path("/tmp/catalog.json")
+        parsed = parse_overrides(codex_config.codex_overrides(4321, catalog, "gpt-6-luna-excel", shared=True))
+        self.assertEqual(parsed["model_provider"], "openai")
+        self.assertEqual(parsed["openai_base_url"], "http://127.0.0.1:4321/v1")
+        self.assertEqual(parsed["model"], "gpt-6-luna")
+        # Conversations started as excel-bridge can still be resumed through the bridge.
+        self.assertEqual(parsed["model_providers.excel-bridge.base_url"], "http://127.0.0.1:4321/v1")
+
+    def test_signed_in_looks_only_at_the_kind_of_sign_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.assertFalse(codex_config.codex_signed_in(home))
+            for content, expected in (
+                ({"tokens": {"access_token": "x", "refresh_token": "y"}}, True),
+                ({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-x"}, True),
+                ({"tokens": {"access_token": " "}}, False),
+                ({"OPENAI_API_KEY": None, "tokens": None}, False),
+                ([], False),
+            ):
+                with self.subTest(content=content):
+                    (home / "auth.json").write_text(json.dumps(content), encoding="utf-8")
+                    self.assertEqual(codex_config.codex_signed_in(home), expected)
+            (home / "auth.json").write_text("{not json", encoding="utf-8")
+            self.assertFalse(codex_config.codex_signed_in(home))
+            with mock.patch.dict(os.environ, {"CODEX_HOME": directory}):
+                (home / "auth.json").write_text('{"OPENAI_API_KEY": "sk-x"}', encoding="utf-8")
+                self.assertTrue(codex_config.codex_signed_in())
 
     def test_windows_paths_survive_toml_parsing(self):
         path = PureWindowsPath(r"C:\Users\张三\AppData\Local\excel-codex-bridge\codex-model-catalog.json")

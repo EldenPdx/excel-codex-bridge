@@ -3,6 +3,14 @@
 The launcher passes everything on the Codex command line, so the user's
 ``~/.codex/config.toml`` is left alone; only ``excel-codex desktop`` edits it
 (see ``desktop_config``).
+
+Codex lists and resumes conversations by the provider they were started with.
+When Codex is signed in, the bridge therefore stands in for Codex's own
+``openai`` provider (``openai_base_url``) rather than adding one of its own,
+and the catalog names models the way OpenAI does (``gpt-6-sol``, not
+``gpt-6-sol-excel``): conversations started with or without the bridge then
+carry on either way.  Without a sign-in Codex would ask for one before using
+``openai``, so the bridge's own ``excel-bridge`` provider is used instead.
 """
 
 from __future__ import annotations
@@ -17,7 +25,7 @@ from . import excel_upstream
 
 PROVIDER_ID = "excel-bridge"
 PROVIDER_NAME = "Excel Bridge"
-DEFAULT_MODEL = excel_upstream.MODEL_ID
+OPENAI_PROVIDER_ID = "openai"
 DEFAULT_PORT = 8765
 # Codex offers its image tool (image_gen.imagegen) to a provider of its own only
 # when the provider sets this header; the bridge answers the tool with the
@@ -47,6 +55,23 @@ CATALOG_ORDER = (
     "gpt-5.6-luna-excel", "gpt-5.6-luna-1m-excel",
 )
 
+
+
+def codex_model(model: str) -> str:
+    """The name Codex keeps for ``model``: OpenAI's own where there is one.
+
+    ``gpt-6-sol-excel`` becomes ``gpt-6-sol``, which Codex's official sign-in
+    serves too, so a conversation left on it carries on with the bridge off.
+    A ``-1m`` alias has no official twin and stays as it is.
+    """
+    alias = excel_upstream.excel_model_id(model)
+    if alias is None or alias.endswith(excel_upstream.LONG_CONTEXT_SUFFIX):
+        return alias or model
+    return excel_upstream.EXCEL_MODEL_UPSTREAMS[alias]
+
+
+DEFAULT_MODEL = codex_model(excel_upstream.MODEL_ID)
+
 _REASONING_LEVEL_DESCRIPTIONS = {
     "low": "Fast responses with lighter reasoning",
     "medium": "Balances speed and reasoning depth for everyday tasks",
@@ -66,16 +91,22 @@ def state_dir() -> Path:
 
 
 def catalog_payload() -> dict[str, object]:
-    """Codex ``model_catalog_json`` entries for the Excel aliases."""
+    """Codex ``model_catalog_json`` entries for the Excel aliases.
+
+    Each is listed under ``codex_model``'s name.  The old ``*-excel`` names
+    stay in, hidden from the picker, for conversations started with them.
+    """
+    listed = [(codex_model(model_id), model_id, "list") for model_id in CATALOG_ORDER]
+    hidden = [(model_id, model_id, "hide") for model_id in CATALOG_ORDER if codex_model(model_id) != model_id]
     models = []
-    for priority, model_id in enumerate(CATALOG_ORDER):
+    for priority, (slug, model_id, visibility) in enumerate(listed + hidden):
         caps = excel_upstream.LOCAL_MODEL_CAPABILITIES[model_id]
         context_window = int(caps["context_window"])
         # Codex compacts at this many tokens; keep a build buffer under the window.
         auto_compact = min(int(caps["auto_compact_token_limit"]), context_window - 8000)
         models.append(
             {
-                "slug": model_id,
+                "slug": slug,
                 "display_name": caps["display_name"],
                 "description": (
                     f"ChatGPT Excel add-in session · {context_window:,} token context · "
@@ -87,7 +118,7 @@ def catalog_payload() -> dict[str, object]:
                     for effort in excel_upstream.EXCEL_REASONING_EFFORTS
                 ],
                 "shell_type": "shell_command",
-                "visibility": "list",
+                "visibility": visibility,
                 "supported_in_api": True,
                 "priority": priority,
                 "additional_speed_tiers": [],
@@ -153,17 +184,47 @@ def http_headers() -> str:
     return f"{{ {json.dumps(name)} = {json.dumps(value)} }}"
 
 
-def codex_overrides(port: int, catalog: Path, model: str = DEFAULT_MODEL) -> list[str]:
-    """``-c`` arguments that route one Codex session through the bridge."""
+def codex_signed_in(home: Path | None = None) -> bool:
+    """Whether Codex has a sign-in of its own, so it can use its ``openai`` provider.
+
+    Only looks at what kind of sign-in ``auth.json`` holds; no token is read out.
+    """
+    if home is None:
+        override = os.environ.get("CODEX_HOME", "").strip()
+        home = Path(override).expanduser() if override else Path.home() / ".codex"
+    try:
+        data = json.loads((home / "auth.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    tokens = data.get("tokens")
+    access = tokens.get("access_token") if isinstance(tokens, dict) else None
+    key = data.get("OPENAI_API_KEY")
+    return any(isinstance(value, str) and value.strip() for value in (access, key))
+
+
+def provider_for(shared: bool) -> str:
+    return OPENAI_PROVIDER_ID if shared else PROVIDER_ID
+
+
+def codex_overrides(port: int, catalog: Path, model: str = DEFAULT_MODEL, *, shared: bool = False) -> list[str]:
+    """``-c`` arguments that route one Codex session through the bridge.
+
+    ``shared`` points Codex's own ``openai`` provider at the bridge; the
+    ``excel-bridge`` provider is defined either way, for conversations started
+    with it.
+    """
     prefix = f"model_providers.{PROVIDER_ID}"
     pairs = [
-        ("model_provider", _toml_string(PROVIDER_ID)),
+        ("model_provider", _toml_string(provider_for(shared))),
+        *([("openai_base_url", _toml_string(base_url(port)))] if shared else []),
         (f"{prefix}.name", _toml_string(PROVIDER_NAME)),
         (f"{prefix}.base_url", _toml_string(base_url(port))),
         (f"{prefix}.wire_api", _toml_string("responses")),
         (f"{prefix}.http_headers", http_headers()),
         ("model_catalog_json", _toml_string(str(catalog))),
-        ("model", _toml_string(model)),
+        ("model", _toml_string(codex_model(model))),
     ]
     args: list[str] = []
     for key, value in pairs:
@@ -187,7 +248,7 @@ def config_snippet(port: int, catalog: Path, model: str = DEFAULT_MODEL) -> str:
     return (
         "# excel-codex-bridge: keep `excel-codex serve` running while using this\n"
         f"model_provider = {_toml_string(PROVIDER_ID)}\n"
-        f"model = {_toml_string(model)}\n"
+        f"model = {_toml_string(codex_model(model))}\n"
         f"model_catalog_json = {_toml_string(str(catalog))}\n"
         "\n"
         f"[model_providers.{PROVIDER_ID}]\n"

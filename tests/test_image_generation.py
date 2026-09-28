@@ -3,11 +3,13 @@ from __future__ import annotations
 import base64
 import email
 import email.policy
+import os
 import unittest
+from unittest import mock
 
 import httpx
 
-from excel_codex_bridge import image_generation
+from excel_codex_bridge import cli, image_generation
 from excel_codex_bridge.image_generation import Refused, edit_form, generation_body
 
 from test_server import BridgeHarness
@@ -61,6 +63,20 @@ class RequestTests(unittest.TestCase):
         self.assertEqual([(name, file[0]) for name, file in files],
                          [("image[]", "picture-1.png"), ("image[]", "picture-2.jpg")])
 
+    def test_a_chosen_image_model_stands_in_for_codex_own(self):
+        with mock.patch.dict(os.environ, {image_generation.MODEL_ENV: " gpt-image-2.5 "}):
+            self.assertEqual(generation_body(CODEX_REQUEST), {**ADDIN_REQUEST, "model": "gpt-image-2.5"})
+            self.assertEqual(generation_body({**CODEX_REQUEST, "model": "gpt-image-2.5"})["model"], "gpt-image-2.5")
+            self.assertEqual(generation_body({"prompt": "p"})["model"], "gpt-image-2.5")
+            fields, _ = edit_form({**CODEX_REQUEST, "images": [{"image_url": PICTURE_URL}]})
+            self.assertEqual(fields["model"], "gpt-image-2.5")
+            with self.assertRaisesRegex(Refused, "draws with gpt-image-2.5.*--image-model"):
+                generation_body({**CODEX_REQUEST, "model": "gpt-image-1"})
+        for name in ("gpt image", "../x", "-x", "x" * 65):
+            with self.subTest(name=name), mock.patch.dict(os.environ, {image_generation.MODEL_ENV: name}), \
+                    self.assertRaisesRegex(Refused, image_generation.MODEL_ENV):
+                generation_body(CODEX_REQUEST)
+
     def test_edit_needs_inline_pictures(self):
         for pictures in (None, [], [{"image_url": "https://example.com/a.png"}], [{"file_id": "file-1"}],
                          ["data:image/png;base64,AAAA"]):
@@ -81,6 +97,15 @@ class RouteTests(unittest.TestCase):
         self.assertTrue(upstream.headers["authorization"].startswith("Bearer "))
         self.assertEqual(upstream.headers["chatgpt-account-id"], "account-id")
         self.assertEqual(upstream.headers["accept"], "application/json")
+
+    def test_the_chosen_model_is_asked_for_and_shown(self):
+        harness = BridgeHarness(lambda _r: httpx.Response(200, json=DRAWN))
+        with mock.patch.dict(os.environ, {image_generation.MODEL_ENV: "gpt-image-2.5"}), \
+                self.assertLogs("excel_codex_bridge", "INFO") as logs:
+            response = harness.request("POST", "/v1/images/generations", json=CODEX_REQUEST)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(harness.upstream_json()["model"], "gpt-image-2.5")
+        self.assertIn("image generations with gpt-image-2.5: 1 picture(s) came back", "\n".join(logs.output))
 
     def test_edit_is_posted_as_the_add_ins_form(self):
         harness = BridgeHarness(lambda _r: httpx.Response(200, json=DRAWN))
@@ -142,6 +167,22 @@ class RouteTests(unittest.TestCase):
         response = BridgeHarness(fail).request("POST", "/v1/images/generations", json=CODEX_REQUEST)
         self.assertEqual(response.status_code, 504)
         self.assertIn("within 10 minutes", response.json()["error"]["message"])
+
+
+class OptionTests(unittest.TestCase):
+    def test_image_model_option(self):
+        args = cli._parser().parse_args(["desktop", "--image-model", "gpt-image-2.5"])
+        with mock.patch.dict(os.environ, {}):
+            cli._apply_proxy(args)
+            self.assertEqual(os.environ[image_generation.MODEL_ENV], "gpt-image-2.5")
+            self.assertIn("draws with gpt-image-2.5", cli._pictures_line())
+        self.assertIn("draws with gpt-image-2 ", cli._pictures_line())
+        for command in ("codex", "serve"):
+            self.assertEqual(cli._parser().parse_args([command, "--image-model", "x-1"]).image_model, "x-1")
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            cli._parser().parse_args(["serve", "--image-model", "not a name"])
+        with mock.patch.dict(os.environ, {image_generation.MODEL_ENV: "not a name"}):
+            self.assertIn("is not an image model name", cli._pictures_line())
 
 
 if __name__ == "__main__":

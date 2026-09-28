@@ -134,8 +134,8 @@ later runs start instantly.
 Common invocations (everything after `--` goes to Codex unchanged):
 
 ```
-excel-codex                                   interactive Codex, default gpt-5.6-sol-excel
-excel-codex --model gpt-5.6-terra-excel       pick another model
+excel-codex                                   interactive Codex, default gpt-5.6-sol (through Excel)
+excel-codex --model gpt-6-sol-1m-excel        pick another model
 excel-codex -- -c model_reasoning_effort=high set reasoning effort
 excel-codex -- exec "add a table of contents to the README"
 excel-codex -- resume --last                  resume the last session
@@ -143,10 +143,12 @@ excel-codex status                            which sign-in is used, is it usabl
 excel-codex --login codex                      use Codex's own sign-in only (never touch Excel)
 excel-codex login                             open Excel's ChatGPT pane to sign in or refresh
 excel-codex desktop                           route the Codex desktop app / IDE extension here
+excel-codex threads migrate                   move bridge conversations from 0.5.3 and earlier into the shared list
 ```
 
-Launcher options: `--login <auto|codex|excel>`, `--model`, `--proxy`, `--port`, `--codex <path>`,
-`--webview-dir <dir>`, `--skip-session-check`, `--no-auto-signin`.
+Launcher options: `--login <auto|codex|excel>`, `--model`, `--proxy`, `--timezone <auto|off>`,
+`--image-model <name>`, `--port`, `--codex <path>`, `--webview-dir <dir>`, `--skip-session-check`,
+`--no-auto-signin`.
 
 ## Models
 
@@ -154,12 +156,17 @@ Every model comes in two versions: the same upstream model with a different cont
 
 | 272k version | 1M version | Upstream model |
 | --- | --- | --- |
-| `gpt-5.6-sol-excel` (default) | `gpt-5.6-sol-1m-excel` | `gpt-5.6-sol` |
-| `gpt-5.6-terra-excel` | `gpt-5.6-terra-1m-excel` | `gpt-5.6-terra` |
-| `gpt-5.6-luna-excel` | `gpt-5.6-luna-1m-excel` | `gpt-5.6-luna` |
-| `gpt-6-sol-excel` | `gpt-6-sol-1m-excel` | `gpt-6-sol` |
-| `gpt-6-luna-excel` | `gpt-6-luna-1m-excel` | `gpt-6-luna` |
-| `gpt-6-astra-excel` | `gpt-6-astra-1m-excel` | `gpt-6-astra` |
+| `gpt-5.6-sol` (default) | `gpt-5.6-sol-1m-excel` | `gpt-5.6-sol` |
+| `gpt-5.6-terra` | `gpt-5.6-terra-1m-excel` | `gpt-5.6-terra` |
+| `gpt-5.6-luna` | `gpt-5.6-luna-1m-excel` | `gpt-5.6-luna` |
+| `gpt-6-sol` | `gpt-6-sol-1m-excel` | `gpt-6-sol` |
+| `gpt-6-luna` | `gpt-6-luna-1m-excel` | `gpt-6-luna` |
+| `gpt-6-astra` | `gpt-6-astra-1m-excel` | `gpt-6-astra` |
+
+- From 0.5.4 the 272k versions use OpenAI's own names in Codex (the model list shows them as, for
+  example, "6-Sol Excel"), so a conversation carries on whether the bridge is on or off, see
+  [Session sharing](#session-sharing). The earlier names such as `gpt-6-sol-excel` still work; they
+  are just no longer in the model list. OpenAI has no 1M versions, so their names stay.
 
 - **272k version**: 272k context; Codex compacts automatically at 180k.
 - **1M version**: 918k context; Codex compacts automatically at about 826k. 918k is the limit measured
@@ -214,10 +221,12 @@ the bridge for as long as you need it:
    It checks the session (signing in if needed), points `config.toml` at the bridge and runs the
    bridge on `127.0.0.1:8765`.
 2. **Fully quit and reopen the Codex desktop app** (or reload the IDE window); the model list
-   shows the `*-excel` models. **Start a new conversation** with them: conversations started
-   earlier keep the account they were started with.
+   shows the bridge's models (their display names say Excel). If Codex is signed in, earlier
+   conversations are in the list too and carry on, see [Session sharing](#session-sharing).
 3. Keep that window open while you work (minimizing is fine). **Closing it or pressing Ctrl+C
    restores `config.toml` exactly.**
+4. On Windows the window also sets the system timezone to Codex's exit timezone, see
+   [Exit timezone](#exit-timezone).
 
 Details:
 
@@ -227,29 +236,110 @@ Details:
   bridge while the window is open.
 - To keep it on: `excel-codex desktop --keep-config`, and later `excel-codex desktop --off`
   (also the fix if the window was killed before it could restore the config).
-- Other model: `excel-codex desktop --model gpt-5.6-terra-excel`; other port: `--port`.
+- Other model: `excel-codex desktop --model gpt-5.6-terra`; other port: `--port`.
 
-**Error `The '…-excel' model is not supported when using Codex with a ChatGPT account`** (after
-signing out of Codex it becomes `401 Unauthorized: Missing bearer or basic authentication` for
+**Error `The '…' model is not supported when using Codex with a ChatGPT account`** (after signing
+out of Codex it becomes `401 Unauthorized: Missing bearer or basic authentication` for
 `api.openai.com/v1/responses`). The conversation's request did not go through the bridge; it went
-straight to OpenAI, so signing out does not help. The desktop app reads `config.toml` when a
-conversation starts to decide where its requests go, and the conversation keeps that choice. The
-model list, though, is read only when the desktop app starts. So the list can still show the
-`*-excel` models while the conversation is tied to OpenAI's own service. Common causes:
+straight to OpenAI, so signing out does not help. Models OpenAI does not have (the 1M versions, or
+the `*-excel` names of 0.5.3 and earlier) fail like this. The desktop app reads `config.toml` and
+the model list only when it starts. Common causes:
 
 - The bridge window was closed (so `config.toml` was restored) but the desktop app was not
-  restarted.
-- The conversation was started before desktop mode was on; switching it to an Excel model does
-  not help.
+  restarted, so the list still shows the bridge's models.
+- A 1M conversation is continued after the bridge was closed: pick an OpenAI model in the model
+  menu.
+- With Codex not signed in (the bridge is then a provider of its own), the conversation was started
+  before desktop mode was on.
 - A tool such as Cockpit Tools switched Codex back to a ChatGPT account.
 
 Fix: open `excel-codex-desktop.cmd`, fully quit the desktop app (File → Quit, or quit from the
-tray; after closing the window it may still run in the background) and reopen it, then **start a
-new conversation**. Each message then shows a line like `"POST /v1/responses HTTP/1.1" 200` in the
-bridge window (0.4.2 and later); if nothing shows up, the request still bypasses the bridge.
+tray; after closing the window it may still run in the background) and reopen it. Each message then
+shows a line like `"POST /v1/responses HTTP/1.1" 200` in the bridge window (0.4.2 and later); if
+nothing shows up, the request still bypasses the bridge.
 
 Fully manual alternative: run `excel-codex serve` and add the output of `excel-codex print-config`
 to `config.toml`; remove those lines to go back.
+
+## Session sharing
+
+Codex lists and continues conversations by the provider they were started with. Up to 0.5.3 the
+bridge was a provider of its own (`excel-bridge`), so with the bridge on the earlier conversations
+of the official sign-in were not listed, and with it off the ones started through the bridge could
+not carry on.
+
+From 0.5.4, **as long as Codex itself is signed in** (`codex login`, with a ChatGPT account or an
+API key), desktop mode and the Codex that `excel-codex` starts point Codex's own `openai` provider
+at the bridge (`openai_base_url`) and use OpenAI's model names. So:
+
+- With the bridge on: the earlier conversations of the official sign-in are all listed and carry on
+  through Excel.
+- With the bridge off: the conversations started with the bridge on are still listed and carry on
+  through the official sign-in. A 1M conversation first needs an OpenAI model picked in the model
+  menu.
+- The reasoning each backend encrypts may not be readable by the other. When the Excel backend
+  cannot read the official one's, the bridge sends the conversation again without that reasoning;
+  the conversation's text is unaffected (the bridge window shows a line about it). Whether the
+  official backend reads the Excel backend's has not been tested yet; if a conversation fails after
+  the bridge is closed, start a new one.
+- `codex exec` shows a line `failed to connect to websocket: 426`: Codex's own provider tries a
+  WebSocket first, the bridge speaks only HTTP and answers 426 so that it switches to HTTP right
+  away. This is expected.
+
+When Codex is not signed in, its own provider asks for a sign-in first, so the bridge stays the
+separate `excel-bridge` provider and behaves as before: conversations started with the bridge on
+are listed only while it is on.
+
+### Bridge conversations from 0.5.3 and earlier
+
+These are filed under `excel-bridge` and are not in the shared list. `excel-codex threads` lists
+them, and `excel-codex threads migrate` moves them into the shared list:
+
+1. Fully quit the Codex desktop app first (or close the IDE window). Codex has to be signed in
+   (`codex login`).
+2. Run `excel-codex threads migrate`. It files them under `openai`, with OpenAI's model names
+   (`gpt-6-sol-excel` → `gpt-6-sol`; the 1M versions stay as they are).
+3. Reopen Codex: they are in the same list as the other conversations.
+
+- Only Codex's conversation index changes (the threads table in `~/.codex/state_<n>.sqlite`), never
+  the conversations themselves (the files under `~/.codex/sessions`). The index is copied first,
+  to `state_<n>.sqlite.before-excel-codex-<time>` in the same folder.
+- `excel-codex threads undo` undoes it: conversations the migration changed, and Codex has not
+  changed since, go back under `excel-bridge`.
+- When a migrated conversation that has not been continued yet is renamed or archived in Codex,
+  Codex rebuilds it from its conversation file and it goes back under `excel-bridge`; run
+  `excel-codex threads migrate` again. Once it has been continued, this no longer happens.
+- Without migrating, they still carry on in a terminal while the bridge is on, with
+  `excel-codex -- resume <session ID>` (the session ID is in the file names under
+  `~/.codex/sessions`).
+- When Codex is signed in, `excel-codex-desktop.cmd` mentions it when there are such conversations.
+
+## Exit timezone
+
+Codex writes this computer's timezone and date into every conversation (`<timezone>` and
+`<current_date>` in `<environment_context>`). Requests leave from the proxy exit; when this
+computer's timezone differs from the exit's, the model assumes you are in another timezone.
+
+- **Requests through the bridge**: the bridge looks up the exit IP
+  (`https://bps.openai.com/cdn-cgi/trace`), then that IP's timezone (ipwho.is, else ipapi.co), and
+  replaces the timezone and today's date in the request with the exit's. It checks every 5 minutes
+  whether the exit IP changed.
+- **Codex's official ChatGPT sign-in** (Windows): this route does not go through the bridge, and
+  Codex reads the Windows system timezone. While `excel-codex-desktop.cmd` is open it looks up the
+  exit timezone of `chatgpt.com` (`api.openai.com` with an API key) the way Codex picks its proxy
+  (`HTTPS_PROXY` / `ALL_PROXY`, else the Windows proxy settings; PAC scripts are not supported),
+  and sets the system timezone to it with `tzutil` at start and every minute after. Nothing else
+  has to run, and no scheduled task is created.
+
+Notes:
+
+- This changes the whole computer's timezone. `excel-codex timezone restore` restores the timezone
+  from before the first change.
+- Only the exit IP is sent to ipwho.is / ipapi.co, through the same proxy; nothing else is sent.
+  The answer for an IP is cached.
+- `--timezone off` (or `EXCEL_BRIDGE_TIMEZONE=off`) turns both off.
+- `excel-codex timezone` shows the exit timezone and the current state;
+  `excel-codex timezone sync --probe` looks up without changing anything.
 
 ## macOS / WSL (experimental)
 
@@ -342,6 +432,16 @@ The picture shows up in the conversation and is saved under `~/.codex/generated_
   model asks for one it is told so, and can draw on a plain background instead.
 - Pictures count against your ChatGPT plan. When the backend refuses, Codex shows the reason the
   backend gave.
+- **Choosing the image model**: Codex's image tool always asks for gpt-image-2 and does not tell the
+  model in the conversation which model drew, so asking it "was this model X?" gets no sure answer.
+  For another model (say `gpt-image-2.5`), start with `--image-model gpt-image-2.5` (or set
+  `EXCEL_BRIDGE_IMAGE_MODEL`) and the bridge asks the backend for that one instead. The bridge window
+  shows the image model at start and logs a line like
+  `image generations with gpt-image-2.5: 1 picture(s) came back` for each picture; go by that.
+  Whether the backend takes the name is up to the backend; when it does not, Codex shows its reason.
+- When conversations are shared with Codex's own ChatGPT sign-in (see
+  [Session sharing](#session-sharing)), Codex offers this tool for its own provider anyway; with an
+  API key sign-in it does not.
 - When a tool such as Cockpit Tools manages Codex, it writes the provider, so add
   `http_headers = { "x-openai-actor-authorization" = "excel-codex-bridge" }` to its provider
   settings yourself.
@@ -392,6 +492,8 @@ running from source, `git pull` is enough.
 | `EXCEL_BRIDGE_HOME` | State folder for the model catalog JSON, `bridge.log`, the sign-in workbook, and `tool-calls.sqlite3`, which lets earlier tool calls replay exactly after a restart (kept 60 days). Default `%LOCALAPPDATA%\excel-codex-bridge` or `~/.excel-codex-bridge` |
 | `EXCEL_BRIDGE_AUTO_SIGNIN` | `0` keeps the tool from opening Excel (same as `--no-auto-signin`) |
 | `EXCEL_BRIDGE_UPDATE_CHECK` | `0` turns off the update check |
+| `EXCEL_BRIDGE_TIMEZONE` | `auto` (default) / `off`, same as `--timezone`, see [Exit timezone](#exit-timezone) |
+| `EXCEL_BRIDGE_IMAGE_MODEL` | The model Codex's image tool asks the backend for, default `gpt-image-2` (same as `--image-model`), see [Image generation](#image-generation) |
 | `CODEX_HOME` | Codex config folder whose `config.toml` `desktop` edits. Default `~/.codex` |
 | `GHCP_EXCEL_WEBVIEW2_DATA_DIR` | Windows WebView2 data root (same as `--webview-dir`) |
 | `GHCP_EXCEL_WEBKIT_WEBSITE_DATA_DIR` | macOS WebKit data folder |
