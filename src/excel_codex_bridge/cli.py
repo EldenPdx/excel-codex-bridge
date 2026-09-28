@@ -813,8 +813,10 @@ def _other_providers(home: Path) -> None:
               if name and name not in (codex_config.OPENAI_PROVIDER_ID, codex_config.PROVIDER_ID)}
     if others:
         listed = ", ".join(f"`{name}` ({count})" for name, count in others.items())
-        _print(f"Also filed under other providers: {listed}. If Codex cannot open those (\"Model provider … not\n"
-               "found\"), `excel-codex threads migrate --from <provider>` moves them under `openai` (Codex quit).")
+        # ASCII only: piped on Windows, output takes the ANSI code page.
+        _print(f"Also filed under other providers: {listed}. If Codex cannot open those (\"Model provider\n"
+               "`<provider>` not found\"), `excel-codex threads migrate --from <provider>` moves them under `openai`\n"
+               "(Codex quit).")
 
 
 def _threads_from(action: str | None, source: str, home: Path, record_dir: Path) -> int:
@@ -846,7 +848,7 @@ def _threads_from(action: str | None, source: str, home: Path, record_dir: Path)
         for thread in threads[:10]:
             _print(_thread_line(thread))
         if len(threads) > 10:
-            _print(f"    … and {len(threads) - 10} more")
+            _print(f"    ... and {len(threads) - 10} more")
         _print(f"If Codex cannot open them (\"Model provider `{source}` not found\"), this moves them under `openai`,\n"
                "the list Codex's official sign-in and the bridge share (quit Codex first):")
         _print(f"    excel-codex threads migrate --from {source}")
@@ -1057,7 +1059,7 @@ def _parser() -> argparse.ArgumentParser:
     threads = sub.add_parser(
         "threads", help="show conversations filed under the bridge's own provider, which need the bridge on"
     )
-    from_help = ("another provider whose conversations Codex cannot open (\"Model provider … not found\"), "
+    from_help = ("another provider whose conversations Codex cannot open (\"Model provider `<name>` not found\"), "
                  "such as `OpenAI`, as a relay's config template may name it; case-sensitive")
     threads.add_argument("--from", dest="source", metavar="PROVIDER", help=from_help)
     moves = threads.add_subparsers(dest="action")

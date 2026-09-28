@@ -794,6 +794,8 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=900, help="seconds for each long step")
     parser.add_argument("launcher", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    # What a launcher printed may not fit the console's code page (cp1252 on Windows runners).
+    sys.stdout.reconfigure(errors="backslashreplace")
     launcher = args.launcher[1:] if args.launcher[:1] == ["--"] else args.launcher
     if not launcher:
         parser.error("give the launcher command after --")
