@@ -796,11 +796,87 @@ def _thread_line(thread) -> str:
     return f"    {title}" + (f"  ({thread.model})" if thread.model else "")
 
 
+def _providers_line(counts: dict[str, int]) -> str:
+    listed = ", ".join(f"`{name}` ({count})" for name, count in counts.items())
+    return f"  Codex files conversations under: {listed or 'nothing yet'} (names are case-sensitive)."
+
+
+def _other_providers(home: Path) -> None:
+    """Point at conversations under providers other than ``openai`` and the bridge's own."""
+    from . import codex_threads
+
+    try:
+        counts = codex_threads.providers(home)
+    except (codex_threads.Refused, OSError, sqlite3.Error):
+        return
+    others = {name: count for name, count in counts.items()
+              if name and name not in (codex_config.OPENAI_PROVIDER_ID, codex_config.PROVIDER_ID)}
+    if others:
+        listed = ", ".join(f"`{name}` ({count})" for name, count in others.items())
+        _print(f"Also filed under other providers: {listed}. If Codex cannot open those (\"Model provider … not\n"
+               "found\"), `excel-codex threads migrate --from <provider>` moves them under `openai` (Codex quit).")
+
+
+def _threads_from(action: str | None, source: str, home: Path, record_dir: Path) -> int:
+    """``threads [migrate] --from <provider>``: conversations under another provider."""
+    from . import codex_threads
+
+    if source == codex_config.OPENAI_PROVIDER_ID:
+        _print("Conversations under `openai` are in the list Codex's official sign-in and the bridge share already.")
+        return 0
+    try:
+        threads = codex_threads.threads_under(home, source)
+        counts = {} if threads else codex_threads.providers(home)
+        if action == "migrate" and threads:
+            # Not signed in: `migrate` refuses first, saying why.
+            if codex_config.codex_signed_in(home) and codex_threads.codex_running():
+                _print(_QUIT_CODEX)
+                return 1
+            result = codex_threads.migrate(home, record_dir, source=source)
+    except (codex_threads.Refused, OSError, sqlite3.Error) as exc:
+        _print(f"Nothing was changed: {exc}")
+        return 1
+
+    if not threads:
+        _print(f"No conversations are filed under `{source}`" + ("; nothing to move." if action == "migrate" else "."))
+        _print(_providers_line(counts))
+        return 0
+    if action != "migrate":
+        _print(f"{len(threads)} conversation(s) are filed under `{source}`:")
+        for thread in threads[:10]:
+            _print(_thread_line(thread))
+        if len(threads) > 10:
+            _print(f"    … and {len(threads) - 10} more")
+        _print(f"If Codex cannot open them (\"Model provider `{source}` not found\"), this moves them under `openai`,\n"
+               "the list Codex's official sign-in and the bridge share (quit Codex first):")
+        _print(f"    excel-codex threads migrate --from {source}")
+        return 0
+    if result.threads:
+        _print(f"Moved {len(result.threads)} conversation(s) from `{source}` to `openai`: they carry on with Codex's")
+        _print("  official sign-in, or through the bridge while it is on.")
+        _print(f"  Conversations started with `{source}` from now on are filed under it again.")
+        if _had_1m(result):
+            _print(_1M_MOVED)
+        _print(f"  Codex's conversation index was copied to {result.backup} first.")
+    if result.left:
+        _print(f"Could not move {len(result.left)} conversation(s): their file is missing or not laid out as expected.")
+        for thread in result.left[:10]:
+            _print(_thread_line(thread))
+    if not result.threads:
+        return 1
+    _print(_REOPEN_FOR_LIST)
+    _print("  `excel-codex threads undo` puts them back.")
+    return 0
+
+
 def cmd_threads(args) -> int:
     from . import codex_threads
 
     home = desktop_config.codex_home()
     record_dir = codex_config.state_dir()
+    source = getattr(args, "source", None)
+    if source and source != codex_config.PROVIDER_ID and args.action != "undo":
+        return _threads_from(args.action, source, home, record_dir)
     try:
         threads = [] if args.action == "undo" else codex_threads.bridge_threads(home, record_dir)
         unfinished = [] if args.action == "undo" else codex_threads.unfinished_threads(home, record_dir)
@@ -846,7 +922,7 @@ def cmd_threads(args) -> int:
         if not undone.restored and not undone.kept:
             _print("Nothing to undo: `excel-codex threads migrate` has not moved any conversations.")
             return 0
-        _print(f"Put back {undone.restored} conversation(s) under the bridge's own provider.")
+        _print(f"Put back {undone.restored} conversation(s) under the provider they were filed under before.")
         if undone.kept:
             _print(f"  {undone.kept} changed since (continued with another model, or deleted) and were left as they are.")
         _print(_REOPEN_FOR_LIST)
@@ -861,6 +937,7 @@ def cmd_threads(args) -> int:
         _print("No conversations are filed under the bridge's own provider.")
         if shared:
             _print("  Conversations with and without the bridge are all in one list.")
+        _other_providers(home)
         return 0
     _print(f"{len(threads)} conversation(s) are filed under the bridge's own provider "
            "(from excel-codex 0.5.3 and earlier, or while Codex was not signed in):")
@@ -875,6 +952,7 @@ def cmd_threads(args) -> int:
     else:
         _print("Codex is not signed in, so the bridge is still their provider and lists them while it is on.\n"
                "After `codex login`, they move into the list shared with it.")
+    _other_providers(home)
     return 0
 
 
@@ -979,12 +1057,16 @@ def _parser() -> argparse.ArgumentParser:
     threads = sub.add_parser(
         "threads", help="show conversations filed under the bridge's own provider, which need the bridge on"
     )
+    from_help = ("another provider whose conversations Codex cannot open (\"Model provider … not found\"), "
+                 "such as `OpenAI`, as a relay's config template may name it; case-sensitive")
+    threads.add_argument("--from", dest="source", metavar="PROVIDER", help=from_help)
     moves = threads.add_subparsers(dest="action")
-    moves.add_parser(
+    migrate = moves.add_parser(
         "migrate",
         help="move them into the list shared with Codex's official sign-in now; with Codex quit "
         "(`desktop` does it by itself)",
     )
+    migrate.add_argument("--from", dest="source", metavar="PROVIDER", default=argparse.SUPPRESS, help=from_help)
     moves.add_parser("undo", help="put back what `threads migrate` moved")
     sub.add_parser("sub2api", add_help=False, help="opt-in SUB2API sidecar and SSH session sync")
     return parser

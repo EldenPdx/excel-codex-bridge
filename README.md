@@ -122,6 +122,7 @@ excel-codex --login codex                      只用 Codex 自己的登录（�
 excel-codex login                             打开 Excel 的 ChatGPT 面板登录或续期
 excel-codex desktop                           让 Codex 桌面版 / IDE 插件走 Excel 链路
 excel-codex threads migrate                   把桥接自己名下的对话并进共享列表（启动时会自动做）
+excel-codex threads migrate --from OpenAI     把中转站 provider（OpenAI）名下的对话并到 openai
 ```
 
 启动器自己的选项：`--login <auto|codex|excel>`、`--model`、`--proxy`、`--timezone <auto|off>`、
@@ -280,6 +281,31 @@ Codex 没登录时，自带的 provider 会先要求登录，所以桥接仍是�
 - `excel-codex threads` 列出还在 `excel-bridge` 名下的对话。`excel-codex threads undo`（同样要先退出
   Codex）撤销：迁移改过、之后没被 Codex 改过的对话放回 `excel-bridge` 名下。
 - 不想自动迁移：设置 `EXCEL_BRIDGE_AUTO_MIGRATE=0`，需要时自己运行 `excel-codex threads migrate`。
+
+### 中转站名下的对话
+
+报“Model provider `OpenAI` not found”（或别的名字）的，多半是经中转站建的对话。有的中转站生成的
+Codex 配置（例如 SUB2API 的“使用密钥 → Codex”）用的是它自己的 provider，名字叫 `OpenAI`：
+`model_provider = "OpenAI"` 加一段 `[model_providers.OpenAI]`。它和 Codex 自带的 `openai` 不是同一个，
+**provider 名字区分大小写**。经它建的对话记在 `OpenAI` 名下；`config.toml` 里一旦没有这段（换回官方
+账号、切换账号的工具改写了配置，或删掉了中转站配置），Codex 就打不开它们。这和桥接无关，但 0.5.10 起
+桥接可以把它们并到 `openai` 名下：
+
+```bash
+excel-codex threads                          # 末尾会列出其他 provider 名下各有几个对话
+excel-codex threads --from OpenAI            # 列出 OpenAI 名下的对话
+excel-codex threads migrate --from OpenAI    # 并到 openai 名下（先完全退出 Codex）
+```
+
+- 改法和上一节一样：先复制对话索引，对话文件里只原地换掉 provider（和桥接的模型名）这几处。
+  `excel-codex threads undo` 把它们放回 `OpenAI` 名下。
+- 名字要和 Codex 记的一字不差；`--from` 找不到时会列出 Codex 里实际有的 provider 名字。
+- 并过去之后，走官方账号、开着桥接都能接着聊。以后经 `OpenAI` 新建的对话还会记在 `OpenAI` 名下。
+- 想让中转站的对话也一直在同一个列表里，就把中转站配成 Codex 自带的 provider：删掉
+  `model_provider = "OpenAI"` 和 `[model_providers.OpenAI]`，改成一行
+  `openai_base_url = "https://你的中转站/v1"`，再用中转站的 key 登录 Codex
+  （`codex login --with-api-key`，从标准输入读入 key）。**`openai_base_url` 指向中转站时不要用 ChatGPT
+  账号登录**，否则 Codex 会把 ChatGPT 的登录凭据发给中转站。
 
 ## 出口时区
 

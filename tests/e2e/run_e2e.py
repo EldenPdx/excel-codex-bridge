@@ -41,6 +41,10 @@ list with ``threads migrate`` (``--migrate desktop``: by starting ``desktop``,
 which moves it by itself).  A plain ``codex exec resume --last`` then carries
 it on with only Codex's own providers, the way the desktop app has them with
 the bridge off; its ``openai`` provider reaches the bridge through ``serve``.
+``--migrate relay`` starts it through a relay instead, set up the way a relay's
+Codex config template sets it up: a provider of its own named ``OpenAI`` (not
+Codex's ``openai``: names are case-sensitive), with ``serve`` in the relay's
+place.  ``threads migrate --from OpenAI`` then moves it under ``openai``.
 
 ``--images`` also attaches a picture (``codex exec -i``).  Like the real
 backend, the fake one refuses a user message with an inline picture; the
@@ -94,6 +98,8 @@ CODEX_ARGS = [
 ]
 # Carries the conversation above on (Codex lists only its current provider's).
 RESUME_ARGS = [*CODEX_ARGS[:-1], "resume", "--last", "Carry on."]
+# What a relay's Codex config template may call its provider.
+RELAY_PROVIDER = "OpenAI"
 PYTHON = "python" if sys.platform == "win32" else "python3"
 # Prints a marker only a real execution can produce, plus the PYTHONPATH Codex
 # gave the command.  Works in bash, PowerShell and cmd alike.
@@ -477,20 +483,38 @@ def migrate_then_resume(launcher, args, root: Path, webview: Path, project: Path
     home = Path(env["CODEX_HOME"])
     # This machine may run a Codex of its own; this run's Codex home is used by nothing else.
     env = dict(env, EXCEL_BRIDGE_ASSUME_CODEX_QUIT="1")
-    first = shlex.split(args.first_launcher) if args.first_launcher else launcher
-    output, checks = run_launcher(first, args, webview, project, env)
+    if args.migrate == "relay":
+        # The relay's key, as its template has it in auth.json.
+        sign_codex_in(home)
+        output, checks = through_a_relay(launcher, args, root, webview, project, env)
+        filed_under = RELAY_PROVIDER
+    else:
+        first = shlex.split(args.first_launcher) if args.first_launcher else launcher
+        output, checks = run_launcher(first, args, webview, project, env)
+        filed_under = codex_config.PROVIDER_ID
     args.first_requests = len(args.backend.requests)
     before = codex_threads(home)
     filed = rollout_providers(home)
     checks += [
-        (len(before) == 1 and before[0][0] == "excel-bridge",
-         f"the first conversation should be filed under excel-bridge, got {before}"),
-        (filed == ["excel-bridge"], f"the first conversation's file should name excel-bridge, got {filed}"),
+        (len(before) == 1 and before[0][0] == filed_under,
+         f"the first conversation should be filed under {filed_under}, got {before}"),
+        (filed == [filed_under], f"the first conversation's file should name {filed_under}, got {filed}"),
     ]
     sign_codex_in(home)
     if args.migrate == "desktop":
         moved, moved_checks = desktop_moves_them(launcher, args, root, webview, project, env)
         expected = "Moved 1 conversation(s) from the bridge's own provider into the shared list"
+    elif args.migrate == "relay":
+        # The plain list points at them; `--from` moves them.
+        listed = run([*launcher, "threads"], cwd=project, env=env, timeout=120)
+        result = run([*launcher, "threads", "migrate", "--from", RELAY_PROVIDER], cwd=project, env=env, timeout=120)
+        moved = listed.stdout + result.stdout
+        moved_checks = [
+            (listed.returncode == 0 and f"Also filed under other providers: `{RELAY_PROVIDER}` (1)" in listed.stdout,
+             f"`threads` did not point at the conversation: {listed.stdout.strip()[-1500:]}"),
+            (result.returncode == 0, f"`threads migrate --from` exit code {result.returncode}"),
+        ]
+        expected = f"Moved 1 conversation(s) from `{RELAY_PROVIDER}` to `openai`"
     else:
         result = run([*launcher, "threads", "migrate"], cwd=project, env=env, timeout=120)
         moved, moved_checks = result.stdout, [(result.returncode == 0, f"`threads migrate` exit code {result.returncode}")]
@@ -517,6 +541,45 @@ def migrate_then_resume(launcher, args, root: Path, webview: Path, project: Path
          "`resume --last` did not carry the moved conversation on"),
     ]
     return output, checks
+
+
+def through_a_relay(launcher, args, root: Path, webview: Path, project: Path, env: dict) -> tuple[str, list]:
+    """A conversation started through a relay's own provider named ``OpenAI``; ``serve`` stands in for the relay."""
+    with serving(launcher, args, root, webview, project, env, "relay.log") as (port, up):
+        codex = shutil.which("codex", path=env.get("PATH"))
+        if not (up and codex):
+            return "", [(up, "`serve` did not come up"), (bool(codex), "codex not found on PATH")]
+        table = f"model_providers.{RELAY_PROVIDER}"
+        overrides = [
+            "-c", f"model_provider='{RELAY_PROVIDER}'",
+            "-c", f"{table}.name='{RELAY_PROVIDER}'",
+            "-c", f"{table}.base_url='{codex_config.base_url(port)}'",
+            "-c", f"{table}.wire_api='responses'",
+            # The key comes from auth.json's OPENAI_API_KEY, as with the relay's template.
+            "-c", f"{table}.requires_openai_auth=true",
+            "-c", f"model='{codex_config.codex_model(args.model)}'",
+            # The bridge's model entries: Codex's own for this model hand it the tools in a
+            # form the bridge does not read (Responses Lite), so its call would reach no tool.
+            "-c", f"model_catalog_json='{codex_config.write_catalog(root / 'catalog')}'",
+        ]
+        result = run(codex_config.codex_command(codex, overrides, args.codex_args),
+                     cwd=project, env=loopback_direct(env), timeout=args.timeout)
+    return result.stdout, [
+        (result.returncode == 0, f"codex through the relay: exit code {result.returncode}: "
+                                 f"{result.stdout.strip()[-1500:]}"),
+    ]
+
+
+@contextlib.contextmanager
+def serving(launcher, args, root: Path, webview: Path, project: Path, env: dict, log: str):
+    """``serve`` on a port of its own while in the block: (port, whether it came up)."""
+    port = free_port()
+    bridge = in_background([*launcher, "serve", "--webview-dir", str(webview), "--port", str(port)],
+                           cwd=project, env=env, log=root / log)
+    try:
+        yield port, wait_healthy(bridge, port, args.timeout)
+    finally:
+        stop(bridge)
 
 
 def desktop_moves_them(launcher, args, root: Path, webview: Path, project: Path, env: dict) -> tuple[str, list]:
@@ -550,13 +613,10 @@ def resume_with_codex_providers_only(launcher, args, root: Path, webview: Path, 
     in for the official service.  A conversation still filed under
     ``excel-bridge`` fails here: "Model provider `excel-bridge` not found".
     """
-    port = free_port()
-    bridge = in_background([*launcher, "serve", "--webview-dir", str(webview), "--port", str(port)],
-                           cwd=project, env=env, log=root / "serve.log")
     checks = []
     output = ""
-    try:
-        checks.append((wait_healthy(bridge, port, args.timeout), "`serve` did not come up"))
+    with serving(launcher, args, root, webview, project, env, "serve.log") as (port, up):
+        checks.append((up, "`serve` did not come up"))
         codex = shutil.which("codex", path=env.get("PATH"))
         if codex and healthy(port):
             base = ["-c", f"openai_base_url='{codex_config.base_url(port)}'"]
@@ -575,8 +635,6 @@ def resume_with_codex_providers_only(launcher, args, root: Path, webview: Path, 
             ]
         else:
             checks.append((False, "codex not found on PATH" if not codex else "skipped codex"))
-    finally:
-        stop(bridge)
     return output, checks
 
 
@@ -722,10 +780,11 @@ def main() -> int:
                         help="also sign Codex in with ChatGPT; `refused` makes the backend turn it down")
     parser.add_argument("--shared", action="store_true",
                         help="sign Codex itself in, so the bridge stands in for its openai provider")
-    parser.add_argument("--migrate", nargs="?", const="command", choices=["command", "desktop"],
+    parser.add_argument("--migrate", nargs="?", const="command", choices=["command", "desktop", "relay"],
                         help="file a conversation the 0.5.3 way, move it into the shared list (by "
                         "`threads migrate`, or by starting `desktop`), then carry it on with the bridge's "
-                        "provider gone")
+                        "provider gone; `relay`: file it under a relay's own `OpenAI` provider and move it "
+                        "with `threads migrate --from OpenAI`")
     parser.add_argument("--rate-limited", nargs="?", const="briefly", choices=("briefly", "long"),
                         help="fail the first two requests on the shared tokens-per-minute limit, or (long) "
                         f"all in the first {LONG_RATE_LIMIT_SECONDS} s with Codex dropping a stream silent for "

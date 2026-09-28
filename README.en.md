@@ -144,6 +144,7 @@ excel-codex --login codex                      use Codex's own sign-in only (nev
 excel-codex login                             open Excel's ChatGPT pane to sign in or refresh
 excel-codex desktop                           route the Codex desktop app / IDE extension here
 excel-codex threads migrate                   move the bridge's own conversations into the shared list (done at start too)
+excel-codex threads migrate --from OpenAI     move a relay provider's (OpenAI) conversations under openai
 ```
 
 Launcher options: `--login <auto|codex|excel>`, `--model`, `--proxy`, `--timezone <auto|off>`,
@@ -344,6 +345,36 @@ What changes:
   go back under `excel-bridge`.
 - To keep it from moving them at start, set `EXCEL_BRIDGE_AUTO_MIGRATE=0` and run
   `excel-codex threads migrate` when you want.
+
+### A relay's conversations
+
+"Model provider `OpenAI` not found" (or another name) usually means a conversation started through
+a relay. Some relays hand out a Codex config (SUB2API does, for an API key) with a provider of their
+own named `OpenAI`: `model_provider = "OpenAI"` plus an `[model_providers.OpenAI]` table.
+That is not Codex's own `openai`: **provider names are case-sensitive**. Conversations started
+through it are filed under `OpenAI`, and once `config.toml` no longer has that table (back to the
+official sign-in, a config rewritten by an account-switching tool, or the relay's config removed),
+Codex cannot open them. The bridge has nothing to do with it, but from 0.5.10 it can move them
+under `openai`:
+
+```bash
+excel-codex threads                          # ends with how many conversations other providers have
+excel-codex threads --from OpenAI            # lists the conversations under OpenAI
+excel-codex threads migrate --from OpenAI    # moves them under openai (quit Codex fully first)
+```
+
+- It changes them the way the section above does: Codex's conversation index is copied first, and
+  only the provider (and the bridge's model names) are changed in place in the conversation files.
+  `excel-codex threads undo` puts them back under `OpenAI`.
+- The name must be exactly the one Codex keeps; when `--from` finds nothing, it lists the provider
+  names Codex has.
+- Once moved, they carry on through the official sign-in, or through the bridge while it is on.
+  Conversations started through `OpenAI` from then on are filed under it again.
+- To keep a relay's conversations in the one list for good, set the relay up as Codex's own provider:
+  remove `model_provider = "OpenAI"` and the `[model_providers.OpenAI]` table, add
+  `openai_base_url = "https://your-relay/v1"`, and sign Codex in with the relay's key
+  (`codex login --with-api-key` reads it from standard input). **Do not pair a relay's
+  `openai_base_url` with a ChatGPT sign-in**: Codex would send the ChatGPT sign-in to the relay.
 
 ## Exit timezone
 

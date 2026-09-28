@@ -124,6 +124,17 @@ class CodexIndex(unittest.TestCase):
     def record(self):
         return json.loads((self.records / codex_threads.RECORD_NAME).read_text(encoding="utf-8"))
 
+    def add_thread(self, thread_id, provider, model, title="Through a relay"):
+        """One more conversation, the newest, as ``provider`` wrote it."""
+        path = self.day / f"rollout-2026-09-01T08-00-00-{thread_id}.jsonl"
+        path.write_text(rollout_text(thread_id, provider, model), encoding="utf-8")
+        os.utime(path, (MTIME, MTIME))
+        self.files[thread_id] = path
+        self.originals[thread_id] = path.read_bytes()
+        with contextlib.closing(sqlite3.connect(self.db)) as db, db:
+            db.execute("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (thread_id, str(path), 6, provider, title, model, "high"))
+
     def earlier_version_moved(self, thread_id="old-1m"):
         """What 0.5.6 to 0.5.8 left: the row, the record and the file's first line under openai."""
         self.records.mkdir(exist_ok=True)
@@ -452,6 +463,78 @@ class CodexRunningTests(unittest.TestCase):
         run.assert_not_called()
 
 
+class RelayIndex(CodexIndex):
+    """Plus a conversation under a relay's provider, named `OpenAI` as sub2api's Codex config template does."""
+
+    def setUp(self):
+        super().setUp()
+        self.add_thread("relay", "OpenAI", "gpt-5.6-sol")
+
+
+class OtherProviderTests(RelayIndex):
+    def test_listed_by_provider(self):
+        self.assertEqual([thread.id for thread in codex_threads.threads_under(self.home, "OpenAI")], ["relay"])
+        self.assertEqual(list(codex_threads.providers(self.home).items()),
+                         [("excel-bridge", 3), ("OpenAI", 1), ("openai", 1), ("someone-else", 1)])
+
+    def test_migrate_from_moves_that_provider_only(self):
+        self.earlier_version_moved()
+        before = {row[0]: row for row in self.rows()}
+        result = codex_threads.migrate(self.home, self.records, source="OpenAI", now=NOW)
+        self.assertEqual([thread.id for thread in result.threads], ["relay"])
+        self.assertEqual((result.left, result.finished), ([], []))
+        after = {row[0]: row for row in self.rows()}
+        self.assertEqual(after.pop("relay"), ("relay", "openai", "gpt-5.6-sol", "high", "Through a relay"))
+        self.assertEqual(after, {key: row for key, row in before.items() if key != "relay"})
+        # Its models are OpenAI's already: only the provider changes, where Codex takes it from.
+        moved = self.files["relay"].read_bytes()
+        self.assertEqual(moved, shared(self.originals["relay"], "OpenAI", "gpt-5.6-sol", "gpt-5.6-sol"))
+        self.assertEqual(rebuilt(self.files["relay"]), ("openai", "gpt-5.6-sol"))
+        self.assertEqual(self.files["relay"].stat().st_mtime, MTIME)
+        self.assertEqual(self.record()["threads"]["relay"], {
+            "model_provider": "OpenAI", "model": "gpt-5.6-sol", "migrated_model": "gpt-5.6-sol",
+            "lines": [[4, [[["payload", "thread_settings", "model_provider_id"], "OpenAI", "openai"]]]]})
+        for thread_id in ("old-sol", "old-1m", "other"):
+            self.assertEqual(self.files[thread_id].read_bytes(),
+                             self.originals[thread_id] if thread_id != "old-1m" else
+                             self.originals["old-1m"].replace(b'"model_provider":"excel-bridge"',
+                                                              b'"model_provider":"openai"', 1))
+        self.assertEqual(codex_threads.migrate(self.home, self.records, source="OpenAI", now=NOW).threads, [])
+
+    def test_undo_puts_each_back_where_it_was(self):
+        codex_threads.migrate(self.home, self.records, now=NOW)
+        codex_threads.migrate(self.home, self.records, source="OpenAI", now=NOW + dt.timedelta(seconds=1))
+        self.assertEqual(codex_threads.undo(self.home, self.records, now=NOW), codex_threads.Undone(4, 0))
+        self.assertEqual({row[0]: row[1:3] for row in self.rows()}, {
+            "official": ("openai", "gpt-6-sol"), "old-1m": ("excel-bridge", "gpt-6-sol-1m-excel"),
+            "old-none": ("excel-bridge", None), "old-sol": ("excel-bridge", "gpt-6-sol-excel"),
+            "other": ("someone-else", "gpt-5.6-sol-excel"), "relay": ("OpenAI", "gpt-5.6-sol"),
+        })
+        for thread_id, original in self.originals.items():
+            with self.subTest(thread=thread_id):
+                self.assertEqual(self.files[thread_id].read_bytes(), original)
+
+    def test_bridge_models_under_another_provider_become_official_too(self):
+        result = codex_threads.migrate(self.home, self.records, source="someone-else", now=NOW)
+        self.assertEqual([thread.id for thread in result.threads], ["other"])
+        self.assertEqual(self.files["other"].read_bytes(),
+                         shared(self.originals["other"], "someone-else", "gpt-5.6-sol-excel", "gpt-5.6-sol"))
+        self.assertEqual(rebuilt(self.files["other"]), ("openai", "gpt-5.6-sol"))
+
+    def test_names_are_case_sensitive(self):
+        self.assertEqual(codex_threads.migrate(self.home, self.records, source="openAI", now=NOW).threads, [])
+        self.assertEqual(self.files["relay"].read_bytes(), self.originals["relay"])
+
+    def test_refused_to_openai_or_without_a_sign_in(self):
+        with self.assertRaisesRegex(codex_threads.Refused, "moved to"):
+            codex_threads.migrate(self.home, self.records, source="openai", now=NOW)
+        self.sign_in({})
+        with self.assertRaisesRegex(codex_threads.Refused, "`codex login`"):
+            codex_threads.migrate(self.home, self.records, source="OpenAI", now=NOW)
+        self.assertEqual(self.files["relay"].read_bytes(), self.originals["relay"])
+        self.assertEqual(self.rows()[-1][1], "OpenAI")
+
+
 class ThreadsCommandTests(CodexIndex):
     def run_cli(self, *argv, env=None):
         out = io.StringIO()
@@ -533,6 +616,53 @@ class ThreadsCommandTests(CodexIndex):
         self.assertIn("Nothing was changed: Codex is not signed in", out)
         code, out = self.run_cli()
         self.assertIn("After `codex login`", out)
+
+
+class OtherProviderCommandTests(RelayIndex):
+    run_cli = ThreadsCommandTests.run_cli
+
+    def test_listed_moved_and_put_back(self):
+        code, out = self.run_cli()
+        self.assertEqual(code, 0)
+        self.assertIn("Also filed under other providers: `OpenAI` (1), `someone-else` (1).", out)
+        code, out = self.run_cli("--from", "OpenAI")
+        self.assertEqual(code, 0)
+        self.assertIn("1 conversation(s) are filed under `OpenAI`:", out)
+        self.assertIn("Through a relay  (gpt-5.6-sol)", out)
+        self.assertIn("Model provider `OpenAI` not found", out)
+        self.assertIn("    excel-codex threads migrate --from OpenAI\n", out)
+        code, out = self.run_cli("migrate", "--from", "OpenAI")
+        self.assertEqual(code, 0)
+        self.assertIn("Moved 1 conversation(s) from `OpenAI` to `openai`", out)
+        self.assertIn("started with `OpenAI` from now on are filed under it again", out)
+        self.assertNotIn(cli._1M_MOVED, out)
+        self.assertIn("before-excel-codex-", out)
+        self.assertEqual((self.file_provider("relay"), self.file_provider("old-sol")), ("openai", "excel-bridge"))
+        code, out = self.run_cli("--from", "OpenAI", "migrate")
+        self.assertEqual(code, 0)
+        self.assertIn("No conversations are filed under `OpenAI`; nothing to move.", out)
+        self.assertIn("`openai` (2)", out)
+        code, out = self.run_cli("undo")
+        self.assertIn("Put back 1 conversation(s)", out)
+        self.assertEqual(self.file_provider("relay"), "OpenAI")
+
+    def test_a_name_in_another_case_lists_what_there_is(self):
+        code, out = self.run_cli("--from", "openAI")
+        self.assertEqual(code, 0)
+        self.assertIn("No conversations are filed under `openAI`.", out)
+        self.assertIn("`OpenAI` (1)", out)
+        self.assertIn("case-sensitive", out)
+        code, out = self.run_cli("migrate", "--from", "openai")
+        self.assertEqual(code, 0)
+        self.assertIn("share already", out)
+        self.assertEqual(self.files["relay"].read_bytes(), self.originals["relay"])
+
+    def test_nothing_changes_while_codex_runs(self):
+        self.codex_running.return_value = True
+        code, out = self.run_cli("migrate", "--from", "OpenAI")
+        self.assertEqual(code, 1)
+        self.assertIn("Nothing was changed: Codex is running", out)
+        self.assertEqual(self.files["relay"].read_bytes(), self.originals["relay"])
 
 
 class AutomaticMoveTests(CodexIndex):

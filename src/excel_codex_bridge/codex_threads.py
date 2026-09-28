@@ -19,6 +19,10 @@ and so do those values in the file, each string in place and nothing else.
 Codex must not be running: it would put the index back, and could be writing
 to the file.  The index is copied first and every change is recorded, so
 ``undo`` puts back exactly what was changed.
+
+``migrate(source=...)`` does the same for conversations under another
+provider that Codex cannot open any more, such as ``OpenAI``, the name a
+relay's Codex config template may give its provider.
 """
 
 from __future__ import annotations
@@ -287,7 +291,7 @@ def _edited(line: bytes, edits: dict[tuple, tuple[str, str]]) -> bytes | None:
         return None
 
 
-def _shared_edits(meta: object) -> dict[tuple, tuple[str, str]]:
+def _shared_edits(meta: object, source: str = codex_config.PROVIDER_ID) -> dict[tuple, tuple[str, str]]:
     """What a later line of a conversation file changes to under ``openai``: {path: (old, new)}."""
     if not isinstance(meta, dict):
         return {}
@@ -304,27 +308,27 @@ def _shared_edits(meta: object) -> dict[tuple, tuple[str, str]]:
         model = _at(meta, path)
         if isinstance(model, str) and codex_config.official_model(model) != model:
             edits[path] = (model, codex_config.official_model(model))
-    if provider and _at(meta, provider) == codex_config.PROVIDER_ID:
-        edits[provider] = (codex_config.PROVIDER_ID, codex_config.OPENAI_PROVIDER_ID)
+    if provider and _at(meta, provider) == source:
+        edits[provider] = (source, codex_config.OPENAI_PROVIDER_ID)
     return edits
 
 
-def _planned(path: Path) -> list:
-    """The later lines of a conversation file that name the bridge's models or provider.
+def _planned(path: Path, source: str = codex_config.PROVIDER_ID) -> list:
+    """The later lines of a conversation file that name the bridge's models or ``source``.
 
     As recorded: ``[[line number, [[path, old, new], ...]], ...]``.
     """
     changes = []
-    with path.open("rb") as source:
-        source.readline()
-        for number, line in enumerate(source, 1):
+    with path.open("rb") as handle:
+        handle.readline()
+        for number, line in enumerate(handle, 1):
             if not any(marker in line for marker in _NAMING_LINES):
                 continue
             try:
                 meta = json.loads(line)
             except ValueError:
                 continue
-            edits = _shared_edits(meta)
+            edits = _shared_edits(meta, source)
             if edits:
                 changes.append([number, [[list(key), old, new] for key, (old, new) in edits.items()]])
     return changes
@@ -401,13 +405,16 @@ def _refile_thread(home: Path, thread_id: str, indexed: str | None, old: str, ne
         return False
 
 
-def _pending(home: Path, index: Path, record: dict | None) -> list[_Pending]:
-    """Conversations to move, newest first, then those an earlier migrate did not finish."""
+def _pending(home: Path, index: Path, record: dict | None,
+             source: str = codex_config.PROVIDER_ID) -> list[_Pending]:
+    """Conversations under ``source`` to move, newest first, then those an earlier migrate did not finish."""
     columns = "SELECT id, title, model, rollout_path FROM threads WHERE"
     found = []
     with contextlib.closing(_connect(index, read_only=True)) as db:
-        for row in db.execute(f"{columns} model_provider = ? ORDER BY updated_at DESC", (codex_config.PROVIDER_ID,)):
+        for row in db.execute(f"{columns} model_provider = ? ORDER BY updated_at DESC", (source,)):
             found.append(_Pending(Thread(*row[:3]), row[3], earlier=False, bridge_file=True))
+        if source != codex_config.PROVIDER_ID:
+            return found
         # Up to 0.5.8 the model and provider on later lines stayed, and 0.5.4 and 0.5.5 moved the row only:
         # Codex puts back what it rebuilds from the file.
         for thread_id, entry in (record or {}).get("threads", {}).items():
@@ -434,6 +441,19 @@ def bridge_threads(home: Path, record_dir: Path | None = None) -> list[Thread]:
     """
     record = _read_record(record_dir / RECORD_NAME) if record_dir is not None else None
     return [item.thread for item in _pending(home, _index(home), record) if item.bridge_file]
+
+
+def threads_under(home: Path, provider: str) -> list[Thread]:
+    """Conversations Codex files under ``provider``, newest first."""
+    return [item.thread for item in _pending(home, _index(home), None, provider)]
+
+
+def providers(home: Path) -> dict[str, int]:
+    """How many conversations Codex files under each provider, most first."""
+    with contextlib.closing(_connect(_index(home), read_only=True)) as db:
+        return dict(db.execute(
+            "SELECT model_provider, COUNT(*) FROM threads GROUP BY model_provider ORDER BY COUNT(*) DESC, model_provider"
+        ).fetchall())
 
 
 def unfinished_threads(home: Path, record_dir: Path) -> list[Thread]:
@@ -468,20 +488,26 @@ def _write_record(path: Path, record: dict) -> None:
         raise
 
 
-def migrate(home: Path, record_dir: Path, *, now: dt.datetime | None = None) -> Migrated:
-    """File the bridge's own conversations under ``openai``; the index is copied first.
+def migrate(home: Path, record_dir: Path, *, source: str = codex_config.PROVIDER_ID,
+            now: dt.datetime | None = None) -> Migrated:
+    """File the conversations under ``source`` (the bridge's own) under ``openai``; the index is copied first.
 
     Only while Codex is not running (see ``codex_running``).
     """
+    if source == codex_config.OPENAI_PROVIDER_ID:
+        raise Refused(f"`{source}` is where conversations are moved to.")
     index = _index(home)
     if not codex_config.codex_signed_in(home):
-        raise Refused(
-            "Codex is not signed in, so the bridge still is a provider of its own and lists these "
-            "conversations while it is on. Run `codex login` first to share them with the official sign-in."
-        )
+        if source == codex_config.PROVIDER_ID:
+            raise Refused(
+                "Codex is not signed in, so the bridge still is a provider of its own and lists these "
+                "conversations while it is on. Run `codex login` first to share them with the official sign-in."
+            )
+        raise Refused(f"Codex is not signed in, so it could not carry on with conversations under "
+                      f"`{codex_config.OPENAI_PROVIDER_ID}`. Run `codex login` first.")
     record_path = record_dir / RECORD_NAME
     record = _read_record(record_path)
-    pending = _pending(home, index, record)
+    pending = _pending(home, index, record, source)
     if not pending:
         return Migrated([], None)
 
@@ -496,7 +522,7 @@ def migrate(home: Path, record_dir: Path, *, now: dt.datetime | None = None) -> 
     for item in pending:
         path = _rollout(home, item.thread.id, item.indexed)
         try:
-            plans[item.thread.id] = _planned(path) if path is not None else None
+            plans[item.thread.id] = _planned(path, source) if path is not None else None
         except OSError:
             plans[item.thread.id] = None
     with contextlib.closing(_connect(index)) as db:
@@ -505,7 +531,7 @@ def migrate(home: Path, record_dir: Path, *, now: dt.datetime | None = None) -> 
             for item in pending:
                 thread = item.thread
                 # A row moved back by Codex keeps what it had before the first migration.
-                entry = earlier.get(thread.id) or {"model_provider": codex_config.PROVIDER_ID, "model": thread.model}
+                entry = earlier.get(thread.id) or {"model_provider": source, "model": thread.model}
                 migrated_model = entry.get("migrated_model")
                 # Carried on with another model since an earlier migrate: undo leaves it as it is.
                 if not item.earlier or thread.model == migrated_model or _official(thread.model) != thread.model:
@@ -518,7 +544,7 @@ def migrate(home: Path, record_dir: Path, *, now: dt.datetime | None = None) -> 
             for item in pending:
                 thread = item.thread
                 plan = plans[thread.id]
-                if plan is None or not _refile_thread(home, thread.id, item.indexed, codex_config.PROVIDER_ID,
+                if plan is None or not _refile_thread(home, thread.id, item.indexed, source,
                                                       codex_config.OPENAI_PROVIDER_ID, plan):
                     left.append(thread)
                     continue
