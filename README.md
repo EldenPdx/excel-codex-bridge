@@ -328,6 +328,20 @@ Codex 会把本机的时区和日期写进每个对话（`<environment_context>`
 在 Windows 上还会在剩余不到 24 小时时[自动打开面板续期](#自动登录windows)，**不用重启**桥接或 Codex。
 `excel-codex status` 可查看剩余时间。
 
+## 限流
+
+用加载项的所有人按模型共用一份每分钟 token 额度（TPM）。额度用满时，后端立刻回一个
+`rate limit exceeded`，说几毫秒后再试；Codex 就按这个间隔重试 5 次，不到一秒就用完，这一轮报错
+（界面上显示“Reconnecting 5/5”）。
+
+所以桥接会先自己等：回答还没开始就被限流时，隔 1、2、4、8、15 秒（之后每次 15 秒）把同一个请求再发一次，
+每个请求最多等 60 秒。这期间 Codex 只显示在工作，桥接窗口（CLI 模式下是 `bridge.log`）里会写
+`the Excel backend is rate limited … trying again in N s`。等满 60 秒还被限流，才把报错交给 Codex；
+Codex 每次重试桥接都会再等一轮，所以最坏约 6 分钟才报错，中途随时可以在 Codex 里中断。
+
+- 回答开始后才失败的不重发，免得内容重复；别的错误照原样交给 Codex。
+- `EXCEL_BRIDGE_RATE_LIMIT_WAIT=<秒>` 改每个请求最多等多久：`0` 不等，最多 `240`。
+
 ## 图片
 
 Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图都能用，不需要任何设置。桥接这样转交：
@@ -418,6 +432,7 @@ Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图�
 | `EXCEL_BRIDGE_AUTO_MIGRATE` | 设为 `0` 时启动不自动迁移桥接自己名下的对话，见[桥接自己名下的对话](#桥接自己名下的对话) |
 | `EXCEL_BRIDGE_TIMEZONE` | `auto`（默认）/ `off`，同 `--timezone`，见[出口时区](#出口时区) |
 | `EXCEL_BRIDGE_IMAGE_MODEL` | 生图工具向后端请求的模型，默认 `gpt-image-2`（同 `--image-model`），见[生图](#生图) |
+| `EXCEL_BRIDGE_RATE_LIMIT_WAIT` | 被限流时每个请求最多等多少秒再把报错交给 Codex，默认 `60`，`0` 不等，最多 `240`，见[限流](#限流) |
 | `CODEX_HOME` | Codex 配置目录，`desktop` 改写其中的 `config.toml`。默认 `~/.codex` |
 | `GHCP_EXCEL_WEBVIEW2_DATA_DIR` | Windows WebView2 数据根目录（同 `--webview-dir`） |
 | `GHCP_EXCEL_WEBKIT_WEBSITE_DATA_DIR` | macOS WebKit 数据目录 |

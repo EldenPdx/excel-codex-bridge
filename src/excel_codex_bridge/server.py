@@ -9,12 +9,16 @@ cached (see ``session``).
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import gzip
 import ipaddress
+import itertools
 import json
 import logging
+import math
 import os
+import re
 import zlib
 from urllib.parse import urlsplit
 
@@ -42,6 +46,19 @@ IMAGE_TIMEOUT = httpx.Timeout(600.0, connect=30.0)
 _LOOPBACK_NAMES = {"localhost"}
 # The backend's answer when it will not take a sign-in.
 LOGIN_REFUSED_STATUSES = {401, 403}
+# Everyone using the add-in shares one tokens-per-minute budget per model.  When
+# it runs out the stream fails at once, saying to try again in some milliseconds;
+# Codex does, five times within a second, and gives up.  The bridge waits longer
+# first, as long as nothing of the answer has come yet.
+RATE_LIMIT_CODES = {"rate_limit_exceeded", "slow_down"}
+RATE_LIMIT_DELAYS = (1.0, 2.0, 4.0, 8.0, 15.0)
+RATE_LIMIT_WAIT = 60.0
+# Codex drops a stream that sends nothing for five minutes.
+MAX_RATE_LIMIT_WAIT = 240.0
+_STREAM_OPENING = {"response.created", "response.in_progress", "response.queued"}
+# How much of a stream is read looking for its first event past the opening ones.
+_STREAM_HEAD_LIMIT = 4 * 1024 * 1024
+_TRY_AGAIN = re.compile(r"(?i)try again in\s*(\d+(?:\.\d+)?)\s*(ms|s|seconds?)\b")
 
 # Kept for tests ported from ghcp_proxy.
 _excel_tool_stream_transform = excel_tool_stream_transform
@@ -206,6 +223,50 @@ def _error_text(response: Response) -> str:
         return "no details"
 
 
+def rate_limit_wait() -> float:
+    """Seconds one request may spend waiting out the backend's rate limit (``EXCEL_BRIDGE_RATE_LIMIT_WAIT``)."""
+    value = os.environ.get("EXCEL_BRIDGE_RATE_LIMIT_WAIT", "").strip()
+    try:
+        seconds = float(value) if value else RATE_LIMIT_WAIT
+    except ValueError:
+        return RATE_LIMIT_WAIT
+    if math.isnan(seconds):
+        return RATE_LIMIT_WAIT
+    return min(max(seconds, 0.0), MAX_RATE_LIMIT_WAIT)
+
+
+def _rate_limit_delay(message: str, attempt: int, left: float) -> float | None:
+    """How long to wait before the next try; None once ``left`` is used up."""
+    if left <= 0:
+        return None
+    advised = 0.0
+    match = _TRY_AGAIN.search(message)
+    if match:
+        advised = float(match.group(1)) / (1000 if match.group(2).lower() == "ms" else 1)
+    return min(max(advised, RATE_LIMIT_DELAYS[min(attempt, len(RATE_LIMIT_DELAYS) - 1)]), left)
+
+
+def _stream_event(block: bytes) -> tuple[bool, str | None]:
+    """(whether ``block`` only opens the stream, the rate limit's message if it fails on that)."""
+    name, data = sse.parse_sse_block(block.decode("utf-8", "replace"))
+    if data is None:
+        return True, None
+    try:
+        payload = json.loads(data)
+    except ValueError:
+        return False, None
+    if not isinstance(payload, dict):
+        return False, None
+    kind = str(name or payload.get("type") or "").strip().lower()
+    if kind in _STREAM_OPENING:
+        return True, None
+    response = payload.get("response")
+    error = response.get("error") if kind == "response.failed" and isinstance(response, dict) else None
+    if isinstance(error, dict) and error.get("code") in RATE_LIMIT_CODES:
+        return False, str(error.get("message") or error["code"])
+    return False, None
+
+
 def _refused(response: Response) -> bool:
     return response.status_code in PICTURE_RETRY_STATUSES
 
@@ -240,6 +301,95 @@ def _request_error_response(exc: httpx.RequestError, timeout: httpx.Timeout) -> 
         message = f"{message} ({detail})"
     log.warning("upstream request failed: %s", detail)
     return sse.openai_error_response(status, message)
+
+
+class _PastRateLimits:
+    """The bytes of a stream; while it fails on the rate limit before any answer, those of a later try.
+
+    Codex gets the first try's opening events (``response.created``) at once,
+    so the stream's keepalives run while the bridge waits, and never a second
+    set.  At most ``wait`` seconds go on waiting; once they are used up, or a
+    try cannot be sent, the last failure goes to Codex as it came.
+    """
+
+    def __init__(self, upstream: httpx.Response, send, wait: float) -> None:
+        self.upstream = upstream
+        self._send = send
+        self._wait = wait
+        self._closed = False
+        self._chunks = self._relay()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> bytes:
+        return await self._chunks.__anext__()
+
+    async def aclose(self) -> None:
+        """Stop, and send no further try, even while a keepalive's read of this waits in another task."""
+        self._closed = True
+        await self.upstream.aclose()
+        with contextlib.suppress(RuntimeError):  # that read is running; it stops by itself now
+            await self._chunks.aclose()
+
+    async def _relay(self):
+        waited = 0.0
+        opened = False
+        try:
+            for attempt in itertools.count():
+                chunks = self.upstream.aiter_bytes()
+                forward_opening = not opened
+                pending = b""
+                first = None
+                limited = None
+                try:
+                    async for chunk in chunks:
+                        pending = (pending + chunk).replace(b"\r\n", b"\n")
+                        while first is None and b"\n\n" in pending:
+                            block, pending = pending.split(b"\n\n", 1)
+                            block += b"\n\n"
+                            opening, limited = _stream_event(block)
+                            if not opening:
+                                first = block
+                            elif forward_opening:
+                                opened = True
+                                yield block
+                        if first is not None or len(pending) > _STREAM_HEAD_LIMIT:
+                            break
+                except httpx.TransportError:
+                    if pending:
+                        yield pending
+                    raise
+                rest = (first or b"") + pending
+                delay = None if limited is None else _rate_limit_delay(limited, attempt, self._wait - waited)
+                if delay is None:
+                    if rest:
+                        yield rest
+                    async for chunk in chunks:
+                        yield chunk
+                    return
+                log.warning("the Excel backend is rate limited (%s); trying again in %g s", limited[:300], delay)
+                await self.upstream.aclose()
+                await asyncio.sleep(delay)
+                waited += delay
+                if self._closed:
+                    return
+                try:
+                    retried = await self._send()
+                except httpx.RequestError as exc:
+                    log.warning("could not try again after the rate limit: %s", type(exc).__name__)
+                    yield rest
+                    return
+                if self._closed or retried.status_code >= 400:
+                    await retried.aclose()
+                    if self._closed:
+                        return
+                    log.warning("trying again after the rate limit returned HTTP %s", retried.status_code)
+                    yield rest
+                    return
+                self.upstream = retried
+        finally:
+            await self.upstream.aclose()
 
 
 class Bridge:
@@ -413,11 +563,14 @@ class Bridge:
         return await self._non_stream(headers, upstream_body, body)
 
     async def _stream(self, headers: dict, upstream_body: dict, source_body: dict) -> Response:
-        request = self.client.build_request(
-            "POST", excel_upstream.RESPONSES_URL, headers=headers, json=upstream_body
-        )
+        async def send() -> httpx.Response:
+            request = self.client.build_request(
+                "POST", excel_upstream.RESPONSES_URL, headers=headers, json=upstream_body
+            )
+            return await self.client.send(request, stream=True)
+
         try:
-            upstream = await self.client.send(request, stream=True)
+            upstream = await send()
         except httpx.RequestError as exc:
             return _request_error_response(exc, self.client.timeout)
         if upstream.status_code >= 400:
@@ -431,10 +584,9 @@ class Bridge:
         transform = excel_tool_stream_transform(source_body)
 
         async def relay():
+            source = _PastRateLimits(upstream, send, rate_limit_wait())
             try:
-                chunks = upstream.aiter_bytes()
-                if transform is not None:
-                    chunks = transform(chunks)
+                chunks = transform(source) if transform is not None else source
                 async for chunk in chunks:
                     yield chunk
             except httpx.TransportError as exc:
@@ -443,7 +595,7 @@ class Bridge:
                 # response.completed and retries on its own.
                 log.warning("upstream stream ended abnormally: %s", type(exc).__name__)
             finally:
-                await upstream.aclose()
+                await source.aclose()
 
         return StreamingResponse(
             relay(),

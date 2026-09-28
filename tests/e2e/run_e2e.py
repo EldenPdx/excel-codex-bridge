@@ -174,8 +174,10 @@ def exit_zone_for(now: dt.datetime) -> str:
 
 class FakeExcelBackend:
     def __init__(self, parallel: bool = False, imagegen: bool = False, refuse: str | None = None,
-                 exit_zone: str = "Pacific/Kiritimati") -> None:
+                 exit_zone: str = "Pacific/Kiritimati", rate_limited: int = 0) -> None:
         self.requests: list[dict] = []
+        # Requests failed on the shared tokens-per-minute limit, before any other is answered.
+        self.limited: list[dict] = []
         # The proxy exit the bridge finds: this IP, in this timezone.
         self.exit_zone = exit_zone
         self.lookups: list[str] = []
@@ -231,6 +233,21 @@ class FakeExcelBackend:
             if inline_in_user_message(body):
                 self.refused.append(body)
                 return JSONResponse({"detail": "Invalid request body."}, status_code=422)
+            if len(self.limited) < rate_limited:
+                self.limited.append(body)
+                limited = [
+                    sse("response.created", {"type": "response.created",
+                        "response": {"id": f"resp_limited_{len(self.limited)}", "status": "in_progress"}}),
+                    sse("response.failed", {"type": "response.failed", "response": {
+                        "id": f"resp_limited_{len(self.limited)}", "status": "failed", "error": {
+                            "code": "rate_limit_exceeded", "message": RATE_LIMITED}}}),
+                ]
+
+                async def failing():
+                    for event in limited:
+                        yield event
+
+                return StreamingResponse(failing(), media_type="text/event-stream")
             n = next(counter)
             self.requests.append(body)
             raw = json.dumps(body)
@@ -295,6 +312,10 @@ class FakeExcelBackend:
             return JSONResponse({"error": {"message": "not here"}}, status_code=404)
 
         self.app = app
+
+
+RATE_LIMITED = ("Rate limit reached for gpt-5.6-sol in organization org-e2e on tokens per min (TPM): "
+                "Limit 500000000, Used 499990000, Requested 150000. Please try again in 18ms.")
 
 
 def start_server(app) -> tuple[uvicorn.Server, int]:
@@ -671,6 +692,9 @@ def main() -> int:
                         help="file a conversation the 0.5.3 way, move it into the shared list (by "
                         "`threads migrate`, or by starting `desktop`), then carry it on with the bridge's "
                         "provider gone")
+    parser.add_argument("--rate-limited", action="store_true",
+                        help="fail the first two requests on the shared tokens-per-minute limit; "
+                        "the bridge waits them out")
     parser.add_argument("--first-launcher",
                         help="with --migrate: the command that starts that conversation, e.g. a 0.5.3 checkout's")
     parser.add_argument("--timeout", type=int, default=900, help="seconds for each long step")
@@ -694,7 +718,7 @@ def main() -> int:
     exit_zone = exit_zone_for(started_at)
     backend = FakeExcelBackend(parallel=args.parallel, imagegen=args.imagegen,
                                refuse="e2e-codex-account" if args.codex_login == "refused" else None,
-                               exit_zone=exit_zone)
+                               exit_zone=exit_zone, rate_limited=2 if args.rate_limited else 0)
     server, port = start_server(backend.app)
 
     env = dict(os.environ)
@@ -812,6 +836,18 @@ def main() -> int:
             (bool(sent) and all(len(parts) == 1 for parts in sent),
              f"expected the picture once in every request, got {[len(parts) for parts in sent]}"),
             (file_ids == ["file-e2e-1"], f"expected every request to name the upload, got {file_ids}"),
+        ]
+    if args.rate_limited:
+        bridge_log = root / "bridge-home" / "bridge.log"
+        waited = bridge_log.read_text(encoding="utf-8", errors="replace") if bridge_log.exists() else ""
+        waited += _desktop_log(root)
+        checks += [
+            (len(backend.limited) == 2, f"expected two rate-limited requests, got {len(backend.limited)}"),
+            (bool(backend.limited) and backend.limited[0] == backend.requests[0],
+             "the bridge did not send the rate-limited request again as it was"),
+            (waited.count("the Excel backend is rate limited") == 2, "the bridge did not say it was waiting"),
+            ("rate limit" not in output.lower() and "reconnecting" not in output.lower(),
+             "Codex saw the rate limit"),
         ]
     failures = [message for ok, message in checks if not ok]
 
