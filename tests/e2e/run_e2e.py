@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
 import itertools
 import json
@@ -588,11 +589,18 @@ def app_server_opens(codex: str, overrides: list[str], thread_ids: list[str], pr
     except (OSError, TimeoutError) as exc:
         return False, repr(exc)
     finally:
-        server.terminate()
+        # Gone for good before `codex exec resume`: a live app-server stays the conversation's writer.
+        # On Windows `codex` is a .cmd wrapper, and terminating it leaves Codex itself running.
+        with contextlib.suppress(OSError):
+            server.stdin.close()
         try:
-            server.wait(timeout=10)
+            server.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            server.kill()
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(server.pid)], capture_output=True)
+            else:
+                server.kill()
+            server.wait(timeout=30)
     shown = [(item.get("id"), item.get("modelProvider")) for item in (listed.get("result") or {}).get("data") or []]
     if shown != [(thread_ids[0], "openai")]:
         return False, f"listed as {shown}"
