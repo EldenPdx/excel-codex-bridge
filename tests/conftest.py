@@ -11,3 +11,16 @@ os.environ.pop("EXCEL_BRIDGE_LOGIN", None)
 os.environ["EXCEL_BRIDGE_TIMEZONE"] = "off"
 # Nor draw with an image model chosen on this machine; test_image_generation.py sets its own.
 os.environ.pop("EXCEL_BRIDGE_IMAGE_MODEL", None)
+
+
+def _workflow_escape(text: str, *, prop: bool = False) -> str:
+    text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return text.replace(":", "%3A").replace(",", "%2C") if prop else text
+
+
+def pytest_runtest_logreport(report):
+    # On GitHub Actions a failure also shows as an annotation on the commit page,
+    # which anyone can read, unlike the job log.
+    if report.failed and os.environ.get("GITHUB_ACTIONS") == "true":
+        title = _workflow_escape(f"{report.nodeid} ({report.when})", prop=True)
+        print(f"\n::error title={title}::{_workflow_escape(report.longreprtext[-3000:])}", flush=True)
