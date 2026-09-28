@@ -391,14 +391,18 @@ def run_desktop(launcher, args, root: Path, webview: Path, project: Path, env: d
     ]
     if windows_zone is not None:
         changed = "Windows timezone changed from" in desktop_output
+        # Leaving the window puts it back by itself; `timezone restore` has nothing left to do.
+        after_exit = tzutil("/g")
         restored = run([*launcher, "timezone", "restore"], cwd=project, env=env, timeout=120)
         now = tzutil("/g")
         if now != windows_zone:
             tzutil("/s", windows_zone)
         checks += [
             (changed, "desktop did not set the Windows timezone to the exit's"),
-            (restored.returncode == 0 and now == windows_zone,
-             f"`timezone restore` left {now} instead of {windows_zone}"),
+            (after_exit == windows_zone and f"Windows timezone: put back {windows_zone}." in desktop_output,
+             f"leaving desktop left the Windows timezone at {after_exit} instead of {windows_zone}"),
+            (restored.returncode == 0 and "Nothing to restore" in restored.stdout and now == windows_zone,
+             f"`timezone restore` after desktop: {restored.stdout.strip()!r}, now {now}"),
         ]
     return output, checks
 

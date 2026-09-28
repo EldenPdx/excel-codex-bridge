@@ -265,17 +265,21 @@ Codex 会把本机的时区和日期写进每个对话（`<environment_context>`
 请求从代理出口发出，本机时区和出口所在地对不上时，模型会以为你在另一个时区。
 
 - **经过桥接的请求**：桥接先查出口 IP（`https://bps.openai.com/cdn-cgi/trace`），再查这个 IP 的时区
-  （ipwho.is，查不到再用 ipapi.co），把请求里的时区和当天日期换成出口那边的。每 5 分钟看一次出口 IP
-  有没有变。
+  （依次问 ipwho.is、ipapi.co、get.geojs.io、api.ip.sb），把请求里的时区和当天日期换成出口那边的。
+  每 5 分钟看一次出口 IP 有没有变。
 - **官方 ChatGPT 登录**（Windows）：这条链路不经过桥接，而 Codex 读的是 Windows 的系统时区。
   `excel-codex-desktop.cmd` 打开期间会按 Codex 选代理的方式（`HTTPS_PROXY` / `ALL_PROXY`，
   否则用 Windows 的代理设置，不支持 PAC 脚本）查 `chatgpt.com`（API key 登录则是 `api.openai.com`）的出口时区，启动时和之后每分钟
-  用 `tzutil` 把系统时区对上。不需要另外运行别的程序或计划任务。
+  用 `tzutil` 把系统时区对上，关掉窗口（右上角关闭或 Ctrl+C）时恢复成原来的时区。不需要另外运行
+  别的程序或计划任务。
+- **以 Cloudflare 看到的国家为准**：查出口 IP 时 Cloudflare 也会给出它认为出口在哪个国家（OpenAI 看到的
+  就是这个）。定位服务给出的国家和它不一致时不采用、换下一家；都不一致就不改时区，并说明各家的结果。
 
 注意：
 
-- 改的是整台电脑的时区。`excel-codex timezone restore` 恢复第一次修改前的时区。
-- 只把出口 IP 发给 ipwho.is / ipapi.co 查时区，走的也是同一个代理，不发送别的信息。同一个 IP
+- 改的是整台电脑的时区。窗口被强制结束（例如任务管理器）时来不及恢复，运行
+  `excel-codex timezone restore` 恢复第一次修改前的时区。
+- 只把出口 IP 发给这几个定位服务查时区，走的也是同一个代理，不发送别的信息。同一个 IP
   的结果会缓存。
 - `--timezone off`（或环境变量 `EXCEL_BRIDGE_TIMEZONE=off`）关掉以上两项。
 - `excel-codex timezone` 查看出口时区和当前状态；`excel-codex timezone sync --probe` 只查不改。

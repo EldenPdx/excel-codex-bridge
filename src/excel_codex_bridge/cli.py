@@ -569,8 +569,18 @@ def cmd_desktop(args) -> int:
     except (desktop_config.ConfigError, OSError, UnicodeError) as exc:
         _print(f"Could not update {config}: {exc}")
         return 1
-    undo = _once(lambda: desktop_config.disable_file(config))
-    keep = _undo_on_exit(undo) if not args.keep_config else None
+    restore_config = _once(lambda: desktop_config.disable_file(config))
+    # The Windows timezone keeper, once started.
+    timezone: list = []
+
+    def undo() -> None:
+        # However this window goes away: the config, then the Windows timezone.
+        if not args.keep_config:
+            restore_config()
+        for keeper in timezone:
+            _put_back_windows_timezone(keeper)
+
+    keep = _undo_on_exit(undo)
 
     _print(f"Codex desktop app and IDE extension now use the Excel bridge ({codex_config.codex_model(args.model)}).")
     _print(f"  Updated {config}" + (f"; the original is saved as {backup.name}" if backup else ""))
@@ -588,16 +598,14 @@ def cmd_desktop(args) -> int:
     _print(_pictures_line())
     _print(f"Listening on {codex_config.base_url(args.port)}")
     _watch_for_updates()
-    timezone = _keep_windows_timezone()
+    timezone.extend(filter(None, [_keep_windows_timezone()]))
     try:
         _run_bridge(reader, args, host="127.0.0.1", port=args.port, quiet=False)
     except KeyboardInterrupt:
         pass
     finally:
-        if timezone is not None:
-            timezone.stop()
+        undo()
         if not args.keep_config:
-            undo()
             _print(f"Restored {config}.")
             _print(_REOPEN_AFTER_RESTORE)
     del keep
@@ -621,8 +629,10 @@ def _describe_sync(result: dict) -> str:
         return f"Skipped: {result.get('reason')}"
     windows = result.get("windows_timezone")
     before = result.get("previous_timezone")
+    country = result.get("exit_country")
     text = (f"{result.get('route')} -> {result.get('exit_host')} via {_redacted(result.get('proxy'))}: "
-            f"exit {result.get('exit_ip')} is in {result.get('iana_timezone')}" + (f" ({windows})" if windows else ""))
+            f"exit {result.get('exit_ip')}" + (f" (Cloudflare: {country})" if country else "")
+            + f" is in {result.get('iana_timezone')}" + (f" ({windows})" if windows else ""))
     if status == "updated":
         return f"{text}\n  Windows timezone changed from {before} to {windows}."
     if status == "unchanged":
@@ -663,10 +673,12 @@ def cmd_timezone(args) -> int:
     _print(f"Timezone matching: {mode}")
     if mode == "auto":
         _print("  Requests through the bridge carry the proxy exit's timezone and date, looked up from the\n"
-               "  exit IP (ipwho.is, else ipapi.co). --timezone off (or EXCEL_BRIDGE_TIMEZONE=off) turns it off.")
+               "  exit IP by ipwho.is, ipapi.co, get.geojs.io or api.ip.sb, whichever first agrees with\n"
+               "  Cloudflare on the exit's country. --timezone off (or EXCEL_BRIDGE_TIMEZONE=off) turns it off.")
         if sys.platform == "win32":
             _print("  `excel-codex desktop` (excel-codex-desktop.cmd) also keeps the Windows timezone on Codex's\n"
-                   "  exit while its window is open, for Codex's official ChatGPT sign-in too.")
+                   "  exit while its window is open, for Codex's official ChatGPT sign-in too, and puts it back\n"
+                   "  when the window closes.")
     original = system_timezone.original_zone() if sys.platform == "win32" else None
     if original:
         _print(f"  Before the first change: {original} (`excel-codex timezone restore` puts it back).")
@@ -688,8 +700,19 @@ def _keep_windows_timezone():
         return None
     from . import system_timezone
 
-    _print("Windows timezone: kept on Codex's proxy exit while this window is open (--timezone off leaves it).")
+    _print("Windows timezone: kept on Codex's proxy exit while this window is open and put back when it\n"
+           "  closes (--timezone off leaves it alone).")
     return system_timezone.Keeper(lambda result: _print(f"Windows timezone: {_describe_sync(result)}")).start()
+
+
+def _put_back_windows_timezone(keeper) -> None:
+    try:
+        original = keeper.put_back()
+    except Exception as exc:  # noqa: BLE001 - tzutil
+        _print(f"Windows timezone: could not put it back ({exc}).\n  -> Run `excel-codex timezone restore`.")
+        return
+    if original:
+        _print(f"Windows timezone: put back {original}.")
 
 
 # ─── threads ──────────────────────────────────────────────────────────────────

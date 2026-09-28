@@ -13,6 +13,7 @@ from unittest import mock
 import httpx
 
 from excel_codex_bridge import cli, exit_timezone, system_timezone
+from excel_codex_bridge.exit_timezone import Exit
 from excel_codex_bridge.system_timezone import Refused, Route
 
 CHATGPT = Route("ChatGPT sign-in", "chatgpt.com", "http://127.0.0.1:7890")
@@ -85,30 +86,57 @@ class LookupTests(unittest.TestCase):
             return httpx.Response(200, json={"ip": "1.1.1.1", "timezone": "Asia/Tokyo", "utc_offset": "+0900"})
 
         with self.client(handler) as client:
-            self.assertEqual(system_timezone.exit_ip(client, "chatgpt.com"), "1.1.1.1")
-            self.assertEqual(system_timezone.lookup(client, "1.1.1.1").name, "Asia/Tokyo")
+            self.assertEqual(system_timezone.find_exit(client, "chatgpt.com"), Exit("1.1.1.1"))
+            self.assertEqual(system_timezone.lookup(client, Exit("1.1.1.1")).name, "Asia/Tokyo")
+
+    def test_only_a_lookup_that_agrees_with_cloudflare_is_believed(self):
+        answers = {
+            "ipwho.is": {"success": True, "ip": "1.1.1.1", "country_code": "TW", "timezone": {"id": "Asia/Taipei"}},
+            "ipapi.co": {"ip": "1.1.1.1", "timezone": "America/Chicago"},
+            "get.geojs.io": {"ip": "1.1.1.1", "country_code": "US", "timezone": "America/Los_Angeles"},
+        }
+
+        def handler(request):
+            if request.url.path == "/cdn-cgi/trace":
+                return httpx.Response(200, text="h=chatgpt.com\nip=1.1.1.1\nloc=US\n")
+            return httpx.Response(200, json=answers[request.url.host])
+
+        with self.client(handler) as client:
+            exit = system_timezone.find_exit(client, "chatgpt.com")
+            self.assertEqual(exit, Exit("1.1.1.1", "US"))
+            self.assertEqual(system_timezone.lookup(client, exit).name, "America/Los_Angeles")
+            answers["get.geojs.io"]["country_code"] = "TW"
+            answers["api.ip.sb"] = {"ip": "1.1.1.1", "country_code": "TW", "timezone": "Asia/Taipei"}
+            with self.assertRaises(Refused) as caught:
+                system_timezone.lookup(client, exit)
+        message = str(caught.exception)
+        self.assertIn("which Cloudflare places in US,", message)
+        self.assertIn("ipwho.is: says TW (Asia/Taipei), but Cloudflare sees the exit in US", message)
+        self.assertIn("ipapi.co: says America/Chicago, no country", message)
+        self.assertIn("left as it is", message)
 
     def test_plain_http_is_only_for_loopback(self):
         with self.client(lambda request: httpx.Response(200, text="h=example.com\nip=1.1.1.1")) as client:
             with mock.patch.dict(os.environ, {system_timezone.TRACE_ENV: "http://example.com/cdn-cgi/trace"}):
                 with self.assertRaises(Refused):
-                    system_timezone.exit_ip(client, "chatgpt.com")
+                    system_timezone.find_exit(client, "chatgpt.com")
         with self.client(lambda request: httpx.Response(200, text="h=127.0.0.1\nip=1.1.1.1")) as client:
             with mock.patch.dict(os.environ, {system_timezone.TRACE_ENV: "http://127.0.0.1:9/cdn-cgi/trace"}):
-                self.assertEqual(system_timezone.exit_ip(client, "chatgpt.com"), "1.1.1.1")
+                self.assertEqual(system_timezone.find_exit(client, "chatgpt.com").ip, "1.1.1.1")
 
     def test_all_lookups_failing_says_why(self):
         with self.client(lambda request: httpx.Response(429)) as client:
             with self.assertRaises(Refused) as caught:
-                system_timezone.lookup(client, "1.1.1.1")
+                system_timezone.lookup(client, Exit("1.1.1.1"))
         self.assertIn("ipwho.is: HTTP 429", str(caught.exception))
 
 
 class SyncTests(Folder):
-    def run_sync(self, *, probe=False, routes=None, ips=None, current="China Standard Time", lookup_fails=False):
+    def run_sync(self, *, probe=False, routes=None, ips=None, current="China Standard Time", lookup_fails=False,
+                 stopped=None):
         self.lookups = 0
 
-        def lookup(client, ip):
+        def lookup(client, exit):
             self.lookups += 1
             if lookup_fails:
                 raise Refused("offline")
@@ -116,13 +144,14 @@ class SyncTests(Folder):
 
         with mock.patch.object(system_timezone.sys, "platform", "win32"), \
              mock.patch.object(system_timezone, "codex_route", side_effect=routes or [CHATGPT, CHATGPT]), \
-             mock.patch.object(system_timezone, "exit_ip", side_effect=ips or ["1.1.1.1", "1.1.1.1"]), \
+             mock.patch.object(system_timezone, "find_exit",
+                               side_effect=[ip if isinstance(ip, Exit) else Exit(ip) for ip in ips or ["1.1.1.1"] * 2]), \
              mock.patch.object(system_timezone, "lookup", side_effect=lookup), \
              mock.patch.object(system_timezone, "windows_zone_for", return_value="Taipei Standard Time"), \
              mock.patch.object(system_timezone, "current_zone", return_value=current), \
              mock.patch.object(system_timezone, "set_zone") as setter:
             try:
-                result = system_timezone.sync(probe=probe)
+                result = system_timezone.sync(probe=probe, stopped=stopped)
             finally:
                 self.set_calls = setter.call_count
         return result["status"]
@@ -149,6 +178,13 @@ class SyncTests(Folder):
         self.assertEqual(self.run_sync(ips=["1.1.1.1", "8.8.8.8"]), "skipped")
         self.assertEqual(self.set_calls, 0)
 
+    def test_nothing_is_changed_once_the_window_is_closing(self):
+        stopped = system_timezone.threading.Event()
+        stopped.set()
+        self.assertEqual(self.run_sync(stopped=stopped), "skipped")
+        self.assertEqual(self.set_calls, 0)
+        self.assertIsNone(system_timezone.original_zone())
+
     def test_a_failed_lookup_changes_nothing(self):
         with self.assertRaises(Refused):
             self.run_sync(lookup_fails=True)
@@ -168,12 +204,31 @@ class SyncTests(Folder):
         self.run_sync(ips=["8.8.8.8", "8.8.8.8"], current="Taipei Standard Time")
         self.assertEqual(self.lookups, 1)
 
+    def test_a_country_change_or_a_state_from_before_the_country_check_is_looked_up_again(self):
+        us = Exit("1.1.1.1", "US")
+        self.run_sync(ips=[us, us], current="Taipei Standard Time")
+        self.run_sync(ips=[us, us], current="Taipei Standard Time")
+        self.assertEqual(self.lookups, 0)
+        self.run_sync(ips=[Exit("1.1.1.1", "JP")] * 2, current="Taipei Standard Time")
+        self.assertEqual(self.lookups, 1)
+        # 0.5.4 saved no exit_country, and could have saved a timezone from a lookup that was wrong.
+        path = self.root / "bridge" / system_timezone.STATE_NAME
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["exit_country"] = "US"
+        path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_sync(ips=[us, us], current="Taipei Standard Time")
+        self.assertEqual(self.lookups, 0)
+        del state["exit_country"]
+        path.write_text(json.dumps(state), encoding="utf-8")
+        self.run_sync(ips=[us, us], current="Taipei Standard Time")
+        self.assertEqual(self.lookups, 1)
+
 
 class RestoreTests(Folder):
     def test_the_timezone_from_before_the_first_change_is_kept(self):
         with mock.patch.object(system_timezone.sys, "platform", "win32"), \
              mock.patch.object(system_timezone, "codex_route", return_value=CHATGPT), \
-             mock.patch.object(system_timezone, "exit_ip", return_value="1.1.1.1"), \
+             mock.patch.object(system_timezone, "find_exit", return_value=Exit("1.1.1.1")), \
              mock.patch.object(system_timezone, "lookup", return_value=exit_timezone.Zone("Asia/Tokyo")), \
              mock.patch.object(system_timezone, "windows_zone_for", return_value="Tokyo Standard Time"), \
              mock.patch.object(system_timezone, "current_zone", side_effect=["China Standard Time", "Korea Standard Time"]), \
@@ -205,7 +260,7 @@ class KeeperTests(Folder):
         reported = []
         keeper = system_timezone.Keeper(reported.append, interval=0)
 
-        def sync():
+        def sync(**_):
             result = results.pop(0)
             if not results:
                 keeper.stop()
@@ -219,6 +274,16 @@ class KeeperTests(Folder):
             ("unchanged", None), ("error", "offline"), ("error", "tzutil failed"), ("unchanged", None),
             ("updated", None)])
         self.assertEqual(system_timezone.last_result()["error"], "tzutil failed")
+
+    def test_put_back_stops_then_restores(self):
+        system_timezone._remember("China Standard Time")
+        keeper = system_timezone.Keeper(lambda result: None)
+        with mock.patch.object(system_timezone.sys, "platform", "win32"), \
+             mock.patch.object(system_timezone, "set_zone") as setter:
+            self.assertEqual(keeper.put_back(), "China Standard Time")
+            self.assertIsNone(keeper.put_back())
+        self.assertTrue(keeper._stop.is_set())
+        setter.assert_called_once_with("China Standard Time")
 
     def test_desktop_keeps_windows_on_the_exit_unless_turned_off(self):
         with mock.patch.object(cli.sys, "platform", "win32"), \

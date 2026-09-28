@@ -4,9 +4,12 @@ Codex puts this computer's timezone and date into every conversation
 (``<environment_context>``: ``<timezone>``, ``<current_date>``).  Requests
 through the bridge leave from the proxy exit, so the bridge finds out where
 that is: the exit IP from ``https://<backend>/cdn-cgi/trace``, its timezone
-from an IP geolocation service (ipwho.is, else ipapi.co), both through the
-bridge's own proxy.  It writes that timezone, and the day it is there, into
-the context before a request goes upstream.  Only the exit IP is looked up;
+from an IP geolocation service (ipwho.is, else ipapi.co, get.geojs.io, api.ip.sb),
+both through the bridge's own proxy.  The trace also says which country
+Cloudflare, in front of OpenAI, places the exit in; a service that puts it in
+another country is not believed, and when none agrees the timezone is left as
+it is.  The bridge writes that timezone, and the day it is there, into the
+context before a request goes upstream.  Only the exit IP is looked up;
 ``EXCEL_BRIDGE_TIMEZONE=off`` (``--timezone off``) turns all of this off.
 
 ``system_timezone`` does the same lookup for Codex's official ChatGPT sign-in,
@@ -36,7 +39,12 @@ MODES = ("auto", "off")
 _OFF = {"off", "0", "false", "no"}
 # Comma-separated URLs with {ip} in them; mostly for tests.
 LOOKUP_ENV = "EXCEL_BRIDGE_TIMEZONE_LOOKUP"
-DEFAULT_LOOKUPS = ("https://ipwho.is/{ip}", "https://ipapi.co/{ip}/json/")
+DEFAULT_LOOKUPS = (
+    "https://ipwho.is/{ip}",
+    "https://ipapi.co/{ip}/json/",
+    "https://get.geojs.io/v1/ip/geo/{ip}.json",
+    "https://api.ip.sb/geoip/{ip}",
+)
 # The exit IP is checked this often; a looked-up IP keeps its timezone for LOOKUP_SECONDS.
 CHECK_SECONDS = 300
 RETRY_SECONDS = 60
@@ -49,6 +57,16 @@ _ZONE_NAME = re.compile(r"(?:UTC|[A-Z][A-Za-z_]+(?:/[A-Za-z0-9_+\-]+){1,2})")
 _CONTEXT = re.compile(r"<environment_context>.*?</environment_context>", re.S)
 _TIMEZONE = re.compile(r"<timezone>([^<]*)</timezone>")
 _DATE = re.compile(r"<current_date>(\d{4}-\d{2}-\d{2})</current_date>")
+_COUNTRY = re.compile(r"[A-Z]{2}")
+# Cloudflare's "unknown" and "Tor".
+_NO_COUNTRY = {"XX", "T1"}
+
+
+@dataclass(frozen=True)
+class Exit:
+    ip: str
+    # Where Cloudflare places the IP (the trace's ``loc``), as OpenAI sees it; None if it did not say.
+    country: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +74,12 @@ class Zone:
     name: str
     # Seconds east of UTC when looked up; the day falls back to it without tzdata.
     offset: int | None = None
+    # The country the lookup service places the IP in.
+    country: str | None = None
+
+
+class Disagreement(ValueError):
+    """A lookup service places the exit in another country than Cloudflare does."""
 
 
 def enabled() -> bool:
@@ -72,15 +96,20 @@ def trace_url(responses_url: str) -> str:
     return f"{parts.scheme}://{parts.netloc}/cdn-cgi/trace"
 
 
-def parse_trace(text: str, host: str | None) -> str:
-    """The public IP a Cloudflare ``/cdn-cgi/trace`` answer saw this request come from."""
+def _country(value: object) -> str | None:
+    code = value.strip().upper() if isinstance(value, str) else ""
+    return code if _COUNTRY.fullmatch(code) and code not in _NO_COUNTRY else None
+
+
+def parse_trace(text: str, host: str | None) -> Exit:
+    """The public IP a Cloudflare ``/cdn-cgi/trace`` answer saw this request come from, and its country."""
     fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
     if not host or fields.get("h") != host:
         raise ValueError("the trace answered for another host")
     address = ipaddress.ip_address(fields.get("ip", "").strip())
     if not address.is_global:
         raise ValueError("the trace did not see a public IP")
-    return str(address)
+    return Exit(str(address), _country(fields.get("loc")))
 
 
 def _offset(value: object) -> int | None:
@@ -92,7 +121,7 @@ def _offset(value: object) -> int | None:
 
 
 def parse_geo(data: object, ip: str) -> Zone:
-    """The timezone in an ipwho.is or ipapi.co answer about ``ip``."""
+    """The timezone in an ipwho.is, ipapi.co, get.geojs.io or api.ip.sb answer about ``ip``."""
     if not isinstance(data, dict) or data.get("success") is False or data.get("error"):
         raise ValueError("the lookup was refused")
     if ipaddress.ip_address(str(data.get("ip", ""))) != ipaddress.ip_address(ip):
@@ -106,7 +135,21 @@ def parse_geo(data: object, ip: str) -> Zone:
         offset = _offset(data.get("utc_offset"))
     if not isinstance(zone, str) or not _ZONE_NAME.fullmatch(zone):
         raise ValueError("the answer has no timezone")
-    return Zone(zone, offset)
+    return Zone(zone, offset, _country(data.get("country_code")))
+
+
+def check_country(zone: Zone, exit: Exit) -> Zone:
+    """``zone``, unless its service places the exit in another country than Cloudflare does."""
+    if exit.country and zone.country != exit.country:
+        where = f"{zone.country} ({zone.name})" if zone.country else f"{zone.name}, no country"
+        raise Disagreement(f"says {where}, but Cloudflare sees the exit in {exit.country}")
+    return zone
+
+
+def lookup_failed(exit: Exit, reasons: list[str]) -> str:
+    # Without the IP: the bridge logs this.
+    where = f", which Cloudflare places in {exit.country}," if exit.country else ""
+    return f"no lookup service could tell the timezone of the exit{where} ({'; '.join(reasons) or 'none tried'})"
 
 
 def today_in(zone: str | None, offset: int | None = None, now: dt.datetime | None = None) -> str | None:
@@ -181,7 +224,7 @@ class ExitTimezone:
         self._trace = trace
         self._clock = clock
         self.zone: Zone | None = None
-        self._ip: str | None = None
+        self._exit: Exit | None = None
         self._looked_up: float | None = None
         self._next_check = 0.0
         self._checked = False
@@ -223,31 +266,33 @@ class ExitTimezone:
         url = self._trace or trace_url(excel_upstream.RESPONSES_URL)
         response = await client.get(url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        ip = parse_trace(response.text, urlsplit(url).hostname)
+        exit = parse_trace(response.text, urlsplit(url).hostname)
         fresh = self._looked_up is not None and self._clock() - self._looked_up < LOOKUP_SECONDS
-        if ip == self._ip and fresh and self.zone is not None:
+        if exit == self._exit and fresh and self.zone is not None:
             return
-        if ip != self._ip:
+        if exit != self._exit:
             # A new exit: the old timezone may be wrong now, so it goes until the lookup works.
-            self._ip, self.zone, self._looked_up = ip, None, None
-        zone = await self._lookup(client, ip)
+            self._exit, self.zone, self._looked_up = exit, None, None
+        zone = await self._lookup(client, exit)
         if zone != self.zone:
             log.info("proxy exit timezone: %s; Codex is told this one instead of this computer's", zone.name)
         self.zone, self._looked_up = zone, self._clock()
 
-    async def _lookup(self, client: httpx.AsyncClient, ip: str) -> Zone:
+    async def _lookup(self, client: httpx.AsyncClient, exit: Exit) -> Zone:
         reasons = []
-        for url in lookup_urls(ip):
+        for url in lookup_urls(exit.ip):
             try:
                 response = await client.get(url, timeout=REQUEST_TIMEOUT)
                 response.raise_for_status()
-                return parse_geo(response.json(), ip)
+                return check_country(parse_geo(response.json(), exit.ip), exit)
             except Exception as exc:  # noqa: BLE001 - try the next service
                 reasons.append(f"{urlsplit(url).hostname}: {_reason(exc)}")
-        raise LookupError("; ".join(reasons) or "no lookup service")
+        raise LookupError(lookup_failed(exit, reasons))
 
 
 def _reason(exc: BaseException) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         return f"HTTP {exc.response.status_code}"
+    if isinstance(exc, Disagreement):
+        return str(exc)
     return f"{type(exc).__name__}: {exc}" if str(exc).strip() else type(exc).__name__

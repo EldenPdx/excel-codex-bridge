@@ -5,10 +5,12 @@ the bridge corrects it in requests that pass through it (``exit_timezone``),
 but Codex's official ChatGPT sign-in talks to OpenAI directly.  So on Windows
 ``excel-codex desktop`` (excel-codex-desktop.cmd) also finds that exit the way
 ``exit_timezone`` does (the IP ``https://chatgpt.com/cdn-cgi/trace`` sees
-through the proxy Codex uses, then its timezone) and sets Windows to it with
-``tzutil``, at start and every minute while its window is open.  It changes
+through the proxy Codex uses, then its timezone from a lookup service that
+agrees with Cloudflare on the country) and sets Windows to it with
+``tzutil``, at start and every minute while its window is open, and puts back
+the one from before the first change when the window goes away.  It changes
 the timezone for every program; ``--timezone off`` leaves it alone and
-``excel-codex timezone restore`` puts back the one from before the first change.
+``excel-codex timezone restore`` puts it back after a window that was killed.
 
 Codex's proxy is found the way Codex finds it: ``HTTPS_PROXY`` / ``ALL_PROXY``,
 else the Windows proxy setting (not PAC scripts), else none.
@@ -46,6 +48,8 @@ TIMEOUT = httpx.Timeout(12.0)
 _TOP_LEVEL = re.compile(r"""^\s*model_provider\s*=\s*["']([^"']+)["']""", re.M)
 _INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 _TIME_ZONES = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Time Zones"
+# Held while the timezone is changed, so a sync cannot change it again after it was put back.
+_changing = threading.Lock()
 
 
 class Refused(RuntimeError):
@@ -173,23 +177,25 @@ def trace_url(host: str) -> str:
     return os.environ.get(TRACE_ENV, "").strip() or f"https://{host}/cdn-cgi/trace"
 
 
-def exit_ip(client: httpx.Client, host: str) -> str:
+def find_exit(client: httpx.Client, host: str) -> exit_timezone.Exit:
+    """The exit IP ``host``'s Cloudflare trace sees, and the country Cloudflare places it in."""
     url = _checked_url(trace_url(host))
     response = client.get(url)
     response.raise_for_status()
     return exit_timezone.parse_trace(response.text, urlsplit(url).hostname)
 
 
-def lookup(client: httpx.Client, ip: str) -> exit_timezone.Zone:
+def lookup(client: httpx.Client, exit: exit_timezone.Exit) -> exit_timezone.Zone:
+    """The exit's timezone from the first lookup service that agrees with Cloudflare on the country."""
     reasons = []
-    for url in exit_timezone.lookup_urls(ip):
+    for url in exit_timezone.lookup_urls(exit.ip):
         try:
             response = client.get(_checked_url(url))
             response.raise_for_status()
-            return exit_timezone.parse_geo(response.json(), ip)
+            return exit_timezone.check_country(exit_timezone.parse_geo(response.json(), exit.ip), exit)
         except Exception as exc:  # noqa: BLE001 - try the next service
             reasons.append(f"{urlsplit(url).hostname}: {exit_timezone._reason(exc)}")
-    raise Refused("could not look up the exit's timezone (" + "; ".join(reasons) + ")")
+    raise Refused(exit_timezone.lookup_failed(exit, reasons) + "; the timezone is left as it is")
 
 
 # ─── Windows ──────────────────────────────────────────────────────────────────
@@ -260,14 +266,16 @@ def _now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
-def _cached(ip: str, now: dt.datetime) -> tuple[str, str, str] | None:
+def _cached(exit: exit_timezone.Exit, now: dt.datetime) -> tuple[str, str, str] | None:
     """(IANA zone, Windows zone, when looked up) from the last run, if the exit is the same."""
     state = _read_json(_state_path(STATE_NAME))
     try:
         looked_up = dt.datetime.fromisoformat(state["looked_up_at"])
     except (KeyError, TypeError, ValueError):
         return None
-    if (state.get("exit_ip") != ip or not state.get("iana_timezone") or not state.get("windows_timezone")
+    # A state without exit_country is from before the country was checked (0.5.4), so not trusted.
+    if (state.get("exit_ip") != exit.ip or "exit_country" not in state or state["exit_country"] != exit.country
+            or not state.get("iana_timezone") or not state.get("windows_timezone")
             or not dt.timedelta(0) <= now - looked_up <= ZONE_CACHE):
         return None
     return state["iana_timezone"], state["windows_timezone"], state["looked_up_at"]
@@ -282,22 +290,25 @@ def _record(status: str, **details) -> dict:
     return result
 
 
-def sync(*, probe: bool = False) -> dict:
-    """Set Windows to the exit's timezone (``probe``: only say what it would be)."""
+def sync(*, probe: bool = False, stopped: threading.Event | None = None) -> dict:
+    """Set Windows to the exit's timezone (``probe``: only say what it would be).
+
+    Once ``stopped`` is set the timezone is left alone: it is being put back.
+    """
     now = _now()
     route = codex_route()
     with _client(route.proxy) as client:
-        ip = exit_ip(client, route.host)
-        cached = _cached(ip, now)
+        exit = find_exit(client, route.host)
+        cached = _cached(exit, now)
         if cached:
             iana, target, looked_up = cached
         else:
-            iana = lookup(client, ip).name
+            iana = lookup(client, exit).name
             target = windows_zone_for(iana) if sys.platform == "win32" else ""
             looked_up = now.isoformat()
         before = current_zone() if sys.platform == "win32" else ""
-        details = dict(route=route.name, exit_host=route.host, proxy=route.proxy, exit_ip=ip,
-                       iana_timezone=iana, windows_timezone=target, previous_timezone=before,
+        details = dict(route=route.name, exit_host=route.host, proxy=route.proxy, exit_ip=exit.ip,
+                       exit_country=exit.country, iana_timezone=iana, windows_timezone=target, previous_timezone=before,
                        looked_up_at=looked_up)
         if probe or sys.platform != "win32":
             # Not saved: timezone-state.json keeps what the last real sync did.
@@ -305,10 +316,13 @@ def sync(*, probe: bool = False) -> dict:
         if _same_zone(before, target):
             return _record("unchanged", **details)
         # Look again right before changing anything: the proxy may have just switched.
-        if codex_route() != route or exit_ip(client, route.host) != ip:
+        if codex_route() != route or find_exit(client, route.host) != exit:
             return _record("skipped", reason="the exit changed during the lookup")
-        _remember(before)
-        set_zone(target)
+        with _changing:
+            if stopped is not None and stopped.is_set():
+                return _record("skipped", reason="the window is closing")
+            _remember(before)
+            set_zone(target)
         return _record("updated", **details)
 
 
@@ -331,15 +345,16 @@ def restore() -> str | None:
     """Put back the timezone from before the first change (returned), if one was changed."""
     if sys.platform != "win32":
         raise Refused("the system timezone is only changed on Windows")
-    original = original_zone()
-    if original:
-        set_zone(original)
-        _state_path(SETTINGS_NAME).unlink(missing_ok=True)
+    with _changing:
+        original = original_zone()
+        if original:
+            set_zone(original)
+            _state_path(SETTINGS_NAME).unlink(missing_ok=True)
     return original
 
 
 class Keeper:
-    """``desktop`` on Windows: syncs now and every minute until stopped.
+    """``desktop`` on Windows: syncs now and every minute until put back.
 
     ``report(result)`` hears the first result, every change, and every new error.
     """
@@ -357,11 +372,16 @@ class Keeper:
     def stop(self) -> None:
         self._stop.set()
 
+    def put_back(self) -> str | None:
+        """Stop, then put back the timezone from before the first change (returned), if there was one."""
+        self.stop()
+        return restore()
+
     def _run(self) -> None:
         last: dict | None = None
         while not self._stop.is_set():
             try:
-                result = sync()
+                result = sync(stopped=self._stop)
             except Exception as exc:  # noqa: BLE001 - network, proxy, tzutil
                 result = _record("error", error=str(exc) or type(exc).__name__)
             if (last is None or result["status"] == "updated"

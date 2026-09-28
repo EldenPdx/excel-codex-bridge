@@ -181,12 +181,14 @@ class DesktopCommandTests(unittest.TestCase):
                 sig = getattr(cli.signal, name)
                 self.addCleanup(cli.signal.signal, sig, cli.signal.getsignal(sig))
 
-    def run_desktop(self, *extra):
+    def run_desktop(self, *extra, while_running=None):
         seen = {}
 
         def fake_bridge(reader, args, *, host, port, quiet):
             seen["config"] = self.config.read_text()
             seen["port"] = port
+            if while_running is not None:
+                while_running(seen)
             raise KeyboardInterrupt
 
         with mock.patch.object(cli, "_run_bridge", fake_bridge), mock.patch.object(cli, "_port_free", lambda p: True):
@@ -226,6 +228,47 @@ class DesktopCommandTests(unittest.TestCase):
         self.assertTrue(desktop_config.is_enabled(self.config.read_text()))
         self.assertEqual(cli.main(["desktop", "--off"]), 0)
         self.assertEqual(self.config.read_text(), USER_CONFIG)
+
+    def test_the_windows_timezone_is_put_back_on_the_way_out(self):
+        keeper = mock.Mock(**{"put_back.return_value": "China Standard Time"})
+        with mock.patch.object(cli, "_keep_windows_timezone", return_value=keeper), \
+             mock.patch.object(cli, "_print") as printed:
+            code, _ = self.run_desktop()
+        self.assertEqual(code, 0)
+        keeper.put_back.assert_called_once_with()
+        self.assertIn("Windows timezone: put back China Standard Time.",
+                      [call.args[0] for call in printed.call_args_list])
+
+    def test_closing_the_window_puts_back_the_timezone(self):
+        for extra in ((), ("--keep-config",)):
+            with self.subTest(extra=extra):
+                self.config.write_text(USER_CONFIG)
+                keeper = mock.Mock(**{"put_back.side_effect": ["China Standard Time", None]})
+                handlers = []
+
+                def window_closed(seen):
+                    # What Windows runs when the console window is closed, before it ends the process.
+                    handlers[0]()
+                    seen["after"] = self.config.read_text()
+
+                with mock.patch.object(cli, "_keep_windows_timezone", return_value=keeper), \
+                     mock.patch.object(cli, "_undo_on_exit", side_effect=handlers.append), \
+                     mock.patch.object(cli, "_print"):
+                    code, seen = self.run_desktop(*extra, while_running=window_closed)
+                self.assertEqual(code, 0)
+                # By the handler, then once more (a no-op by then) on the way out.
+                self.assertEqual(keeper.put_back.call_count, 2)
+                self.assertEqual(seen["after"] == USER_CONFIG, not extra)
+
+    def test_a_timezone_that_cannot_be_put_back_says_what_to_run(self):
+        keeper = mock.Mock(**{"put_back.side_effect": RuntimeError("tzutil failed")})
+        with mock.patch.object(cli, "_keep_windows_timezone", return_value=keeper), \
+             mock.patch.object(cli, "_print") as printed:
+            code, _ = self.run_desktop()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.config.read_text(), USER_CONFIG)
+        self.assertTrue(any("tzutil failed" in call.args[0] and "excel-codex timezone restore" in call.args[0]
+                            for call in printed.call_args_list))
 
     def test_busy_port_changes_nothing(self):
         with mock.patch.object(cli, "_port_free", lambda p: False):

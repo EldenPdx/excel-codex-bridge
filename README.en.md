@@ -321,21 +321,27 @@ Codex writes this computer's timezone and date into every conversation (`<timezo
 computer's timezone differs from the exit's, the model assumes you are in another timezone.
 
 - **Requests through the bridge**: the bridge looks up the exit IP
-  (`https://bps.openai.com/cdn-cgi/trace`), then that IP's timezone (ipwho.is, else ipapi.co), and
-  replaces the timezone and today's date in the request with the exit's. It checks every 5 minutes
-  whether the exit IP changed.
+  (`https://bps.openai.com/cdn-cgi/trace`), then that IP's timezone (asking ipwho.is, ipapi.co,
+  get.geojs.io and api.ip.sb in turn), and replaces the timezone and today's date in the request
+  with the exit's. It checks every 5 minutes whether the exit IP changed.
 - **Codex's official ChatGPT sign-in** (Windows): this route does not go through the bridge, and
   Codex reads the Windows system timezone. While `excel-codex-desktop.cmd` is open it looks up the
   exit timezone of `chatgpt.com` (`api.openai.com` with an API key) the way Codex picks its proxy
   (`HTTPS_PROXY` / `ALL_PROXY`, else the Windows proxy settings; PAC scripts are not supported),
-  and sets the system timezone to it with `tzutil` at start and every minute after. Nothing else
-  has to run, and no scheduled task is created.
+  and sets the system timezone to it with `tzutil` at start and every minute after, then puts the
+  earlier one back when the window is closed (its close button or Ctrl+C). Nothing else has to
+  run, and no scheduled task is created.
+- **Cloudflare's country decides**: the exit IP lookup also gives the country Cloudflare places the
+  exit in (which is what OpenAI sees). A lookup service that answers another country is not used
+  and the next one is asked; when none agrees the timezone is left alone and what each answered is
+  shown.
 
 Notes:
 
-- This changes the whole computer's timezone. `excel-codex timezone restore` restores the timezone
-  from before the first change.
-- Only the exit IP is sent to ipwho.is / ipapi.co, through the same proxy; nothing else is sent.
+- This changes the whole computer's timezone. A window that is killed (for example from Task
+  Manager) cannot put it back; `excel-codex timezone restore` restores the timezone from before the
+  first change.
+- Only the exit IP is sent to these lookup services, through the same proxy; nothing else is sent.
   The answer for an IP is cached.
 - `--timezone off` (or `EXCEL_BRIDGE_TIMEZONE=off`) turns both off.
 - `excel-codex timezone` shows the exit timezone and the current state;

@@ -10,7 +10,7 @@ from unittest import mock
 import httpx
 
 from excel_codex_bridge import exit_timezone
-from excel_codex_bridge.exit_timezone import ExitTimezone, Zone
+from excel_codex_bridge.exit_timezone import Exit, ExitTimezone, Zone
 
 from test_server import BridgeHarness, text_stream
 
@@ -27,8 +27,8 @@ def context(zone: str = "Asia/Shanghai", date: str = "2026-09-28") -> str:
     )
 
 
-def trace_answer(ip: str = "1.1.1.1", host: str = "bps.openai.com") -> httpx.Response:
-    return httpx.Response(200, text=f"fl=1\nh={host}\nip={ip}\nts=1\n")
+def trace_answer(ip: str = "1.1.1.1", host: str = "bps.openai.com", loc: str | None = None) -> httpx.Response:
+    return httpx.Response(200, text=f"fl=1\nh={host}\nip={ip}\nts=1\n" + (f"loc={loc}\n" if loc else ""))
 
 
 class Upstream:
@@ -39,23 +39,29 @@ class Upstream:
         self.zones = {"1.1.1.1": "Asia/Tokyo"} if zones is None else zones
         self.trace_fails = False
         self.ipwho_fails = False
+        # Cloudflare's country in the trace, the one ipwho.is gives, and what get.geojs.io answers.
+        self.loc: str | None = None
+        self.ipwho_country: str | None = None
+        self.geojs: dict | None = None
         self.requests: list[str] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         self.requests.append(url)
         if url == TRACE:
-            return httpx.Response(503) if self.trace_fails else trace_answer(self.ip)
+            return httpx.Response(503) if self.trace_fails else trace_answer(self.ip, loc=self.loc)
         ip = request.url.path.split("/")[1]
         if request.url.host == "ipwho.is":
             if self.ipwho_fails or ip not in self.zones:
                 return httpx.Response(200, json={"ip": ip, "success": False, "message": "reserved range"})
-            return httpx.Response(200, json={"ip": ip, "success": True,
+            return httpx.Response(200, json={"ip": ip, "success": True, "country_code": self.ipwho_country,
                                              "timezone": {"id": self.zones[ip], "offset": 32400}})
         if request.url.host == "ipapi.co":
             if ip not in self.zones:
                 return httpx.Response(429)
             return httpx.Response(200, json={"ip": ip, "timezone": self.zones[ip], "utc_offset": "+0900"})
+        if request.url.host == "get.geojs.io" and self.geojs is not None:
+            return httpx.Response(200, json={"ip": request.url.path.split("/")[-1].removesuffix(".json"), **self.geojs})
         return httpx.Response(404)
 
     def lookups(self) -> int:
@@ -73,7 +79,23 @@ class Clock:
 class ParseTests(unittest.TestCase):
     def test_trace_gives_the_public_exit_ip(self):
         self.assertEqual(exit_timezone.parse_trace("h=bps.openai.com\nip=1.1.1.1\n", "bps.openai.com"),
-                         "1.1.1.1")
+                         Exit("1.1.1.1"))
+
+    def test_trace_gives_cloudflare_country(self):
+        for loc, country in (("US", "US"), ("jp", "JP"), ("XX", None), ("T1", None), ("USA", None), ("", None)):
+            with self.subTest(loc=loc):
+                exit = exit_timezone.parse_trace(f"h=bps.openai.com\nip=1.1.1.1\nloc={loc}\n", "bps.openai.com")
+                self.assertEqual(exit, Exit("1.1.1.1", country))
+
+    def test_a_lookup_in_another_country_than_cloudflare_is_refused(self):
+        taipei = exit_timezone.parse_geo({"ip": "1.1.1.1", "country_code": "TW", "timezone": "Asia/Taipei"}, "1.1.1.1")
+        self.assertEqual(taipei, Zone("Asia/Taipei", None, "TW"))
+        self.assertIs(exit_timezone.check_country(taipei, Exit("1.1.1.1", "TW")), taipei)
+        self.assertIs(exit_timezone.check_country(taipei, Exit("1.1.1.1")), taipei)
+        with self.assertRaisesRegex(exit_timezone.Disagreement, "says TW \\(Asia/Taipei\\), but Cloudflare sees the exit in US"):
+            exit_timezone.check_country(taipei, Exit("1.1.1.1", "US"))
+        with self.assertRaisesRegex(exit_timezone.Disagreement, "says Asia/Taipei, no country"):
+            exit_timezone.check_country(Zone("Asia/Taipei"), Exit("1.1.1.1", "US"))
         for text, host in (("h=example.com\nip=1.1.1.1", "bps.openai.com"),
                            ("h=bps.openai.com\nip=10.0.0.1", "bps.openai.com"),
                            ("h=bps.openai.com\nip=127.0.0.1", "bps.openai.com"),
@@ -106,7 +128,8 @@ class ParseTests(unittest.TestCase):
 
     def test_lookup_urls_can_be_replaced(self):
         self.assertEqual(exit_timezone.lookup_urls("1.1.1.1"),
-                         ["https://ipwho.is/1.1.1.1", "https://ipapi.co/1.1.1.1/json/"])
+                         ["https://ipwho.is/1.1.1.1", "https://ipapi.co/1.1.1.1/json/",
+                          "https://get.geojs.io/v1/ip/geo/1.1.1.1.json", "https://api.ip.sb/geoip/1.1.1.1"])
         with mock.patch.dict(os.environ, {exit_timezone.LOOKUP_ENV: "http://127.0.0.1:9/geo/{ip}"}):
             self.assertEqual(exit_timezone.lookup_urls("1.1.1.1"), ["http://127.0.0.1:9/geo/1.1.1.1"])
 
@@ -177,6 +200,17 @@ class TrackerTests(unittest.TestCase):
 
     def test_first_request_waits_for_the_lookup(self):
         self.assertEqual(self.run_async(lambda tracker: tracker.current()), TOKYO)
+
+    def test_only_a_lookup_in_cloudflare_country_is_used(self):
+        # ipwho.is puts a US exit in Taiwan, ipapi.co gives no country: neither is believed.
+        self.upstream.zones = {"1.1.1.1": "Asia/Taipei"}
+        self.upstream.loc, self.upstream.ipwho_country = "US", "TW"
+        with self.assertLogs("excel_codex_bridge", "WARNING") as logs:
+            self.assertIsNone(self.run_async(lambda tracker: tracker.current()))
+        self.assertIn("ipwho.is: says TW (Asia/Taipei), but Cloudflare sees the exit in US", logs.output[0])
+        self.assertIn("sending Codex's own timezone", logs.output[0])
+        self.upstream.geojs = {"country_code": "US", "timezone": "America/Los_Angeles"}
+        self.assertEqual(self.run_async(lambda tracker: tracker.current()), Zone("America/Los_Angeles", None, "US"))
 
     def test_off_looks_nothing_up(self):
         with mock.patch.dict(os.environ, {exit_timezone.MODE_ENV: "off"}):
