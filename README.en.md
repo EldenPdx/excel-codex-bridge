@@ -346,6 +346,10 @@ Notes:
 - `--timezone off` (or `EXCEL_BRIDGE_TIMEZONE=off`) turns both off.
 - `excel-codex timezone` shows the exit timezone and the current state;
   `excel-codex timezone sync --probe` looks up without changing anything.
+- A country you did not expect, such as `(Cloudflare: TW)`, means your proxy sends OpenAI's traffic
+  through a node there, so that is what OpenAI sees; the proxy app's home page only shows the
+  default node. Opening `https://chatgpt.com/cdn-cgi/trace` through the same proxy shows the
+  country OpenAI sees on its `loc=` line.
 
 ## macOS / WSL (experimental)
 

@@ -5,15 +5,19 @@
 
 ## 变化
 
-- **出口时区不再被查错的国家带偏**：0.5.4 只信一个 IP 定位服务，它把美国出口定位到台湾时，Windows
-  就被改成台北时间。现在以 Cloudflare（OpenAI 前面那一层）看到的出口国家为准：定位服务给出的国家
-  和它不一致就不采用，依次换 ipwho.is、ipapi.co、get.geojs.io、api.ip.sb；都不一致时不改时区，
-  并在窗口里写明各家说的是哪里。窗口里显示为 `exit … (Cloudflare: US) is in America/Los_Angeles`。
+- **出口时区以 Cloudflare 看到的国家为准**：0.5.4 只信第一个答复的 IP 定位服务，定位库一旦把出口
+  判错国家，时区就跟着错。现在先看 Cloudflare（OpenAI 前面那一层）认为出口在哪个国家，定位服务
+  给出的国家和它不一致就不采用，依次换 ipwho.is、ipapi.co、get.geojs.io、api.ip.sb；都不一致时
+  不改时区，并写明各家说的是哪里。窗口里显示为 `exit … (Cloudflare: US) is in America/Los_Angeles`。
   0.5.4 缓存的查询结果不再沿用，会重新查一次。
+- **显示 `(Cloudflare: TW)` 却以为自己是美国出口**：说明代理把 OpenAI 的流量分流到了台湾节点（常见于
+  把 OpenAI / ChatGPT 单独走"家宽"节点的规则），OpenAI 看到的就是台湾，台北时间是对的；代理软件
+  首页显示的只是默认节点。想用美国时区，要在代理规则里把 OpenAI 分流到美国节点。通过同一个代理
+  打开 `https://chatgpt.com/cdn-cgi/trace`，`loc=` 那一行就是 OpenAI 看到的国家。
 - **关掉窗口就恢复 Windows 时区**：`excel-codex-desktop.cmd` 的窗口不论是点右上角关闭还是按 Ctrl+C，
   都会把时区恢复成第一次修改前的，窗口里会显示 `Windows timezone: put back …`。窗口被强制结束
   （例如任务管理器）时恢复不了，需要手动运行 `excel-codex timezone restore`。
-- 已经被 0.5.4 改成台北时间的：运行一次 `excel-codex timezone restore`，或者打开 0.5.5 的
+- 0.5.4 改过时区、关窗后没有恢复的：运行一次 `excel-codex timezone restore`，或者打开 0.5.5 的
   `excel-codex-desktop.cmd` 再关掉，都会回到原来的时区。
 
 0.5.4 的新功能（和官方链路会话互通、旧对话迁移、指定生图模型、出口时区）见
@@ -49,18 +53,25 @@ curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.5
 
 ## Changes
 
-- **The exit timezone no longer follows a wrong country**: 0.5.4 believed a single IP lookup
-  service, so when it placed a US exit in Taiwan, Windows was set to Taipei time. Now the country
-  Cloudflare (in front of OpenAI) sees the exit in decides: an answer in another country is not
-  used, and ipwho.is, ipapi.co, get.geojs.io and api.ip.sb are tried in turn; when none agrees the
-  timezone is left alone and the window says what each one answered. The window shows
-  `exit … (Cloudflare: US) is in America/Los_Angeles`. A lookup cached by 0.5.4 is not reused.
+- **Cloudflare's country decides the exit timezone**: 0.5.4 believed the first IP lookup service
+  that answered, so a lookup database that placed the exit in the wrong country set the wrong
+  timezone. Now the country Cloudflare (in front of OpenAI) sees the exit in decides: an answer in
+  another country is not used, and ipwho.is, ipapi.co, get.geojs.io and api.ip.sb are tried in
+  turn; when none agrees the timezone is left alone and the window says what each one answered.
+  The window shows `exit … (Cloudflare: US) is in America/Los_Angeles`. A lookup cached by 0.5.4 is
+  not reused.
+- **It says `(Cloudflare: TW)` but you expected a US exit**: your proxy sends OpenAI's traffic
+  through a Taiwan node (common with rules that route OpenAI / ChatGPT through a residential node),
+  so OpenAI sees Taiwan and Taipei time is right; the proxy app's home page only shows the default
+  node. For a US timezone, route OpenAI through a US node in the proxy rules. Opening
+  `https://chatgpt.com/cdn-cgi/trace` through the same proxy shows the country OpenAI sees on its
+  `loc=` line.
 - **Closing the window puts the Windows timezone back**: whether the `excel-codex-desktop.cmd`
   window is closed with its close button or Ctrl+C, the timezone from before the first change is
   put back and the window says `Windows timezone: put back …`. A window that is killed (for example
   from Task Manager) cannot do that; run `excel-codex timezone restore` then.
-- If 0.5.4 already set Taipei time: run `excel-codex timezone restore` once, or open 0.5.5's
-  `excel-codex-desktop.cmd` and close it; either puts back the earlier timezone.
+- If 0.5.4 changed the timezone and it was not put back: run `excel-codex timezone restore` once, or
+  open 0.5.5's `excel-codex-desktop.cmd` and close it; either puts back the earlier timezone.
 
 For what 0.5.4 added (conversations shared with the official sign-in, moving earlier
 conversations, choosing the image model, the exit timezone), see the

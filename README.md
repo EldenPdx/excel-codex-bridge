@@ -283,6 +283,9 @@ Codex 会把本机的时区和日期写进每个对话（`<environment_context>`
   的结果会缓存。
 - `--timezone off`（或环境变量 `EXCEL_BRIDGE_TIMEZONE=off`）关掉以上两项。
 - `excel-codex timezone` 查看出口时区和当前状态；`excel-codex timezone sync --probe` 只查不改。
+- 显示 `(Cloudflare: TW)` 这类和预期不同的国家，说明代理把 OpenAI 的流量分流到了那个国家的节点，
+  OpenAI 看到的就是那里；代理软件首页显示的只是默认节点。通过同一个代理打开
+  `https://chatgpt.com/cdn-cgi/trace`，`loc=` 那一行就是 OpenAI 看到的国家。
 
 ## macOS / WSL（实验性）
 
