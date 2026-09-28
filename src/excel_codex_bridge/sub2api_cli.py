@@ -169,7 +169,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "serve":
-            app = create_app(GatewayKeys.from_env())
+            if os.environ.get("EXCEL_SUB2API_DELEGATE_URL"):
+                from .sub2api_delegate import create_delegate_app
+                app = create_delegate_app(GatewayKeys.from_env())
+            else:
+                app = create_app(GatewayKeys.from_env())
             uvicorn.run(app, host=args.host, port=args.port, proxy_headers=False,
                         access_log=False, log_level="warning", limit_concurrency=32)
         elif args.command == "init-secrets":

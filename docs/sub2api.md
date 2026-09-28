@@ -99,6 +99,27 @@ excel-sub2api push-session --ssh operator@your-vps --sudo --watch 60
 中定义别名。同步命令不会自动打开 Excel，也不会刷新/延长任何 token；需要时用 `codex login`（Codex 那份）
 或 `excel-codex login` / 手动打开 Excel 加载项重新登录。监视模式会在失败时继续重试，但不会打印请求内容。
 
+## 可选：通过 sidecar 使用另一个 SUB2API 分组
+
+如果客户 Key 必须先经过 sidecar，而账号池由现有 SUB2API 分组管理，可启用转发模式。给目标分组创建一把**专用内部 Key**，将它保存为 `packaging/sub2api/secrets/delegate-key`（文件权限 `0600`、属主为容器 UID `10001`）。目标分组不能包含指向这个 sidecar 的账号，否则会形成循环。此模式不使用或同步 Codex/Excel 登录会话。
+
+在 `packaging/sub2api/.env` 中配置 sidecar 可达的 SUB2API 内部入口，例如：
+
+```sh
+EXCEL_SUB2API_DELEGATE_URL=http://caddy:8080/v1
+EXCEL_SUB2API_DELEGATE_HOST=api.example.com
+```
+
+`DELEGATE_HOST` 只在内部反向代理按 Host 分流时需要。随后在 `packaging/sub2api` 目录运行：
+
+```sh
+docker compose -f compose.yaml -f compose.delegate.yaml config --quiet
+docker compose -f compose.yaml -f compose.delegate.yaml up -d --build
+docker exec excel-sub2api excel-sub2api session-status
+```
+
+外层账号继续使用本 sidecar 的 API key、Base URL 和 OpenAI 透传；客户仍使用外层 SUB2API 发的 Key。sidecar 用内部 Key 将 `/v1/models` 和 `/v1/responses` 转到目标分组，目标分组的账号增删即时生效。**同一请求会经过两次 SUB2API 计费**：客户 Key 的持有人承担外层费用，内部 Key 的持有人承担内层费用；分别检查两把 Key 的余额、限额和用量。
+
 ## 接口与限制
 
 | 接口 | 凭证 | 作用 |
@@ -107,6 +128,8 @@ excel-sub2api push-session --ssh operator@your-vps --sudo --watch 60
 | `GET /v1/models`（或 `/models`） | 上游 API key | Excel 模型列表 |
 | `POST /v1/responses`（或 `/responses`） | 上游 API key | 流式/非流式、工具、图片 |
 | `GET/POST/DELETE /admin/session` | 回环 + 管理 key | 状态/导入/清除 |
+
+转发模式下，模型和 Responses 接口从目标 SUB2API 分组取得结果；`GET /admin/session` 只报告转发模式已配置，`POST/DELETE` 返回 409，不接收会话。
 
 不提供 Chat Completions、Anthropic Messages、`/responses/compact`、WebSocket、管理面板。
 请求与解压后体积均限 64 MiB，管理请求限 64 KiB。上游 401/403/429、`Retry-After`

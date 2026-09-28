@@ -1,0 +1,12 @@
+services:
+  excel-sub2api:
+    environment:
+      EXCEL_SUB2API_DELEGATE_URL: ${EXCEL_SUB2API_DELEGATE_URL:?Set the internal SUB2API /v1 URL}
+      EXCEL_SUB2API_DELEGATE_HOST: ${EXCEL_SUB2API_DELEGATE_HOST:-}
+      EXCEL_SUB2API_DELEGATE_KEY_FILE: /run/secrets/delegate-key
+    secrets:
+      - delegate-key
+
+secrets:
+  delegate-key:
+    file: ./secrets/delegate-key
