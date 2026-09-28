@@ -758,10 +758,12 @@ def main() -> int:
     dates = set(re.findall(r"<current_date>([^<]*)</current_date>", sent))
     exit_days = {exit_timezone.today_in(exit_zone, now=when)
                  for when in (started_at, dt.datetime.now(dt.timezone.utc))}
+    # Each bridge started looks the exit up once (--migrate starts a second to carry on);
+    # on Windows desktop's system sync does too.
+    lookups = 1 + bool(args.migrate) + (sys.platform == "win32" and (args.desktop or args.migrate == "desktop"))
     checks += [
-        # The bridge looks the exit up once; on Windows desktop's system sync does too.
-        (0 < len(backend.lookups) <= 2 and set(backend.lookups) == {EXIT_IP},
-         f"expected the exit IP looked up once or twice, got {backend.lookups}"),
+        (0 < len(backend.lookups) <= lookups and set(backend.lookups) == {EXIT_IP},
+         f"expected the exit IP looked up at most {lookups} time(s), got {backend.lookups}"),
         (zones == {exit_zone}, f"Codex's timezone should be the exit's ({exit_zone}), got {zones}"),
         (bool(dates) and dates <= exit_days, f"Codex's date should be the day at the exit {exit_days}, got {dates}"),
         (f"provider: {'openai' if args.shared else 'excel-bridge'}" in output, "Codex used another provider"),
