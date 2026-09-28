@@ -57,7 +57,8 @@ class RouteTests(Folder):
 
     def test_codex_proxy_comes_from_the_environment_first(self):
         clean = {name: "" for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")}
-        with mock.patch.dict(os.environ, {**clean, "ALL_PROXY": "127.0.0.1:1081"}), \
+        # Set after the clean-up: on Windows all_proxy and ALL_PROXY are one variable.
+        with mock.patch.dict(os.environ, clean), mock.patch.dict(os.environ, {"ALL_PROXY": "127.0.0.1:1081"}), \
              mock.patch.object(system_timezone, "_registry_proxy", return_value="http://127.0.0.1:1082"):
             self.assertEqual(system_timezone.codex_proxy(), "http://127.0.0.1:1081")
         with mock.patch.dict(os.environ, clean), \
