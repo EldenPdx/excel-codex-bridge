@@ -57,7 +57,7 @@ class Upstream:
         return answer if isinstance(answer, httpx.Response) else stream(answer)
 
 
-def ask(upstream: Upstream, *, tools: bool = True, wait: str | None = None) -> str:
+def ask(upstream: Upstream, *, tools: bool = True, wait: str | None = None, delays=(0.01,)) -> str:
     reader = StaticReader()
     reader.store.configure(session_headers(None), persist=False, allow_expired=True)
     app = create_app(reader, client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(upstream)))
@@ -69,7 +69,7 @@ def ask(upstream: Upstream, *, tools: bool = True, wait: str | None = None) -> s
             return await client.post("/v1/responses", json=body)
 
     environ = {} if wait is None else {"EXCEL_BRIDGE_RATE_LIMIT_WAIT": wait}
-    with mock.patch.dict(os.environ, environ), mock.patch.object(server, "RATE_LIMIT_DELAYS", (0.01,)):
+    with mock.patch.dict(os.environ, environ), mock.patch.object(server, "RATE_LIMIT_DELAYS", delays):
         response = asyncio.run(go())
     assert response.status_code == 200, response.text
     return response.text
@@ -77,6 +77,11 @@ def ask(upstream: Upstream, *, tools: bool = True, wait: str | None = None) -> s
 
 def event_names(text: str) -> list[str]:
     return [line[len("event: "):] for line in text.replace("\r\n", "\n").split("\n") if line.startswith("event: ")]
+
+
+def events(text: str) -> list[dict]:
+    return [json.loads(line[len("data: "):]) for line in text.replace("\r\n", "\n").split("\n")
+            if line.startswith("data: ") and line != "data: [DONE]"]
 
 
 class WaitingTests(unittest.TestCase):
@@ -95,19 +100,24 @@ class WaitingTests(unittest.TestCase):
                 self.assertEqual(names[-1], "response.completed")
                 self.assertIn("pong", text)
 
-    def test_the_failure_reaches_codex_once_the_wait_is_used_up(self):
+    def test_once_the_wait_is_used_up_codex_is_told_so_and_not_to_try_again(self):
         upstream = Upstream(created() + failed())
         text = ask(upstream, wait="0.05")
-        names = event_names(text)
         self.assertGreater(len(upstream.requests), 2)
-        self.assertEqual(names, ["response.created", "response.failed"])
-        self.assertIn("Please try again in 18ms", text)
+        self.assertEqual(event_names(text), ["response.created", "response.failed"])
+        response = events(text)[-1]["response"]
+        # Codex tries a rate limit again, which the bridge would wait out afresh; not this code.
+        self.assertEqual(response["error"]["code"], "invalid_prompt")
+        self.assertIn("still rate limited after 0.05 seconds", response["error"]["message"])
+        self.assertIn("Please try again in 18ms", response["error"]["message"])
+        self.assertEqual((response["id"], response["status"]), ("resp_limited", "failed"))
 
     def test_no_wait_when_it_is_turned_off(self):
         upstream = Upstream(created() + failed(), text_stream("pong"))
         text = ask(upstream, wait="0")
         self.assertEqual(len(upstream.requests), 1)
         self.assertEqual(event_names(text), ["response.created", "response.failed"])
+        self.assertEqual(events(text)[-1]["response"]["error"]["code"], "rate_limit_exceeded")
 
     def test_other_failures_are_not_sent_again(self):
         upstream = Upstream(created() + failed("server_error", "boom"), text_stream("pong"))
@@ -131,13 +141,32 @@ class WaitingTests(unittest.TestCase):
         self.assertEqual(len(upstream.requests), 2)
         self.assertEqual(event_names(text), ["response.created", "response.failed"])
         self.assertIn("Please try again in 18ms", text)
+        self.assertEqual(events(text)[-1]["response"]["error"]["code"], "rate_limit_exceeded")
 
-    def test_a_failure_before_any_opening_event_takes_the_next_try_s_opening(self):
+    def test_a_failure_before_any_opening_event_opens_the_stream_itself(self):
         upstream = Upstream(failed(), text_stream("pong"))
-        names = event_names(ask(upstream, tools=False))
+        text = ask(upstream, tools=False)
+        names = event_names(text)
         self.assertEqual(len(upstream.requests), 2)
+        self.assertEqual(names[0], "response.created")
         self.assertEqual(names.count("response.created"), 1)
+        opened = events(text)[0]["response"]
+        self.assertEqual((opened["id"], opened["status"]), ("resp_limited", "in_progress"))
+        self.assertNotIn("error", opened)
         self.assertEqual(names[-1], "response.completed")
+
+    def test_codex_hears_the_stream_is_still_going_while_the_bridge_waits(self):
+        for tools in (True, False):
+            with self.subTest(tools=tools):
+                upstream = Upstream(created() + failed(), text_stream("pong"))
+                with mock.patch.object(server, "RATE_LIMIT_KEEPALIVE", 0.02):
+                    text = ask(upstream, tools=tools, delays=(0.1,))
+                names = event_names(text)
+                self.assertEqual(names[0], "response.created")
+                self.assertGreaterEqual(names.count("response.in_progress"), 3)
+                self.assertTrue(all(event["response"]["id"] == "resp_limited" for event in events(text)
+                                    if event.get("type") == "response.in_progress"))
+                self.assertEqual(names[-1], "response.completed")
 
     def test_crlf_streams_are_read_too(self):
         upstream = Upstream(created("\r\n") + failed(newline="\r\n"), text_stream("pong"))
@@ -174,7 +203,7 @@ class ClosingTests(unittest.TestCase):
 class DelayTests(unittest.TestCase):
     def test_delays(self):
         delay = server._rate_limit_delay
-        self.assertEqual(delay(LIMITED, 0, 60.0), 1.0)
+        self.assertEqual(delay(LIMITED, 0, 300.0), 1.0)
         self.assertEqual(delay(LIMITED, 3, 60.0), 8.0)
         self.assertEqual(delay(LIMITED, 20, 60.0), 15.0)
         self.assertEqual(delay("Rate limit reached. Please try again in 7s.", 0, 60.0), 7.0)
@@ -183,8 +212,8 @@ class DelayTests(unittest.TestCase):
         self.assertIsNone(delay(LIMITED, 0, 0.0))
 
     def test_the_wait_setting(self):
-        for value, expected in (("", 60.0), ("abc", 60.0), ("nan", 60.0), ("0", 0.0), ("-5", 0.0),
-                                ("90", 90.0), ("1000", 240.0), ("inf", 240.0)):
+        for value, expected in (("", 300.0), ("abc", 300.0), ("nan", 300.0), ("0", 0.0), ("-5", 0.0),
+                                ("90", 90.0), ("1000", 1000.0), ("5000", 1800.0), ("inf", 1800.0)):
             with self.subTest(value=value), mock.patch.dict(os.environ, {"EXCEL_BRIDGE_RATE_LIMIT_WAIT": value}):
                 self.assertEqual(server.rate_limit_wait(), expected)
 

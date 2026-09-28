@@ -408,16 +408,19 @@ backend fails the request at once with `rate limit exceeded`, saying to try agai
 milliseconds; Codex does, five times within a second, and the turn fails ("Reconnecting 5/5").
 
 So the bridge waits first: when a request is rate limited before any of the answer has come, it
-sends the same request again after 1, 2, 4, 8 and 15 seconds (then every 15 seconds), for up to 60
-seconds per request. Meanwhile Codex just shows it is working, and the bridge window (`bridge.log`
-for the CLI) says `the Excel backend is rate limited … trying again in N s`. Only if it is still
-rate limited after that does Codex get the error; each of Codex's own retries gets another wait, so
-at worst it takes about 6 minutes to fail. You can interrupt in Codex at any time.
+sends the same request again after 1, 2, 4, 8 and 15 seconds (then every 15 seconds), for up to 5
+minutes. Meanwhile Codex just shows it is working (the bridge tells it every 10 seconds that the
+response is still going, so its five-minute idle timeout does not fire), and the bridge window
+(`bridge.log` for the CLI) says `the Excel backend is rate limited … trying again in N s`. If it is
+still rate limited after 5 minutes, Codex shows `The Excel backend is still rate limited after 5
+minutes …` and the turn ends; send the message again later. Codex does not retry that itself, or
+each of its retries would wait another 5 minutes. You can interrupt in Codex at any time.
 
 - A request that fails after its answer has begun is not sent again, so nothing is repeated; other
   errors reach Codex as they came.
-- `EXCEL_BRIDGE_RATE_LIMIT_WAIT=<seconds>` sets how long each request may wait: `0` for no wait, at
-  most `240`.
+- `EXCEL_BRIDGE_RATE_LIMIT_WAIT=<seconds>` sets how long to wait: `300` by default, at most `1800`;
+  `0` for no wait, the error then reaching Codex as it came (it retries five times, quickly, its own
+  way).
 
 ## Pictures
 
@@ -532,7 +535,7 @@ running from source, `git pull` is enough.
 | `EXCEL_BRIDGE_AUTO_MIGRATE` | `0` keeps the bridge from moving its own conversations into the shared list at start, see [The bridge's own conversations](#the-bridges-own-conversations) |
 | `EXCEL_BRIDGE_TIMEZONE` | `auto` (default) / `off`, same as `--timezone`, see [Exit timezone](#exit-timezone) |
 | `EXCEL_BRIDGE_IMAGE_MODEL` | The model Codex's image tool asks the backend for, default `gpt-image-2` (same as `--image-model`), see [Image generation](#image-generation) |
-| `EXCEL_BRIDGE_RATE_LIMIT_WAIT` | Seconds each request may wait out a rate limit before Codex gets the error: `60` by default, `0` for none, at most `240`; see [Rate limits](#rate-limits) |
+| `EXCEL_BRIDGE_RATE_LIMIT_WAIT` | Seconds to wait out a rate limit before Codex gets the error: `300` (5 minutes) by default, `0` for none, at most `1800`; see [Rate limits](#rate-limits) |
 | `CODEX_HOME` | Codex config folder whose `config.toml` `desktop` edits. Default `~/.codex` |
 | `GHCP_EXCEL_WEBVIEW2_DATA_DIR` | Windows WebView2 data root (same as `--webview-dir`) |
 | `GHCP_EXCEL_WEBKIT_WEBSITE_DATA_DIR` | macOS WebKit data folder |

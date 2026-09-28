@@ -81,6 +81,8 @@ jobs:
         run: python tests/e2e/run_e2e.py --migrate desktop -- ./excel-codex.sh
       - name: e2e (excel-codex.sh, the shared rate limit waited out)
         run: python tests/e2e/run_e2e.py --rate-limited -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh, a rate limit longer than Codex waits for a silent stream)
+        run: python tests/e2e/run_e2e.py --rate-limited long -- ./excel-codex.sh
       - name: e2e (excel-codex.sh desktop, the shared rate limit waited out)
         run: python tests/e2e/run_e2e.py --desktop --shared --rate-limited -- ./excel-codex.sh
 
@@ -138,6 +140,8 @@ jobs:
         run: python tests/e2e/run_e2e.py --migrate desktop -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.exe, the shared rate limit waited out)
         run: python tests/e2e/run_e2e.py --rate-limited -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe, a rate limit longer than Codex waits for a silent stream)
+        run: python tests/e2e/run_e2e.py --rate-limited long -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.exe desktop, the shared rate limit waited out)
         run: python tests/e2e/run_e2e.py --desktop --shared --rate-limited -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.cmd)
@@ -214,6 +218,8 @@ jobs:
         run: python tests/e2e/run_e2e.py --desktop --shared -- dist/excel-codex/excel-codex
       - name: e2e (excel-codex desktop, the shared rate limit waited out)
         run: python tests/e2e/run_e2e.py --desktop --shared --rate-limited -- dist/excel-codex/excel-codex
+      - name: e2e (excel-codex, a rate limit longer than Codex waits for a silent stream)
+        run: python tests/e2e/run_e2e.py --rate-limited long -- dist/excel-codex/excel-codex
 
       - name: Package
         run: |

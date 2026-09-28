@@ -174,10 +174,13 @@ def exit_zone_for(now: dt.datetime) -> str:
 
 class FakeExcelBackend:
     def __init__(self, parallel: bool = False, imagegen: bool = False, refuse: str | None = None,
-                 exit_zone: str = "Pacific/Kiritimati", rate_limited: int = 0) -> None:
+                 exit_zone: str = "Pacific/Kiritimati", rate_limited: int = 0,
+                 rate_limited_for: float = 0.0) -> None:
         self.requests: list[dict] = []
-        # Requests failed on the shared tokens-per-minute limit, before any other is answered.
+        # Requests failed on the shared tokens-per-minute limit, before any other is answered:
+        # the first ``rate_limited``, and all in the first ``rate_limited_for`` seconds.
         self.limited: list[dict] = []
+        self.limited_until: float | None = None
         # The proxy exit the bridge finds: this IP, in this timezone.
         self.exit_zone = exit_zone
         self.lookups: list[str] = []
@@ -233,7 +236,9 @@ class FakeExcelBackend:
             if inline_in_user_message(body):
                 self.refused.append(body)
                 return JSONResponse({"detail": "Invalid request body."}, status_code=422)
-            if len(self.limited) < rate_limited:
+            if self.limited_until is None:
+                self.limited_until = time.monotonic() + rate_limited_for
+            if len(self.limited) < rate_limited or time.monotonic() < self.limited_until:
                 self.limited.append(body)
                 limited = [
                     sse("response.created", {"type": "response.created",
@@ -316,6 +321,9 @@ class FakeExcelBackend:
 
 RATE_LIMITED = ("Rate limit reached for gpt-5.6-sol in organization org-e2e on tokens per min (TPM): "
                 "Limit 500000000, Used 499990000, Requested 150000. Please try again in 18ms.")
+# --rate-limited long: limited for longer than Codex, told to, waits for a silent stream.
+LONG_RATE_LIMIT_SECONDS = 40
+CODEX_IDLE_MS = 20000
 
 
 def start_server(app) -> tuple[uvicorn.Server, int]:
@@ -692,9 +700,10 @@ def main() -> int:
                         help="file a conversation the 0.5.3 way, move it into the shared list (by "
                         "`threads migrate`, or by starting `desktop`), then carry it on with the bridge's "
                         "provider gone")
-    parser.add_argument("--rate-limited", action="store_true",
-                        help="fail the first two requests on the shared tokens-per-minute limit; "
-                        "the bridge waits them out")
+    parser.add_argument("--rate-limited", nargs="?", const="briefly", choices=("briefly", "long"),
+                        help="fail the first two requests on the shared tokens-per-minute limit, or (long) "
+                        f"all in the first {LONG_RATE_LIMIT_SECONDS} s with Codex dropping a stream silent for "
+                        f"{CODEX_IDLE_MS // 1000} s; the bridge waits them out")
     parser.add_argument("--first-launcher",
                         help="with --migrate: the command that starts that conversation, e.g. a 0.5.3 checkout's")
     parser.add_argument("--timeout", type=int, default=900, help="seconds for each long step")
@@ -703,6 +712,8 @@ def main() -> int:
     launcher = args.launcher[1:] if args.launcher[:1] == ["--"] else args.launcher
     if not launcher:
         parser.error("give the launcher command after --")
+    if args.rate_limited == "long" and (args.shared or args.migrate):
+        parser.error("--rate-limited long sets the idle timeout of the bridge's own provider")
     if Path(launcher[0]).exists():
         launcher[0] = str(Path(launcher[0]).resolve())
 
@@ -718,7 +729,8 @@ def main() -> int:
     exit_zone = exit_zone_for(started_at)
     backend = FakeExcelBackend(parallel=args.parallel, imagegen=args.imagegen,
                                refuse="e2e-codex-account" if args.codex_login == "refused" else None,
-                               exit_zone=exit_zone, rate_limited=2 if args.rate_limited else 0)
+                               exit_zone=exit_zone, rate_limited=2 if args.rate_limited == "briefly" else 0,
+                               rate_limited_for=LONG_RATE_LIMIT_SECONDS if args.rate_limited == "long" else 0)
     server, port = start_server(backend.app)
 
     env = dict(os.environ)
@@ -736,6 +748,8 @@ def main() -> int:
     if args.shared and not args.migrate:
         sign_codex_in(Path(env["CODEX_HOME"]))
     args.codex_args = list(CODEX_ARGS)
+    if args.rate_limited == "long":
+        args.codex_args[-1:-1] = ["-c", f"model_providers.excel-bridge.stream_idle_timeout_ms={CODEX_IDLE_MS}"]
     args.backend, args.first_requests = backend, 0
     picture = png()
     if args.images:
@@ -843,13 +857,16 @@ def main() -> int:
         bridge_log = root / "bridge-home" / "bridge.log"
         waited = bridge_log.read_text(encoding="utf-8", errors="replace") if bridge_log.exists() else ""
         waited += _desktop_log(root)
+        expected = 2 if args.rate_limited == "briefly" else 5
         checks += [
-            (len(backend.limited) == 2, f"expected two rate-limited requests, got {len(backend.limited)}"),
-            (bool(backend.limited) and backend.limited[0] == backend.requests[0],
+            (len(backend.limited) >= expected if args.rate_limited == "long" else len(backend.limited) == expected,
+             f"expected {expected} rate-limited requests, got {len(backend.limited)}"),
+            (bool(backend.limited) and bool(backend.requests) and backend.limited[0] == backend.requests[0],
              "the bridge did not send the rate-limited request again as it was"),
-            (waited.count("the Excel backend is rate limited") == 2, "the bridge did not say it was waiting"),
-            ("rate limit" not in output.lower() and "reconnecting" not in output.lower(),
-             "Codex saw the rate limit"),
+            (waited.count("the Excel backend is rate limited") == len(backend.limited),
+             "the bridge did not say it was waiting"),
+            (not any(said in output.lower() for said in ("rate limit", "reconnecting", "disconnected")),
+             "Codex saw the rate limit, or gave up on the stream"),
         ]
     failures = [message for ok, message in checks if not ok]
 
