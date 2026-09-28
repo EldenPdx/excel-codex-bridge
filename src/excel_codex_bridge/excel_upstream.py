@@ -30,17 +30,47 @@ from uuid import NAMESPACE_URL, uuid4, uuid5
 from . import item_ids as responses_replay_ids
 
 
-EXCEL_MODEL_UPSTREAMS = {
+_BASE_MODEL_UPSTREAMS = {
     "gpt-5.6-luna-excel": "gpt-5.6-luna",
     "gpt-5.6-terra-excel": "gpt-5.6-terra",
     "gpt-5.6-sol-excel": "gpt-5.6-sol",
     "gpt-6-sol-excel": "gpt-6-sol",
     "gpt-6-luna-excel": "gpt-6-luna",
-    # excel-codex-bridge: not yet confirmed on the Excel backend.
     "gpt-6-astra-excel": "gpt-6-astra",
+}
+LONG_CONTEXT_SUFFIX = "-1m-excel"
+# Every model is served twice: a 272k alias, and a ``-1m`` alias of the same
+# upstream that runs at the longest input the Excel backend accepts.
+EXCEL_MODEL_UPSTREAMS = {
+    **_BASE_MODEL_UPSTREAMS,
+    **{
+        alias.removesuffix("-excel") + LONG_CONTEXT_SUFFIX: upstream
+        for alias, upstream in _BASE_MODEL_UPSTREAMS.items()
+    },
 }
 MODEL_IDS = tuple(EXCEL_MODEL_UPSTREAMS)
 MODEL_ID = "gpt-5.6-sol-excel"
+DEFAULT_CONTEXT_WINDOW = 272_000
+# Measured on the real backend for gpt-5.6-sol, gpt-6-sol, gpt-6-luna and
+# gpt-6-astra alike: 918,843 input tokens accepted, ~921,375 refused with
+# context_length_exceeded. Rounded down.
+LONG_CONTEXT_WINDOW = 918_000
+
+
+def context_window_for(model_id: str) -> int:
+    return LONG_CONTEXT_WINDOW if model_id.endswith(LONG_CONTEXT_SUFFIX) else DEFAULT_CONTEXT_WINDOW
+
+
+def _compaction_limits(context_window: int) -> tuple[int, int]:
+    """(Codex auto-compact limit, backend compact_threshold) for a window.
+
+    Codex compacts first; the backend threshold is the fallback for a turn
+    that outgrows it, and stays under the window so the backend compacts
+    instead of refusing.
+    """
+    if context_window <= DEFAULT_CONTEXT_WINDOW:
+        return 180_000, 200_000
+    return context_window * 90 // 100 // 1000 * 1000, context_window * 95 // 100 // 1000 * 1000
 _UPSTREAM_MODEL_OVERRIDE = os.environ.get("GHCP_EXCEL_UPSTREAM_MODEL", "").strip()
 UPSTREAM_MODEL = _UPSTREAM_MODEL_OVERRIDE or EXCEL_MODEL_UPSTREAMS[MODEL_ID]
 EXCEL_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
@@ -157,20 +187,30 @@ _DEFAULT_CLIENT_HEADERS = {
     "x-stainless-runtime": "browser:chrome",
 }
 
+_DISPLAY_NAMES = {
+    "gpt-5.6-luna-excel": "5.6-Luna Excel",
+    "gpt-5.6-terra-excel": "5.6-Terra Excel",
+    "gpt-5.6-sol-excel": "5.6-Sol Excel",
+    "gpt-6-sol-excel": "6-Sol Excel",
+    "gpt-6-luna-excel": "6-Luna Excel",
+    "gpt-6-astra-excel": "6-Astra Excel",
+}
+
+
+def _display_name(model_id: str) -> str:
+    base = model_id.replace(LONG_CONTEXT_SUFFIX, "-excel")
+    name = _DISPLAY_NAMES.get(base, base.removesuffix("-excel").upper().replace("GPT-", "GPT "))
+    return f"{name} 1M" if model_id.endswith(LONG_CONTEXT_SUFFIX) else name
+
+
 LOCAL_MODEL_CAPABILITIES = {
     model_id: {
-        "auto_compact_token_limit": 180_000,
-        "context_window": 200_000 if "luna" in model_id else 272_000,
-        "display_name": {
-            "gpt-5.6-luna-excel": "5.6-Luna Excel",
-            "gpt-5.6-terra-excel": "5.6-Terra Excel",
-            "gpt-5.6-sol-excel": "5.6-Sol Excel",
-            "gpt-6-sol-excel": "6-Sol Excel",
-            "gpt-6-luna-excel": "6-Luna Excel",
-            "gpt-6-astra-excel": "6-Astra Excel",
-        }.get(model_id, model_id.removesuffix("-excel").upper().replace("GPT-", "GPT ")),
+        "auto_compact_token_limit": _compaction_limits(context_window_for(model_id))[0],
+        "compact_threshold": _compaction_limits(context_window_for(model_id))[1],
+        "context_window": context_window_for(model_id),
+        "display_name": _display_name(model_id),
         "input_modalities": ["text", "image"],
-        "max_context_window": 200_000 if "luna" in model_id else 272_000,
+        "max_context_window": context_window_for(model_id),
         "messages_endpoint_supported": False,
         "model_picker_enabled": True,
         "parallel_tool_calls": True,
@@ -192,6 +232,11 @@ def excel_model_id(model: object) -> str | None:
         return None
     normalized = model.strip().lower()
     return normalized if normalized in EXCEL_MODEL_UPSTREAMS else None
+
+
+def _default_compact_threshold(model: object) -> int:
+    model_id = excel_model_id(model) or MODEL_ID
+    return int(LOCAL_MODEL_CAPABILITIES[model_id]["compact_threshold"])
 
 
 def upstream_model_for(model: object) -> str:
@@ -1759,7 +1804,7 @@ def prepare_responses_body(
     output["context_management"] = (
         context_management
         if isinstance(context_management, list)
-        else [{"type": "compaction", "compact_threshold": 200_000}]
+        else [{"type": "compaction", "compact_threshold": _default_compact_threshold(source.get("model"))}]
     )
 
     metadata: dict[str, str] = {}

@@ -37,14 +37,23 @@ class CatalogTests(unittest.TestCase):
             efforts = [level["effort"] for level in model["supported_reasoning_levels"]]
             self.assertEqual(efforts, ["low", "medium", "high", "xhigh"])
         windows = {m["slug"]: m["context_window"] for m in models}
-        self.assertEqual(windows["gpt-5.6-luna-excel"], 200_000)
-        self.assertEqual(windows["gpt-6-luna-excel"], 200_000)
-        self.assertEqual(windows["gpt-6-sol-excel"], 272_000)
+        self.assertEqual(len(windows), 12)
+        for base in ("5.6-sol", "5.6-terra", "5.6-luna", "6-sol", "6-luna", "6-astra"):
+            with self.subTest(base=base):
+                self.assertEqual(windows[f"gpt-{base}-excel"], 272_000)
+                self.assertEqual(windows[f"gpt-{base}-1m-excel"], 918_000)
         self.assertEqual(
-            {m["slug"]: m["display_name"] for m in models if m["slug"] in {"gpt-6-sol-excel", "gpt-6-luna-excel"}},
-            {"gpt-6-sol-excel": "6-Sol Excel", "gpt-6-luna-excel": "6-Luna Excel"},
+            {m["slug"]: m["display_name"] for m in models if m["slug"].startswith("gpt-6-sol")},
+            {"gpt-6-sol-excel": "6-Sol Excel", "gpt-6-sol-1m-excel": "6-Sol Excel 1M"},
         )
         self.assertFalse(any("experimental" in m["description"] for m in models))
+
+    def test_long_context_aliases_compact_near_their_window(self):
+        models = {m["slug"]: m for m in codex_config.catalog_payload()["models"]}
+        self.assertEqual(models["gpt-6-sol-excel"]["auto_compact_token_limit"], 180_000)
+        self.assertEqual(models["gpt-6-sol-1m-excel"]["auto_compact_token_limit"], 826_000)
+        self.assertEqual(models["gpt-6-sol-1m-excel"]["max_context_window"], 918_000)
+        self.assertIn("918,000 token context", models["gpt-6-sol-1m-excel"]["description"])
 
     def test_catalog_order_covers_every_served_model(self):
         self.assertEqual(sorted(codex_config.CATALOG_ORDER), sorted(excel_upstream.MODEL_IDS))

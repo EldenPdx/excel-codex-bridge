@@ -150,14 +150,24 @@ Launcher options: `--login <auto|codex|excel>`, `--model`, `--proxy`, `--port`, 
 
 ## Models
 
-| Choose in Codex | Upstream model | Context |
+Every model comes in two versions: the same upstream model with a different context length.
+
+| 272k version | 1M version | Upstream model |
 | --- | --- | --- |
-| `gpt-5.6-sol-excel` (default) | `gpt-5.6-sol` | 272k |
-| `gpt-5.6-terra-excel` | `gpt-5.6-terra` | 272k |
-| `gpt-5.6-luna-excel` | `gpt-5.6-luna` | 200k |
-| `gpt-6-sol-excel` | `gpt-6-sol` | treated as 272k |
-| `gpt-6-luna-excel` | `gpt-6-luna` | treated as 200k |
-| `gpt-6-astra-excel` | `gpt-6-astra` | treated as 272k |
+| `gpt-5.6-sol-excel` (default) | `gpt-5.6-sol-1m-excel` | `gpt-5.6-sol` |
+| `gpt-5.6-terra-excel` | `gpt-5.6-terra-1m-excel` | `gpt-5.6-terra` |
+| `gpt-5.6-luna-excel` | `gpt-5.6-luna-1m-excel` | `gpt-5.6-luna` |
+| `gpt-6-sol-excel` | `gpt-6-sol-1m-excel` | `gpt-6-sol` |
+| `gpt-6-luna-excel` | `gpt-6-luna-1m-excel` | `gpt-6-luna` |
+| `gpt-6-astra-excel` | `gpt-6-astra-1m-excel` | `gpt-6-astra` |
+
+- **272k version**: 272k context; Codex compacts automatically at 180k.
+- **1M version**: 918k context; Codex compacts automatically at about 826k. 918k is the limit measured
+  on the real backend: it accepts up to about 918k input tokens per request and answers
+  `context_length_exceeded` beyond that. gpt-5.6-sol, gpt-6-sol, gpt-6-luna and gpt-6-astra measured
+  the same; gpt-5.6-terra and gpt-5.6-luna use the same limit.
+- Each turn of a long conversation sends more context and uses more of your plan, so pick the 272k
+  version when you don't need the length.
 
 Reasoning effort `low` / `medium` / `high` / `xhigh`, default `medium`.
 

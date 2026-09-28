@@ -145,6 +145,12 @@ class ExcelUpstreamTests(unittest.TestCase):
             "gpt-5.6-sol-excel": "gpt-5.6-sol",
             "gpt-6-sol-excel": "gpt-6-sol",
             "gpt-6-luna-excel": "gpt-6-luna",
+            "gpt-6-sol-1m-excel": "gpt-6-sol",
+            "gpt-6-luna-1m-excel": "gpt-6-luna",
+            "gpt-6-astra-1m-excel": "gpt-6-astra",
+            "gpt-5.6-sol-1m-excel": "gpt-5.6-sol",
+            "gpt-5.6-terra-1m-excel": "gpt-5.6-terra",
+            "gpt-5.6-luna-1m-excel": "gpt-5.6-luna",
         }
         for requested, upstream in expected.items():
             with self.subTest(requested=requested):
@@ -155,6 +161,24 @@ class ExcelUpstreamTests(unittest.TestCase):
                 self.assertEqual(body["model_selection"], "explicit")
                 self.assertTrue(excel_upstream.is_excel_model(requested))
         self.assertFalse(excel_upstream.is_excel_model("gpt-excel"))
+
+    def test_default_backend_compaction_follows_the_alias_window(self):
+        for requested, threshold in (
+            ("gpt-6-sol-excel", 200_000),
+            ("gpt-5.6-luna-excel", 200_000),
+            ("gpt-6-sol-1m-excel", 872_000),
+            ("gpt-5.6-luna-1m-excel", 872_000),
+        ):
+            with self.subTest(requested=requested):
+                body = excel_upstream.prepare_responses_body({"model": requested, "input": "Hello"})
+                self.assertEqual(
+                    body["context_management"], [{"type": "compaction", "compact_threshold": threshold}]
+                )
+        explicit = [{"type": "compaction", "compact_threshold": 50_000}]
+        body = excel_upstream.prepare_responses_body(
+            {"model": "gpt-6-sol-1m-excel", "input": "Hello", "context_management": explicit}
+        )
+        self.assertEqual(body["context_management"], explicit)
 
     def test_task_identity_is_stable_for_a_conversation(self):
         source = {
@@ -1662,6 +1686,12 @@ class ExcelUpstreamTests(unittest.TestCase):
                 "gpt-6-sol-excel",
                 "gpt-6-luna-excel",
                 "gpt-6-astra-excel",
+                "gpt-5.6-luna-1m-excel",
+                "gpt-5.6-terra-1m-excel",
+                "gpt-5.6-sol-1m-excel",
+                "gpt-6-sol-1m-excel",
+                "gpt-6-luna-1m-excel",
+                "gpt-6-astra-1m-excel",
             ],
         )
 

@@ -61,6 +61,7 @@ import uvicorn  # noqa: E402
 from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 
+from excel_codex_bridge import excel_upstream  # noqa: E402
 from helpers import write_codex_login, write_webview_session  # noqa: E402
 
 USER_PYTHONPATH = "e2e-user-pythonpath"
@@ -409,7 +410,7 @@ def main() -> int:
         output, checks = run_launcher(launcher, args, webview, project, env)
     server.should_exit = True
 
-    upstream_model = args.model.removesuffix("-excel")
+    upstream_model = excel_upstream.EXCEL_MODEL_UPSTREAMS[args.model]
     checks += [
         ("provider: excel-bridge" in output, "Codex did not use the excel-bridge provider"),
         ("done: tool output seen" in output, "the tool output did not reach the model"),

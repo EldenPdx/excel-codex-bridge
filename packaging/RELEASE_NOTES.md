@@ -1,31 +1,34 @@
-新增 GPT-6 Sol / GPT-6 Luna 两个模型 · Adds the GPT-6 Sol and GPT-6 Luna models
+每个模型新增 1M 长上下文版 · Every model gets a 1M long-context version
 
 > **非官方项目**，与 OpenAI、Microsoft 无关联。使用加载项后端可能违反 OpenAI 服务条款，风险自负。
 > **Unofficial.** Not affiliated with OpenAI or Microsoft. Using the add-in's backend may violate OpenAI's terms; use at your own risk.
 
 ## 变化
 
-- **新增两个模型**：`gpt-6-sol-excel`（上游 `gpt-6-sol`）和 `gpt-6-luna-excel`（上游 `gpt-6-luna`）。
-  Codex 模型列表、桌面版、`--model` 和 SUB2API 的模型列表里都能直接选。
-- 上下文窗口按同名前代处理：GPT-6 Sol 按 272k、GPT-6 Luna 按 200k，自动压缩阈值随之设定。
-- 默认模型不变，仍是 `gpt-5.6-sol-excel`；已有模型和设置不受影响。
-- 顺带确认 Codex 的上下文压缩经本桥工作正常：命令行/桌面版用的本地压缩、以 OpenAI 方式接入（如经
-  SUB2API）时用的远端压缩，压缩请求都已在真实后端验证过，压缩后仍记得之前的内容；自动触发时机用模拟后端验证。
+- **每个模型都有两个版本**：原来的名字是 272k 版，另加一个 `-1m` 的 1M 版，例如 `gpt-6-sol-excel` 和
+  `gpt-6-sol-1m-excel`，两者用的是同一个上游模型。Codex 模型列表、桌面版、`--model` 和 SUB2API 的模型列表里都能选，
+  桌面版里显示为「6-Sol Excel 1M」这样的名字。
+- **1M 版的上下文是 918k**：这是真实后端的实测上限，一次最多接受约 918k 输入 token，再多就返回
+  `context_length_exceeded`。gpt-5.6-sol、gpt-6-sol、gpt-6-luna、gpt-6-astra 实测结果相同，gpt-5.6-terra 和
+  gpt-5.6-luna 按同一上限设置。Codex 在约 826k 时自动压缩，后端兜底压缩阈值设在约 872k。
+- **272k 版**：所有模型统一按 272k，Codex 仍在 180k 时自动压缩。gpt-5.6-luna 和 gpt-6-luna 从原来的 200k 改为 272k。
+- 长对话每轮发出去的上下文更多，额度消耗也相应更多，用不到这么长时选 272k 版即可。
+- 默认模型不变，仍是 `gpt-5.6-sol-excel`；已有配置里的模型名照常可用。
 
 ## 下载
 
-- **Windows**：`excel-codex-bridge-0.5.2-windows-x64.zip`。解压后双击 `excel-codex.exe` 打开 Codex CLI，
+- **Windows**：`excel-codex-bridge-0.5.3-windows-x64.zip`。解压后双击 `excel-codex.exe` 打开 Codex CLI，
   双击 `excel-codex-desktop.cmd` 给桌面版用。
-- **macOS（Apple 芯片）**：`excel-codex-bridge-0.5.2-macos-arm64.tar.gz`
-- **macOS（Intel）**：`excel-codex-bridge-0.5.2-macos-x64.tar.gz`
+- **macOS（Apple 芯片）**：`excel-codex-bridge-0.5.3-macos-arm64.tar.gz`
+- **macOS（Intel）**：`excel-codex-bridge-0.5.3-macos-x64.tar.gz`
 - **Linux / WSL 或从源码运行**：下载 Source code，使用 `excel-codex.sh`（需要 Python 3.10+）。
-- **Linux / VPS 的 SUB2API 部署**：下载本版本 Source code，按 [部署文档](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.2/docs/sub2api.md) 构建 `packaging/sub2api/compose.yaml`。
+- **Linux / VPS 的 SUB2API 部署**：下载本版本 Source code，按 [部署文档](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.3/docs/sub2api.md) 构建 `packaging/sub2api/compose.yaml`。
 
 macOS 推荐在终端用 `curl` 下载，这样不会被"无法验证开发者"拦下（Intel 芯片把 `arm64` 换成 `x64`）：
 
 ```
-curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.2/excel-codex-bridge-0.5.2-macos-arm64.tar.gz | tar xz
-./excel-codex-bridge-0.5.2-macos-arm64/excel-codex status
+curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.3/excel-codex-bridge-0.5.3-macos-arm64.tar.gz | tar xz
+./excel-codex-bridge-0.5.3-macos-arm64/excel-codex status
 ```
 
 用浏览器下载的，解压后先运行一次 `xattr -dr com.apple.quarantine <解压出的目录>`。
@@ -42,31 +45,36 @@ curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.2
 
 ## Changes
 
-- **Two new models**: `gpt-6-sol-excel` (upstream `gpt-6-sol`) and `gpt-6-luna-excel` (upstream
-  `gpt-6-luna`), selectable in Codex's model list, the desktop app, `--model` and the SUB2API model list.
-- Context windows follow their namesakes: GPT-6 Sol is treated as 272k and GPT-6 Luna as 200k, with the
-  auto-compaction threshold set to match.
-- The default model is still `gpt-5.6-sol-excel`; existing models and settings are unchanged.
-- Also confirmed: Codex's context compaction works through the bridge. The local compaction used by the
-  CLI and desktop app, and the remote compaction used when connecting the OpenAI way (e.g. via SUB2API),
-  were both verified against the real backend, with earlier context kept; the auto-trigger timing was
-  checked against a simulated backend.
+- **Every model now comes in two versions**: the existing name is the 272k version, plus a `-1m`
+  1M version, e.g. `gpt-6-sol-excel` and `gpt-6-sol-1m-excel`, both using the same upstream model.
+  Both are selectable in Codex's model list, the desktop app, `--model` and the SUB2API model list;
+  the desktop app shows names like "6-Sol Excel 1M".
+- **The 1M versions have a 918k context**: the limit measured on the real backend, which accepts
+  up to about 918k input tokens per request and answers `context_length_exceeded` beyond that.
+  gpt-5.6-sol, gpt-6-sol, gpt-6-luna and gpt-6-astra measured the same; gpt-5.6-terra and gpt-5.6-luna
+  use the same limit. Codex compacts automatically at about 826k, and the backend's fallback
+  compaction threshold is about 872k.
+- **272k versions**: every model is now 272k, and Codex still compacts at 180k. gpt-5.6-luna and
+  gpt-6-luna move from 200k to 272k.
+- Each turn of a long conversation sends more context and uses more of your plan, so pick the 272k
+  version when you don't need the length.
+- The default model is still `gpt-5.6-sol-excel`; model names in existing configs keep working.
 
 ## Download
 
-- **Windows**: `excel-codex-bridge-0.5.2-windows-x64.zip`. Double-click `excel-codex.exe` for the
+- **Windows**: `excel-codex-bridge-0.5.3-windows-x64.zip`. Double-click `excel-codex.exe` for the
   Codex CLI, or `excel-codex-desktop.cmd` for the desktop app.
-- **macOS (Apple silicon)**: `excel-codex-bridge-0.5.2-macos-arm64.tar.gz`
-- **macOS (Intel)**: `excel-codex-bridge-0.5.2-macos-x64.tar.gz`
+- **macOS (Apple silicon)**: `excel-codex-bridge-0.5.3-macos-arm64.tar.gz`
+- **macOS (Intel)**: `excel-codex-bridge-0.5.3-macos-x64.tar.gz`
 - **Linux / WSL, or from source**: download the source code and use `excel-codex.sh` (Python 3.10+).
-- **Linux / VPS with SUB2API**: download this release's source and follow the [deployment guide](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.2/docs/sub2api.en.md).
+- **Linux / VPS with SUB2API**: download this release's source and follow the [deployment guide](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.3/docs/sub2api.en.md).
 
 On a Mac, downloading with `curl` avoids the "developer cannot be verified" block (Intel: replace
 `arm64` with `x64`):
 
 ```
-curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.2/excel-codex-bridge-0.5.2-macos-arm64.tar.gz | tar xz
-./excel-codex-bridge-0.5.2-macos-arm64/excel-codex status
+curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.3/excel-codex-bridge-0.5.3-macos-arm64.tar.gz | tar xz
+./excel-codex-bridge-0.5.3-macos-arm64/excel-codex status
 ```
 
 If you downloaded with a browser, run `xattr -dr com.apple.quarantine <extracted folder>` once.

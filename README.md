@@ -128,14 +128,22 @@ excel-codex desktop                           让 Codex 桌面版 / IDE 插件�
 
 ## 模型
 
-| Codex 里选择 | 上游模型 | 上下文 |
+每个模型都有两个版本，上游是同一个模型，只是上下文长度不同：
+
+| 272k 版 | 1M 版 | 上游模型 |
 | --- | --- | --- |
-| `gpt-5.6-sol-excel`（默认） | `gpt-5.6-sol` | 272k |
-| `gpt-5.6-terra-excel` | `gpt-5.6-terra` | 272k |
-| `gpt-5.6-luna-excel` | `gpt-5.6-luna` | 200k |
-| `gpt-6-sol-excel` | `gpt-6-sol` | 按 272k 处理 |
-| `gpt-6-luna-excel` | `gpt-6-luna` | 按 200k 处理 |
-| `gpt-6-astra-excel` | `gpt-6-astra` | 按 272k 处理 |
+| `gpt-5.6-sol-excel`（默认） | `gpt-5.6-sol-1m-excel` | `gpt-5.6-sol` |
+| `gpt-5.6-terra-excel` | `gpt-5.6-terra-1m-excel` | `gpt-5.6-terra` |
+| `gpt-5.6-luna-excel` | `gpt-5.6-luna-1m-excel` | `gpt-5.6-luna` |
+| `gpt-6-sol-excel` | `gpt-6-sol-1m-excel` | `gpt-6-sol` |
+| `gpt-6-luna-excel` | `gpt-6-luna-1m-excel` | `gpt-6-luna` |
+| `gpt-6-astra-excel` | `gpt-6-astra-1m-excel` | `gpt-6-astra` |
+
+- **272k 版**：上下文 272k，Codex 在 180k 时自动压缩。
+- **1M 版**：上下文 918k，Codex 在约 826k 时自动压缩。918k 是真实后端的实测上限：一次最多接受约 918k
+  输入 token，再多就返回 `context_length_exceeded`。gpt-5.6-sol、gpt-6-sol、gpt-6-luna、gpt-6-astra
+  实测结果相同，gpt-5.6-terra 和 gpt-5.6-luna 按同一上限设置。
+- 长对话每轮发出去的上下文更多，额度消耗也相应更多，用不到这么长时选 272k 版即可。
 
 推理强度 `low` / `medium` / `high` / `xhigh`，默认 `medium`。
 

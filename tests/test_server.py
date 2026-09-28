@@ -196,6 +196,8 @@ class ResponsesRouteTests(unittest.TestCase):
         for model, upstream in (
             ("gpt-6-sol-excel", "gpt-6-sol"), ("gpt-6-sol", "gpt-6-sol"),
             ("gpt-6-luna-excel", "gpt-6-luna"), ("gpt-6-luna", "gpt-6-luna"),
+            ("gpt-6-sol-1m-excel", "gpt-6-sol"), ("gpt-6-sol-1m", "gpt-6-sol"),
+            ("gpt-5.6-luna-1m-excel", "gpt-5.6-luna"), ("gpt-5.6-luna-1m", "gpt-5.6-luna"),
         ):
             with self.subTest(model=model):
                 response = harness.request(

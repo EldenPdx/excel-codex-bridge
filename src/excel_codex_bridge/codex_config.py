@@ -39,8 +39,12 @@ You are Codex, a coding agent running in the user's terminal. You and the user s
 """
 
 CATALOG_ORDER = (
-    "gpt-5.6-sol-excel", "gpt-6-sol-excel", "gpt-6-astra-excel", "gpt-6-luna-excel",
-    "gpt-5.6-terra-excel", "gpt-5.6-luna-excel",
+    "gpt-5.6-sol-excel", "gpt-5.6-sol-1m-excel",
+    "gpt-6-sol-excel", "gpt-6-sol-1m-excel",
+    "gpt-6-astra-excel", "gpt-6-astra-1m-excel",
+    "gpt-6-luna-excel", "gpt-6-luna-1m-excel",
+    "gpt-5.6-terra-excel", "gpt-5.6-terra-1m-excel",
+    "gpt-5.6-luna-excel", "gpt-5.6-luna-1m-excel",
 )
 
 _REASONING_LEVEL_DESCRIPTIONS = {
