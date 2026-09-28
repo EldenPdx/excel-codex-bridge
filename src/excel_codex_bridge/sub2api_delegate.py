@@ -1,4 +1,4 @@
-"""Optional sidecar mode that forwards Responses to a separate SUB2API group."""
+"""Forward Responses to a SUB2API group without the Excel/bps adaptations."""
 
 from __future__ import annotations
 

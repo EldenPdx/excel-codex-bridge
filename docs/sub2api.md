@@ -118,7 +118,7 @@ docker compose -f compose.yaml -f compose.delegate.yaml up -d --build
 docker exec excel-sub2api excel-sub2api session-status
 ```
 
-外层账号继续使用本 sidecar 的 API key、Base URL 和 OpenAI 透传；客户仍使用外层 SUB2API 发的 Key。sidecar 用内部 Key 将 `/v1/models` 和 `/v1/responses` 转到目标分组，目标分组的账号增删即时生效。**同一请求会经过两次 SUB2API 计费**：客户 Key 的持有人承担外层费用，内部 Key 的持有人承担内层费用；分别检查两把 Key 的余额、限额和用量。
+外层账号继续使用本 sidecar 的 API key、Base URL 和 OpenAI 透传；客户仍使用外层 SUB2API 发的 Key。sidecar 用内部 Key 将 `/v1/models` 和 `/v1/responses` 转到目标分组，目标分组的账号增删即时生效。此模式执行鉴权、请求校验和流式转发，**不运行原 Excel/bps 的工具调用改写或图片上传适配**；工具、图片等能力取决于目标分组的原生 Responses 实现。**同一请求会经过两次 SUB2API 计费**：客户 Key 的持有人承担外层费用，内部 Key 的持有人承担内层费用；分别检查两把 Key 的余额、限额和用量。
 
 ## 接口与限制
 
