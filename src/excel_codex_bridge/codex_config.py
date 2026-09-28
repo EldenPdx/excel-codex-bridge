@@ -70,6 +70,16 @@ def codex_model(model: str) -> str:
     return excel_upstream.EXCEL_MODEL_UPSTREAMS[alias]
 
 
+def official_model(model: str) -> str:
+    """The model OpenAI serves in place of ``model``, for ``-1m`` aliases too.
+
+    ``gpt-6-sol-1m-excel`` becomes ``gpt-6-sol``: what a conversation moved
+    off the bridge's own provider carries on with once the bridge is off.
+    """
+    alias = excel_upstream.excel_model_id(model)
+    return excel_upstream.EXCEL_MODEL_UPSTREAMS[alias] if alias else model
+
+
 DEFAULT_MODEL = codex_model(excel_upstream.MODEL_ID)
 
 _REASONING_LEVEL_DESCRIPTIONS = {

@@ -258,6 +258,15 @@ tray; after closing the window it may still run in the background) and reopen it
 shows a line like `"POST /v1/responses HTTP/1.1" 200` in the bridge window (0.4.2 and later); if
 nothing shows up, the request still bypasses the bridge.
 
+**After the bridge is closed, a conversation fails with `stream disconnected before completion:
+… (os error 10061)` (connection refused) and "Reconnecting x/5"**: the bridge window was closed
+but Codex kept running. A conversation opened while the bridge was on keeps the bridge's local
+address (`127.0.0.1:<port>`), where nothing listens any more. Closing the desktop app's window is not
+enough: on Windows it keeps running in the tray. Quit it from its tray icon (`Cmd+Q` on macOS),
+reload IDE windows that use Codex, then open Codex again and it uses the official sign-in. The bridge
+window says so when it closes; closed with Ctrl+C while it still sees a Codex process, it adds
+`Codex is still running right now`.
+
 Fully manual alternative: run `excel-codex serve` and add the output of `excel-codex print-config`
 to `config.toml`; remove those lines to go back.
 
@@ -305,18 +314,25 @@ cannot open them: "Model provider `excel-bridge` not found". When Codex is signe
   conversation files. So **start the bridge first, then the desktop app**; or quit Codex and run
   `excel-codex threads migrate`.
 - Moved conversations are filed under `openai`, with OpenAI's model names (`gpt-6-sol-excel` →
-  `gpt-6-sol`; the 1M versions stay as they are). They open and carry on with the bridge off, and
-  renaming or archiving them no longer moves them back.
+  `gpt-6-sol`). OpenAI has no 1M versions, so a 1M conversation carries on with the same model's
+  official version (`gpt-6-sol-1m-excel` → `gpt-6-sol`, 272k); pick a 1M model again in the model
+  menu to use one with the bridge on. They open and carry on with the bridge off (through the
+  official sign-in or a relay), and renaming or archiving them no longer moves them back.
 
 What changes:
 
 - Codex's conversation index (the threads table in `~/.codex/state_<n>.sqlite`). It is copied first,
   to `state_<n>.sqlite.before-excel-codex-<time>` in the same folder.
-- The provider on the first line of each of those conversation files (under `~/.codex/sessions`).
-  Codex rebuilds the index from that line, so a change to the index alone is put back to
-  `excel-bridge`; that is all `threads migrate` did in 0.5.4 and 0.5.5, and conversations it moved
-  are finished now. Only that one field changes: the rest of the file, the conversation itself and
-  the file's modification time stay as they are.
+- Where each of those conversation files (under `~/.codex/sessions`) says what Codex rebuilds the
+  index from: the provider on the first line, and the model and provider on the later
+  `turn_context` and `thread_settings_applied` lines. A change to the index alone is put back to
+  `excel-bridge` or the bridge's model names when Codex rebuilds it. Each value is changed in place:
+  the rest of the file, the conversation itself and the file's modification time stay as they are.
+- Conversations moved by earlier versions are finished: 0.5.4 and 0.5.5 changed the index only;
+  0.5.6 to 0.5.8 left the model names on the later lines, and the 1M ones, so with the bridge off
+  Codex could go back to the bridge's model names and fail, through the official sign-in or a relay.
+  The next start of the bridge while Codex is fully quit finishes them; the window says
+  `Finished N conversation(s) moved by an earlier excel-codex`.
 - `excel-codex threads` lists the conversations still under `excel-bridge`. `excel-codex threads undo`
   (also with Codex quit) undoes the move: conversations it changed, and Codex has not changed since,
   go back under `excel-bridge`.

@@ -215,6 +215,13 @@ TLS 证书校验始终开启。Codex 到桥接走 `127.0.0.1`，启动器会自�
 还在后台运行）再打开。发消息时桥接窗口里会出现 `"POST /v1/responses HTTP/1.1" 200`
 这样的一行（0.4.2 起）；没有就说明请求还是没经过桥接。
 
+**关掉桥接后接着聊，报 `stream disconnected before completion: 由于目标计算机积极拒绝，无法连接。
+(os error 10061)`，并显示“正在重新连接 x/5”**：桥接窗口关了，Codex 却还在运行。开着桥接时打开的
+对话会一直记着桥接的本机地址（`127.0.0.1:端口`），桥接关掉后那个端口没人监听，就被拒绝。只关窗口不够：
+桌面版在 Windows 上关掉窗口后还在托盘里运行。要从托盘图标右键退出（macOS 用 `Cmd+Q`），IDE 插件要重新
+加载窗口，再打开 Codex 就走官方链路了。桥接窗口关闭时会提示这一点；按 Ctrl+C 关闭时如果还看得到 Codex
+进程，会多一句 `Codex is still running right now`。
+
 也可以全手动：`excel-codex serve` 常驻桥接，再把 `excel-codex print-config` 输出的片段加进
 `config.toml`，不用时删掉。
 
@@ -251,16 +258,22 @@ Codex 没登录时，自带的 provider 会先要求登录，所以桥接仍是�
 - Codex 还开着（桌面版、IDE 插件，或终端里的 `codex`）时不迁移，只提示一句：Codex 运行时会把改动
   改回去，也可能正在写这些对话文件。所以要**先开桥接、再开桌面版**；或者退出 Codex 后运行
   `excel-codex threads migrate`。
-- 迁移后这些对话记到 `openai` 名下，模型名换成官方的（`gpt-6-sol-excel` → `gpt-6-sol`，1M 版不变），
-  关掉桥接也能打开、接着聊，改名、归档也不会再变回去。
+- 迁移后这些对话记到 `openai` 名下，模型名换成官方的（`gpt-6-sol-excel` → `gpt-6-sol`）。官方没有
+  1M 版，1M 版的对话换成同一模型的官方版（`gpt-6-sol-1m-excel` → `gpt-6-sol`，272k）；开着桥接时想继续
+  用 1M，在模型菜单里再选回来。关掉桥接也能打开、接着聊（走官方账号或中转站都行），改名、归档也不会再
+  变回去。
 
 改动内容：
 
 - Codex 的对话索引（`~/.codex/state_<n>.sqlite` 里的 threads 表）。改之前先复制一份，存为同目录下的
   `state_<n>.sqlite.before-excel-codex-<时间>`。
-- 每个对话文件（`~/.codex/sessions` 下）第一行记的 provider。Codex 按这一行重建索引，只改索引的话，
-  它会把对话改回 `excel-bridge`。0.5.4、0.5.5 的 `threads migrate` 就只改了索引，那样迁移过的对话
-  这次会补齐。只改这一个字段，文件其余内容和修改时间都不变，对话内容不动。
+- 每个对话文件（`~/.codex/sessions` 下）里 Codex 重建索引要读的几处：第一行的 provider，以及后面
+  `turn_context`、`thread_settings_applied` 行里的模型名和 provider。Codex 会按这些重建索引，只改索引
+  的话，它会把对话改回 `excel-bridge` 或桥接的模型名。每处只原地换掉这一个值，文件其余内容、对话内容
+  和修改时间都不变。
+- 旧版本迁移过的对话会补齐：0.5.4、0.5.5 只改了索引；0.5.6 到 0.5.8 没改后面几行的模型名，1M 版也
+  没换，关掉桥接后 Codex 可能又用回桥接的模型名，走官方或中转站都会失败。下次在 Codex 完全退出时启动
+  桥接，窗口里会显示 `Finished N conversation(s) moved by an earlier excel-codex`。
 - `excel-codex threads` 列出还在 `excel-bridge` 名下的对话。`excel-codex threads undo`（同样要先退出
   Codex）撤销：迁移改过、之后没被 Codex 改过的对话放回 `excel-bridge` 名下。
 - 不想自动迁移：设置 `EXCEL_BRIDGE_AUTO_MIGRATE=0`，需要时自己运行 `excel-codex threads migrate`。

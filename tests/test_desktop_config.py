@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from excel_codex_bridge import cli, desktop_config
+from excel_codex_bridge import cli, codex_threads, desktop_config
 
 from helpers import write_webview_session
 
@@ -180,6 +180,10 @@ class DesktopCommandTests(unittest.TestCase):
             if hasattr(cli.signal, name):
                 sig = getattr(cli.signal, name)
                 self.addCleanup(cli.signal.signal, sig, cli.signal.getsignal(sig))
+        # This machine's own Codex, if it runs one, is none of these tests' business.
+        seen = mock.patch.object(codex_threads, "codex_seen", return_value=False)
+        self.codex_seen = seen.start()
+        self.addCleanup(seen.stop)
 
     def run_desktop(self, *extra, while_running=None):
         seen = {}
@@ -221,6 +225,28 @@ class DesktopCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(tomllib.loads(seen["config"])["model_provider"], "excel-bridge")
         self.assertIn(cli._SEPARATE, [call.args[0] for call in printed.call_args_list])
+
+    def test_it_says_to_quit_codex_fully_when_done(self):
+        for running in (True, False, None):
+            with self.subTest(running=running), mock.patch.object(cli, "_print") as printed:
+                self.codex_seen.return_value = running
+                code, _ = self.run_desktop()
+                said = [call.args[0] for call in printed.call_args_list]
+                self.assertEqual(code, 0)
+                self.assertIn(cli._QUIT_WHEN_DONE, said)
+                self.assertIn(cli._REOPEN_AFTER_RESTORE, said)
+                # Only when a Codex process is seen: not when the process list cannot be read.
+                self.assertEqual(cli._STILL_RUNNING in said, running is True)
+        self.assertIn("tray icon", cli._QUIT_WHEN_DONE)
+        self.assertIn("os error 10061", cli._REOPEN_AFTER_RESTORE)
+
+    def test_off_says_so_too(self):
+        self.run_desktop("--keep-config")
+        self.codex_seen.return_value = True
+        with mock.patch.object(cli, "_print") as printed:
+            self.assertEqual(cli.main(["desktop", "--off"]), 0)
+        said = [call.args[0] for call in printed.call_args_list]
+        self.assertEqual(said[1:], [cli._REOPEN_AFTER_RESTORE, cli._STILL_RUNNING])
 
     def test_keep_config_then_off(self):
         code, _ = self.run_desktop("--keep-config")

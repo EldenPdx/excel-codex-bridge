@@ -79,6 +79,8 @@ jobs:
         run: python tests/e2e/run_e2e.py --migrate -- ./excel-codex.sh
       - name: e2e (excel-codex.sh desktop, the bridge's own conversations moved at start)
         run: python tests/e2e/run_e2e.py --migrate desktop -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh, a 1M conversation moved onto the same model's official version)
+        run: python tests/e2e/run_e2e.py --migrate --model gpt-5.6-sol-1m-excel -- ./excel-codex.sh
       - name: e2e (excel-codex.sh, the shared rate limit waited out)
         run: python tests/e2e/run_e2e.py --rate-limited -- ./excel-codex.sh
       - name: e2e (excel-codex.sh, a rate limit longer than Codex waits for a silent stream)
@@ -138,6 +140,8 @@ jobs:
         run: python tests/e2e/run_e2e.py --migrate -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.exe desktop, the bridge's own conversations moved at start)
         run: python tests/e2e/run_e2e.py --migrate desktop -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe, a 1M conversation moved onto the same model's official version)
+        run: python tests/e2e/run_e2e.py --migrate --model gpt-5.6-sol-1m-excel -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.exe, the shared rate limit waited out)
         run: python tests/e2e/run_e2e.py --rate-limited -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.exe, a rate limit longer than Codex waits for a silent stream)

@@ -498,11 +498,14 @@ def migrate_then_resume(launcher, args, root: Path, webview: Path, project: Path
     print(moved)
     after = codex_threads(home)
     refiled = rollout_providers(home)
-    official = codex_config.codex_model(args.model)
+    rebuilt = rollout_rebuilt(home)
+    # A 1M model too: OpenAI serves the same model without it.
+    official = codex_config.official_model(args.model)
     checks += moved_checks + [
         (expected in moved, f"the conversation was not moved: {moved.strip()[-1500:]}"),
         (after == [("openai", official)], f"it should be filed as ('openai', {official}), got {after}"),
         (refiled == ["openai"], f"its file should name openai now, got {refiled}"),
+        (rebuilt == after, f"Codex would rebuild its index row from the file as {rebuilt}, not {after}"),
         (len(list(home.glob("state_*.sqlite.before-excel-codex-*"))) == 1, "no copy of Codex's index"),
     ]
     args.shared = True
@@ -656,6 +659,29 @@ def rollout_providers(home: Path) -> list[str]:
     for path in sorted((home / "sessions").rglob("rollout-*.jsonl")):
         with path.open(encoding="utf-8") as handle:
             found.append(json.loads(handle.readline())["payload"].get("model_provider"))
+    return found
+
+
+def rollout_rebuilt(home: Path) -> list[tuple[str, str]]:
+    """(provider, model) Codex takes from each conversation file when it rebuilds its index row.
+
+    As codex-rs state/src/extract.rs does: the provider from session_meta, then
+    the model, and the provider again, from each later line in turn.
+    """
+    found = []
+    for path in sorted((home / "sessions").rglob("rollout-*.jsonl")):
+        provider = model = None
+        for line in path.read_text(encoding="utf-8").splitlines():
+            item = json.loads(line)
+            payload = item.get("payload") or {}
+            if item.get("type") == "session_meta":
+                provider = payload.get("model_provider")
+            elif item.get("type") == "turn_context":
+                model = payload.get("model")
+            elif item.get("type") == "event_msg" and payload.get("type") == "thread_settings_applied":
+                model = payload["thread_settings"].get("model")
+                provider = payload["thread_settings"].get("model_provider_id")
+        found.append((provider, model))
     return found
 
 

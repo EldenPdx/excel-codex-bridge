@@ -509,11 +509,19 @@ def _undo_on_exit(undo):
     return handler
 
 
-# The desktop app reads its model list only at startup, so it keeps offering
-# the Excel models after the config is restored; requests then go to OpenAI.
+# The desktop app reads its config and model list only at startup, and a
+# conversation it has open keeps the route it was opened with: to the bridge,
+# gone once this window is.
 _REOPEN_AFTER_RESTORE = (
-    "  Quit and reopen the Codex desktop app too: until then it still lists the bridge's models,\n"
-    "  and the 1M ones fail there with \"not supported when using Codex with a ChatGPT account\"."
+    "  Now fully quit the Codex desktop app and open it again (Windows: right-click its tray icon > Quit;\n"
+    "  closing its window leaves it running), and reload IDE windows that use Codex. Until then the\n"
+    "  conversations opened meanwhile still go to the bridge and fail with \"connection refused\"\n"
+    "  (os error 10061), and the app still offers the bridge's models (1M ones fail without it)."
+)
+_STILL_RUNNING = "  Codex is still running right now: quit it as above before carrying on."
+_QUIT_WHEN_DONE = (
+    "  When done, fully quit Codex too (Windows: its tray icon > Quit) before using it without the\n"
+    "  bridge: conversations opened meanwhile keep going to this window until then."
 )
 _SHARED = (
     "  Conversations are shared with Codex's official sign-in: earlier ones carry on through the\n"
@@ -529,24 +537,35 @@ def _move_bridge_threads(home: Path) -> None:
     """Move the bridge's own conversations into the shared list, if Codex is not running.
 
     With the bridge off, Codex cannot open them otherwise ("Model provider
-    `excel-bridge` not found").  EXCEL_BRIDGE_AUTO_MIGRATE=0 leaves that to
-    `excel-codex threads migrate`.
+    `excel-bridge` not found").  Conversations an earlier excel-codex moved get
+    OpenAI's models in their file too.  EXCEL_BRIDGE_AUTO_MIGRATE=0 leaves that
+    to `excel-codex threads migrate`.
     """
     from . import codex_threads
 
     record_dir = codex_config.state_dir()
     try:
         count = len(codex_threads.bridge_threads(home, record_dir))
-        if not count:
+        unfinished = len(codex_threads.unfinished_threads(home, record_dir))
+        if not count and not unfinished:
             return
         if os.environ.get("EXCEL_BRIDGE_AUTO_MIGRATE", "").strip() == "0":
-            _print(f"  {count} conversation(s) under the bridge's own provider open only while it is on:\n"
-                   "  `excel-codex threads migrate` moves them into the shared list.")
+            if count:
+                _print(f"  {count} conversation(s) under the bridge's own provider open only while it is on:\n"
+                       "  `excel-codex threads migrate` moves them into the shared list.")
+            if unfinished:
+                _print(f"  {unfinished} conversation(s) moved by an earlier excel-codex still name the bridge's models in\n"
+                       "  their file: `excel-codex threads migrate` finishes them.")
             return
         if codex_threads.codex_running():
-            _print(f"  {count} conversation(s) under the bridge's own provider open only while it is on. They move\n"
-                   "  into the shared list when this starts while Codex (desktop app, IDE, `codex` in a\n"
-                   "  terminal) is fully quit, or with `excel-codex threads migrate` then.")
+            if count:
+                _print(f"  {count} conversation(s) under the bridge's own provider open only while it is on. They move\n"
+                       "  into the shared list when this starts while Codex (desktop app, IDE, `codex` in a\n"
+                       "  terminal) is fully quit, or with `excel-codex threads migrate` then.")
+            if unfinished:
+                _print(f"  {unfinished} conversation(s) moved by an earlier excel-codex still name the bridge's models in\n"
+                       "  their file. They are finished when this starts while Codex is fully quit, or with\n"
+                       "  `excel-codex threads migrate` then.")
             return
         result = codex_threads.migrate(home, record_dir)
     except (codex_threads.Refused, OSError, sqlite3.Error) as exc:
@@ -555,8 +574,22 @@ def _move_bridge_threads(home: Path) -> None:
     if result.threads:
         _print(f"  Moved {len(result.threads)} conversation(s) from the bridge's own provider into the shared list,\n"
                "  so they open with the bridge off too (`excel-codex threads undo` puts them back).")
+    if result.finished:
+        _print(f"  Finished {len(result.finished)} conversation(s) moved by an earlier excel-codex: with the bridge\n"
+               "  off they carry on with OpenAI's models now.")
+    if _had_1m(result):
+        _print(_1M_MOVED)
     if result.left:
         _print(f"  {len(result.left)} conversation(s) could not be moved; `excel-codex threads` lists them.")
+
+
+_1M_MOVED = ("  1M conversations among them carry on with the same model's official version (272k); pick\n"
+             "  a 1M model again while the bridge is on.")
+
+
+def _had_1m(result) -> bool:
+    return any((thread.model or "").endswith(excel_upstream.LONG_CONTEXT_SUFFIX)
+               for thread in [*result.threads, *result.finished])
 
 
 def cmd_desktop(args) -> int:
@@ -570,6 +603,7 @@ def cmd_desktop(args) -> int:
         _print(f"Restored {config}." if changed else f"Nothing to undo in {config}.")
         if changed:
             _print(_REOPEN_AFTER_RESTORE)
+            _say_if_codex_runs()
         return 0
 
     _apply_proxy(args)
@@ -618,6 +652,7 @@ def cmd_desktop(args) -> int:
         _print("  Keep this window open. `excel-codex desktop --off` puts your config back.")
     else:
         _print("  Keep this window open; closing it or pressing Ctrl+C puts your config back.")
+    _print(_QUIT_WHEN_DONE)
     _print(_pictures_line())
     _print(f"Listening on {codex_config.base_url(args.port)}")
     _watch_for_updates()
@@ -631,8 +666,16 @@ def cmd_desktop(args) -> int:
         if not args.keep_config:
             _print(f"Restored {config}.")
             _print(_REOPEN_AFTER_RESTORE)
+            _say_if_codex_runs()
     del keep
     return 0
+
+
+def _say_if_codex_runs() -> None:
+    from . import codex_threads
+
+    if codex_threads.codex_seen():
+        _print(_STILL_RUNNING)
 
 
 # ─── timezone ─────────────────────────────────────────────────────────────────
@@ -760,7 +803,8 @@ def cmd_threads(args) -> int:
     record_dir = codex_config.state_dir()
     try:
         threads = [] if args.action == "undo" else codex_threads.bridge_threads(home, record_dir)
-        if args.action == "migrate" and threads:
+        unfinished = [] if args.action == "undo" else codex_threads.unfinished_threads(home, record_dir)
+        if args.action == "migrate" and (threads or unfinished):
             # Not signed in: `migrate` refuses first, saying why.
             if codex_config.codex_signed_in(home) and codex_threads.codex_running():
                 _print(_QUIT_CODEX)
@@ -776,18 +820,24 @@ def cmd_threads(args) -> int:
         return 1
 
     if args.action == "migrate":
-        if not threads:
+        if not threads and not unfinished:
             _print("No conversations are filed under the bridge's own provider; nothing to move.")
             return 0
         if result.threads:
             _print(f"Moved {len(result.threads)} conversation(s) into the list shared with Codex's official sign-in;")
             _print("  they open with the bridge off too.")
+        if result.finished:
+            _print(f"Finished {len(result.finished)} conversation(s) moved by an earlier excel-codex: with the bridge off")
+            _print("  they carry on with OpenAI's models now.")
+        if _had_1m(result):
+            _print(_1M_MOVED)
+        if result.threads or result.finished:
             _print(f"  Codex's conversation index was copied to {result.backup} first.")
         if result.left:
             _print(f"Could not move {len(result.left)} conversation(s): their file is missing or not laid out as expected.")
             for thread in result.left[:10]:
                 _print(_thread_line(thread))
-        if not result.threads:
+        if not result.threads and not result.finished:
             return 1
         _print(_REOPEN_FOR_LIST)
         _print("  `excel-codex threads undo` puts them back.")
@@ -803,6 +853,10 @@ def cmd_threads(args) -> int:
         return 0
 
     shared = codex_config.codex_signed_in(home)
+    if unfinished:
+        _print(f"{len(unfinished)} conversation(s) moved by an earlier excel-codex still name the bridge's models in their\n"
+               "file, so with the bridge off Codex may go back to those and fail. `excel-codex threads migrate`\n"
+               "finishes them (Codex quit), and so do `excel-codex desktop` and `excel-codex` when they start.")
     if not threads:
         _print("No conversations are filed under the bridge's own provider.")
         if shared:
