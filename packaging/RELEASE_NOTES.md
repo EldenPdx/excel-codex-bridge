@@ -1,16 +1,19 @@
-迁移过的对话关掉桥接后能接着聊，1M 版换成官方版 · Moved conversations carry on with the bridge off, 1M ones on the official version
+普通版到 450k 才压缩；迁移过的对话关掉桥接后能接着聊 · Standard models compact at 450k; moved conversations carry on with the bridge off
 
 > **非官方项目**，与 OpenAI、Microsoft 无关联。使用加载项后端可能违反 OpenAI 服务条款，风险自负。
 > **Unofficial.** Not affiliated with OpenAI or Microsoft. Using the add-in's backend may violate OpenAI's terms; use at your own risk.
 
 ## 变化
 
+- **普通版（非 1M 版）到 450k 才自动压缩**：上下文从 272k 改为 500k，Codex 自动压缩从 180k 改为
+  450k，后端兜底压缩从 200k 改为 475k。1M 版不变（918k，约 826k 压缩）。普通版和官方模型同名，关掉
+  桥接后官方链路按官方自己的窗口处理：对话很长又要关掉桥接时，建议开着桥接先压缩一次（`/compact`）。
 - **迁移过的对话关掉桥接后不再报错**：以前迁移只改了对话文件第一行的 provider，后面几行
   （`turn_context`、`thread_settings_applied`）里还记着桥接的模型名。Codex 按这些重建索引时，会把
   对话改回桥接的模型名，关掉桥接后走官方账号或中转站都会失败。现在这几行里的模型名和 provider 也会改，
   每处只原地换掉这一个值，文件其余内容、对话内容和修改时间都不变；`threads undo` 会一并改回。
-- **1M 版的对话换成同一模型的官方版**：官方没有 1M 版，迁移时 `gpt-6-sol-1m-excel` 换成 `gpt-6-sol`
-  （272k）。开着桥接时想继续用 1M，在模型菜单里再选回来。
+- **1M 版的对话换成同一模型的官方版**：官方没有 1M 版，迁移时 `gpt-6-sol-1m-excel` 换成 `gpt-6-sol`。
+  开着桥接时想继续用 1M，在模型菜单里再选回来。
 - **0.5.6 到 0.5.8 迁移过的对话自动补齐**：升级后在 Codex 完全退出时启动一次桥接，窗口里会显示
   `Finished N conversation(s) moved by an earlier excel-codex`。`excel-codex threads` 也会列出还没补齐的。
 - **关掉桥接后报 `os error 10061`（由于目标计算机积极拒绝，无法连接）、“正在重新连接 x/5”**：这是
@@ -55,6 +58,11 @@ curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.9
 
 ## Changes
 
+- **Standard (non-1M) models compact at 450k**: their context goes from 272k to 500k, Codex's
+  automatic compaction from 180k to 450k, and the backend's fallback compaction from 200k to 475k.
+  The 1M versions stay as they were (918k, compacting at about 826k). The standard versions share
+  OpenAI's names, and with the bridge off the official sign-in goes by OpenAI's own windows: before
+  closing the bridge on a long conversation, compact it once with the bridge on (`/compact`).
 - **Moved conversations no longer fail with the bridge off**: migrating used to change only the
   provider on the first line of a conversation file, and later lines (`turn_context`,
   `thread_settings_applied`) still named the bridge's models. Codex rebuilds its index from those, so
@@ -63,7 +71,7 @@ curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.9
   in place: the rest of the file, the conversation itself and the file's modification time stay as
   they are; `threads undo` puts them back as well.
 - **1M conversations carry on with the same model's official version**: OpenAI has no 1M versions,
-  so migrating turns `gpt-6-sol-1m-excel` into `gpt-6-sol` (272k). Pick a 1M model again in the model
+  so migrating turns `gpt-6-sol-1m-excel` into `gpt-6-sol`. Pick a 1M model again in the model
   menu to use one with the bridge on.
 - **Conversations moved by 0.5.6 to 0.5.8 are finished**: after upgrading, start the bridge once
   while Codex is fully quit; the window says `Finished N conversation(s) moved by an earlier

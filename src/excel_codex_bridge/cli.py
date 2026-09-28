@@ -583,7 +583,7 @@ def _move_bridge_threads(home: Path) -> None:
         _print(f"  {len(result.left)} conversation(s) could not be moved; `excel-codex threads` lists them.")
 
 
-_1M_MOVED = ("  1M conversations among them carry on with the same model's official version (272k); pick\n"
+_1M_MOVED = ("  1M conversations among them carry on with the same model's official version; pick\n"
              "  a 1M model again while the bridge is on.")
 
 

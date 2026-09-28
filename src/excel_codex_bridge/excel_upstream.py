@@ -39,7 +39,7 @@ _BASE_MODEL_UPSTREAMS = {
     "gpt-6-astra-excel": "gpt-6-astra",
 }
 LONG_CONTEXT_SUFFIX = "-1m-excel"
-# Every model is served twice: a 272k alias, and a ``-1m`` alias of the same
+# Every model is served twice: a 500k alias, and a ``-1m`` alias of the same
 # upstream that runs at the longest input the Excel backend accepts.
 EXCEL_MODEL_UPSTREAMS = {
     **_BASE_MODEL_UPSTREAMS,
@@ -50,7 +50,7 @@ EXCEL_MODEL_UPSTREAMS = {
 }
 MODEL_IDS = tuple(EXCEL_MODEL_UPSTREAMS)
 MODEL_ID = "gpt-5.6-sol-excel"
-DEFAULT_CONTEXT_WINDOW = 272_000
+DEFAULT_CONTEXT_WINDOW = 500_000
 # Measured on the real backend for gpt-5.6-sol, gpt-6-sol, gpt-6-luna and
 # gpt-6-astra alike: 918,843 input tokens accepted, ~921,375 refused with
 # context_length_exceeded. Rounded down.
@@ -68,8 +68,6 @@ def _compaction_limits(context_window: int) -> tuple[int, int]:
     that outgrows it, and stays under the window so the backend compacts
     instead of refusing.
     """
-    if context_window <= DEFAULT_CONTEXT_WINDOW:
-        return 180_000, 200_000
     return context_window * 90 // 100 // 1000 * 1000, context_window * 95 // 100 // 1000 * 1000
 _UPSTREAM_MODEL_OVERRIDE = os.environ.get("GHCP_EXCEL_UPSTREAM_MODEL", "").strip()
 UPSTREAM_MODEL = _UPSTREAM_MODEL_OVERRIDE or EXCEL_MODEL_UPSTREAMS[MODEL_ID]

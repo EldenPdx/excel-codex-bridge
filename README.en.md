@@ -154,7 +154,7 @@ Launcher options: `--login <auto|codex|excel>`, `--model`, `--proxy`, `--timezon
 
 Every model comes in two versions: the same upstream model with a different context length.
 
-| 272k version | 1M version | Upstream model |
+| Standard version (500k) | 1M version | Upstream model |
 | --- | --- | --- |
 | `gpt-5.6-sol` (default) | `gpt-5.6-sol-1m-excel` | `gpt-5.6-sol` |
 | `gpt-5.6-terra` | `gpt-5.6-terra-1m-excel` | `gpt-5.6-terra` |
@@ -163,18 +163,24 @@ Every model comes in two versions: the same upstream model with a different cont
 | `gpt-6-luna` | `gpt-6-luna-1m-excel` | `gpt-6-luna` |
 | `gpt-6-astra` | `gpt-6-astra-1m-excel` | `gpt-6-astra` |
 
-- From 0.5.4 the 272k versions use OpenAI's own names in Codex (the model list shows them as, for
+- From 0.5.4 the standard versions use OpenAI's own names in Codex (the model list shows them as, for
   example, "6-Sol Excel"), so a conversation carries on whether the bridge is on or off, see
   [Session sharing](#session-sharing). The earlier names such as `gpt-6-sol-excel` still work; they
   are just no longer in the model list. OpenAI has no 1M versions, so their names stay.
 
-- **272k version**: 272k context; Codex compacts automatically at 180k.
+- **Standard version**: 500k context; Codex compacts automatically at 450k (272k and 180k up to
+  0.5.8).
 - **1M version**: 918k context; Codex compacts automatically at about 826k. 918k is the limit measured
   on the real backend: it accepts up to about 918k input tokens per request and answers
   `context_length_exceeded` beyond that. gpt-5.6-sol, gpt-6-sol, gpt-6-luna and gpt-6-astra measured
   the same; gpt-5.6-terra and gpt-5.6-luna use the same limit.
-- Each turn of a long conversation sends more context and uses more of your plan, so pick the 272k
+- Each turn of a long conversation sends more context and uses more of your plan, so pick the standard
   version when you don't need the length.
+- The standard versions share OpenAI's names, and the official sign-in goes by OpenAI's own context
+  windows. With the bridge on a conversation grows to 450k before it is compacted; carried on with
+  the bridge off, Codex first compacts what goes beyond OpenAI's window, and whether the official
+  backend accepts a compaction that long has not been tested. Before closing the bridge on a long
+  conversation, compact it once with the bridge on (`/compact`).
 
 Reasoning effort `low` / `medium` / `high` / `xhigh`, default `medium`.
 
@@ -315,7 +321,7 @@ cannot open them: "Model provider `excel-bridge` not found". When Codex is signe
   `excel-codex threads migrate`.
 - Moved conversations are filed under `openai`, with OpenAI's model names (`gpt-6-sol-excel` →
   `gpt-6-sol`). OpenAI has no 1M versions, so a 1M conversation carries on with the same model's
-  official version (`gpt-6-sol-1m-excel` → `gpt-6-sol`, 272k); pick a 1M model again in the model
+  official version (`gpt-6-sol-1m-excel` → `gpt-6-sol`); pick a 1M model again in the model
   menu to use one with the bridge on. They open and carry on with the bridge off (through the
   official sign-in or a relay), and renaming or archiving them no longer moves them back.
 

@@ -164,8 +164,8 @@ class ExcelUpstreamTests(unittest.TestCase):
 
     def test_default_backend_compaction_follows_the_alias_window(self):
         for requested, threshold in (
-            ("gpt-6-sol-excel", 200_000),
-            ("gpt-5.6-luna-excel", 200_000),
+            ("gpt-6-sol-excel", 475_000),
+            ("gpt-5.6-luna-excel", 475_000),
             ("gpt-6-sol-1m-excel", 872_000),
             ("gpt-5.6-luna-1m-excel", 872_000),
         ):
