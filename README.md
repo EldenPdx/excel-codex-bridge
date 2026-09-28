@@ -133,6 +133,8 @@ excel-codex desktop                           让 Codex 桌面版 / IDE 插件�
 | `gpt-5.6-sol-excel`（默认） | `gpt-5.6-sol` | 272k |
 | `gpt-5.6-terra-excel` | `gpt-5.6-terra` | 272k |
 | `gpt-5.6-luna-excel` | `gpt-5.6-luna` | 200k |
+| `gpt-6-sol-excel` | `gpt-6-sol` | 按 272k 处理 |
+| `gpt-6-luna-excel` | `gpt-6-luna` | 按 200k 处理 |
 | `gpt-6-astra-excel` | `gpt-6-astra` | 按 272k 处理 |
 
 推理强度 `low` / `medium` / `high` / `xhigh`，默认 `medium`。

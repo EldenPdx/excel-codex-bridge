@@ -38,7 +38,10 @@ You are Codex, a coding agent running in the user's terminal. You and the user s
 - When done, reply concisely: what changed (with file paths), how it was verified, and anything left for the user. Use plain Markdown and do not paste whole files.
 """
 
-CATALOG_ORDER = ("gpt-5.6-sol-excel", "gpt-6-astra-excel", "gpt-5.6-terra-excel", "gpt-5.6-luna-excel")
+CATALOG_ORDER = (
+    "gpt-5.6-sol-excel", "gpt-6-sol-excel", "gpt-6-astra-excel", "gpt-6-luna-excel",
+    "gpt-5.6-terra-excel", "gpt-5.6-luna-excel",
+)
 
 _REASONING_LEVEL_DESCRIPTIONS = {
     "low": "Fast responses with lighter reasoning",

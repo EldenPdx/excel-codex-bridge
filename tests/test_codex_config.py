@@ -36,8 +36,14 @@ class CatalogTests(unittest.TestCase):
             self.assertLess(model["auto_compact_token_limit"], model["context_window"])
             efforts = [level["effort"] for level in model["supported_reasoning_levels"]]
             self.assertEqual(efforts, ["low", "medium", "high", "xhigh"])
-        luna = next(m for m in models if m["slug"] == "gpt-5.6-luna-excel")
-        self.assertEqual(luna["context_window"], 200_000)
+        windows = {m["slug"]: m["context_window"] for m in models}
+        self.assertEqual(windows["gpt-5.6-luna-excel"], 200_000)
+        self.assertEqual(windows["gpt-6-luna-excel"], 200_000)
+        self.assertEqual(windows["gpt-6-sol-excel"], 272_000)
+        self.assertEqual(
+            {m["slug"]: m["display_name"] for m in models if m["slug"] in {"gpt-6-sol-excel", "gpt-6-luna-excel"}},
+            {"gpt-6-sol-excel": "6-Sol Excel", "gpt-6-luna-excel": "6-Luna Excel"},
+        )
         self.assertFalse(any("experimental" in m["description"] for m in models))
 
     def test_catalog_order_covers_every_served_model(self):

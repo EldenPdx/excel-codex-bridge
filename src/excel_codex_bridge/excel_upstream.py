@@ -34,6 +34,8 @@ EXCEL_MODEL_UPSTREAMS = {
     "gpt-5.6-luna-excel": "gpt-5.6-luna",
     "gpt-5.6-terra-excel": "gpt-5.6-terra",
     "gpt-5.6-sol-excel": "gpt-5.6-sol",
+    "gpt-6-sol-excel": "gpt-6-sol",
+    "gpt-6-luna-excel": "gpt-6-luna",
     # excel-codex-bridge: not yet confirmed on the Excel backend.
     "gpt-6-astra-excel": "gpt-6-astra",
 }
@@ -163,6 +165,8 @@ LOCAL_MODEL_CAPABILITIES = {
             "gpt-5.6-luna-excel": "5.6-Luna Excel",
             "gpt-5.6-terra-excel": "5.6-Terra Excel",
             "gpt-5.6-sol-excel": "5.6-Sol Excel",
+            "gpt-6-sol-excel": "6-Sol Excel",
+            "gpt-6-luna-excel": "6-Luna Excel",
             "gpt-6-astra-excel": "6-Astra Excel",
         }.get(model_id, model_id.removesuffix("-excel").upper().replace("GPT-", "GPT ")),
         "input_modalities": ["text", "image"],

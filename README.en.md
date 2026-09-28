@@ -155,6 +155,8 @@ Launcher options: `--login <auto|codex|excel>`, `--model`, `--proxy`, `--port`, 
 | `gpt-5.6-sol-excel` (default) | `gpt-5.6-sol` | 272k |
 | `gpt-5.6-terra-excel` | `gpt-5.6-terra` | 272k |
 | `gpt-5.6-luna-excel` | `gpt-5.6-luna` | 200k |
+| `gpt-6-sol-excel` | `gpt-6-sol` | treated as 272k |
+| `gpt-6-luna-excel` | `gpt-6-luna` | treated as 200k |
 | `gpt-6-astra-excel` | `gpt-6-astra` | treated as 272k |
 
 Reasoning effort `low` / `medium` / `high` / `xhigh`, default `medium`.
