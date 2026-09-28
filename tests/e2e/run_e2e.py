@@ -68,6 +68,7 @@ import shlex
 import tempfile
 import threading
 import time
+import traceback
 import urllib.request
 import zlib
 from pathlib import Path
@@ -450,10 +451,11 @@ def migrate_then_resume(launcher, args, root: Path, webview: Path, project: Path
     output, checks = run_launcher(first, args, webview, project, env)
     args.first_requests = len(args.backend.requests)
     before = codex_threads(home)
+    filed = rollout_providers(home)
     checks += [
         (len(before) == 1 and before[0][0] == "excel-bridge",
          f"the first conversation should be filed under excel-bridge, got {before}"),
-        (rollout_providers(home) == ["excel-bridge"], "the first conversation's file should name excel-bridge"),
+        (filed == ["excel-bridge"], f"the first conversation's file should name excel-bridge, got {filed}"),
     ]
     sign_codex_in(home)
     if args.migrate == "desktop":
@@ -465,11 +467,12 @@ def migrate_then_resume(launcher, args, root: Path, webview: Path, project: Path
         expected = "Moved 1 conversation(s) into the list shared"
     print(moved)
     after = codex_threads(home)
+    refiled = rollout_providers(home)
     official = codex_config.codex_model(args.model)
     checks += moved_checks + [
-        (expected in moved, "the conversation was not moved"),
+        (expected in moved, f"the conversation was not moved: {moved.strip()[-1500:]}"),
         (after == [("openai", official)], f"it should be filed as ('openai', {official}), got {after}"),
-        (rollout_providers(home) == ["openai"], "its file should name openai now"),
+        (refiled == ["openai"], f"its file should name openai now, got {refiled}"),
         (len(list(home.glob("state_*.sqlite.before-excel-codex-*"))) == 1, "no copy of Codex's index"),
     ]
     args.shared = True
@@ -534,7 +537,7 @@ def resume_with_codex_providers_only(launcher, args, root: Path, webview: Path, 
             output = result.stdout
             checks += [
                 (opened, f"the desktop app's `thread/resume` could not open it: {said}"),
-                (result.returncode == 0, f"codex exit code {result.returncode}"),
+                (result.returncode == 0, f"codex exit code {result.returncode}: {output.strip()[-1500:]}"),
                 ("`excel-bridge` not found" not in output, "Codex still looked for the excel-bridge provider"),
             ]
         else:
@@ -633,6 +636,11 @@ def codex_threads(home: Path) -> list[tuple[str, str]]:
 
 def tzutil(*args: str) -> str:
     return subprocess.run(["tzutil", *args], capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _annotation(text: str) -> str:
+    """``text`` as one GitHub Actions workflow-command message."""
+    return text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
 def _desktop_log(root: Path) -> str:
@@ -814,6 +822,9 @@ def main() -> int:
             print("--- 2nd request tail\n" + tail[-1500:])
         for message in failures:
             print("FAIL:", message)
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                # The job log needs a sign-in; annotations do not.
+                print("::error title=e2e::" + _annotation(message))
         return 1
     shutil.rmtree(root, ignore_errors=True)
     print("e2e ok")
@@ -821,4 +832,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        code = main()
+    except Exception:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            print("::error title=e2e::" + _annotation(traceback.format_exc()[-3000:]))
+        raise
+    raise SystemExit(code)
