@@ -121,7 +121,7 @@ excel-codex status                            看当前用哪份登录、是否�
 excel-codex --login codex                      只用 Codex 自己的登录（不碰 Excel）
 excel-codex login                             打开 Excel 的 ChatGPT 面板登录或续期
 excel-codex desktop                           让 Codex 桌面版 / IDE 插件走 Excel 链路
-excel-codex threads migrate                   把 0.5.3 及更早版本的桥接对话并进共享列表
+excel-codex threads migrate                   把桥接自己名下的对话并进共享列表（启动时会自动做）
 ```
 
 启动器自己的选项：`--login <auto|codex|excel>`、`--model`、`--proxy`、`--timezone <auto|off>`、
@@ -237,27 +237,33 @@ Codex 按对话建立时用的 provider 列出和继续对话。0.5.3 及更早�
   WebSocket，桥接只讲 HTTP，回 426 让它马上改用 HTTP，属于正常现象。
 
 Codex 没登录时，自带的 provider 会先要求登录，所以桥接仍是独立的 `excel-bridge` provider，行为和
-以前一样：开着桥接建的对话只在开着桥接时出现在列表里。
+以前一样：开着桥接建的对话只在开着桥接时出现在列表里。之后 `codex login`，这些对话会按下一节自动并进
+共享列表。
 
-### 0.5.3 及更早版本建的桥接对话
+### 桥接自己名下的对话
 
-这些对话记在 `excel-bridge` 名下，不在共享列表里。`excel-codex threads` 列出它们，
-`excel-codex threads migrate` 把它们并进共享列表：
+0.5.3 及更早版本、或 Codex 没登录时经桥接建的对话，记在 `excel-bridge` 名下。它们不在共享列表里，
+关掉桥接后 Codex 也打不开，会报“Model provider `excel-bridge` not found”。Codex 登录过（`codex login`）
+时，桥接会自动把它们并进共享列表：
 
-1. 先完全退出 Codex 桌面版（IDE 插件则关掉窗口），Codex 登录过（`codex login`）才能迁移。
-2. 运行 `excel-codex threads migrate`。它把这些对话改记到 `openai` 名下，模型名换成官方的
-   （`gpt-6-sol-excel` → `gpt-6-sol`，1M 版不变）。
-3. 重新打开 Codex，这些对话就和其他对话在同一个列表里了。
+- `excel-codex-desktop.cmd`（`excel-codex desktop`）和 `excel-codex` 启动时，如果 Codex 已经完全退出，
+  就自动迁移，窗口里会显示 `Moved N conversation(s) … into the shared list`。
+- Codex 还开着（桌面版、IDE 插件，或终端里的 `codex`）时不迁移，只提示一句：Codex 运行时会把改动
+  改回去，也可能正在写这些对话文件。所以要**先开桥接、再开桌面版**；或者退出 Codex 后运行
+  `excel-codex threads migrate`。
+- 迁移后这些对话记到 `openai` 名下，模型名换成官方的（`gpt-6-sol-excel` → `gpt-6-sol`，1M 版不变），
+  关掉桥接也能打开、接着聊，改名、归档也不会再变回去。
 
-- 只改 Codex 的对话索引（`~/.codex/state_<n>.sqlite` 里的 threads 表），不碰对话内容
-  （`~/.codex/sessions` 下的文件）。改之前先把索引复制一份，存为同目录下的
+改动内容：
+
+- Codex 的对话索引（`~/.codex/state_<n>.sqlite` 里的 threads 表）。改之前先复制一份，存为同目录下的
   `state_<n>.sqlite.before-excel-codex-<时间>`。
-- `excel-codex threads undo` 撤销：把迁移改过、之后没再被 Codex 改过的对话放回 `excel-bridge` 名下。
-- 迁移后还没接着聊过的对话，如果在 Codex 里改名或归档，Codex 会按对话文件重建这一条，它又会回到
-  `excel-bridge` 名下；再运行一次 `excel-codex threads migrate` 即可。接着聊过一次后就不会了。
-- 不想迁移的话，开着桥接时仍然可以在终端用 `excel-codex -- resume <会话 ID>` 接着聊
-  （会话 ID 在 `~/.codex/sessions` 下的文件名里）。
-- Codex 登录过时，`excel-codex-desktop.cmd` 发现有这类对话会提示一句。
+- 每个对话文件（`~/.codex/sessions` 下）第一行记的 provider。Codex 按这一行重建索引，只改索引的话，
+  它会把对话改回 `excel-bridge`。0.5.4、0.5.5 的 `threads migrate` 就只改了索引，那样迁移过的对话
+  这次会补齐。只改这一个字段，文件其余内容和修改时间都不变，对话内容不动。
+- `excel-codex threads` 列出还在 `excel-bridge` 名下的对话。`excel-codex threads undo`（同样要先退出
+  Codex）撤销：迁移改过、之后没被 Codex 改过的对话放回 `excel-bridge` 名下。
+- 不想自动迁移：设置 `EXCEL_BRIDGE_AUTO_MIGRATE=0`，需要时自己运行 `excel-codex threads migrate`。
 
 ## 出口时区
 
@@ -409,6 +415,7 @@ Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图�
 | `EXCEL_BRIDGE_HOME` | 状态目录：模型目录 JSON、`bridge.log`、登录用工作簿，以及让重启后仍能原样回放历史工具调用的 `tool-calls.sqlite3`（保留 60 天）。默认 `%LOCALAPPDATA%\excel-codex-bridge` 或 `~/.excel-codex-bridge` |
 | `EXCEL_BRIDGE_AUTO_SIGNIN` | 设为 `0` 时不自动打开 Excel（同 `--no-auto-signin`） |
 | `EXCEL_BRIDGE_UPDATE_CHECK` | 设为 `0` 时不检查更新 |
+| `EXCEL_BRIDGE_AUTO_MIGRATE` | 设为 `0` 时启动不自动迁移桥接自己名下的对话，见[桥接自己名下的对话](#桥接自己名下的对话) |
 | `EXCEL_BRIDGE_TIMEZONE` | `auto`（默认）/ `off`，同 `--timezone`，见[出口时区](#出口时区) |
 | `EXCEL_BRIDGE_IMAGE_MODEL` | 生图工具向后端请求的模型，默认 `gpt-image-2`（同 `--image-model`），见[生图](#生图) |
 | `CODEX_HOME` | Codex 配置目录，`desktop` 改写其中的 `config.toml`。默认 `~/.codex` |

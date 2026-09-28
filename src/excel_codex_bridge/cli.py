@@ -422,10 +422,12 @@ def cmd_codex(args, codex_args: list[str]) -> int:
                 _print(f"The bridge did not start; see {log_file}")
                 return 1
             time.sleep(0.2)
+        shared = codex_config.codex_signed_in()
+        if shared:
+            _move_bridge_threads(desktop_config.codex_home())
         _print(_pictures_line())
         _print(f"Bridge ready on {codex_config.base_url(port)} (log: {log_file}). Starting Codex...")
 
-        shared = codex_config.codex_signed_in()
         command = codex_config.codex_command(
             codex, codex_config.codex_overrides(port, catalog, args.model, shared=shared), codex_args
         )
@@ -523,17 +525,38 @@ _SEPARATE = (
 )
 
 
-def _print_unshared_threads(home: Path) -> None:
-    """Point at `threads migrate` when conversations from 0.5.3 and earlier are not in the shared list."""
+def _move_bridge_threads(home: Path) -> None:
+    """Move the bridge's own conversations into the shared list, if Codex is not running.
+
+    With the bridge off, Codex cannot open them otherwise ("Model provider
+    `excel-bridge` not found").  EXCEL_BRIDGE_AUTO_MIGRATE=0 leaves that to
+    `excel-codex threads migrate`.
+    """
     from . import codex_threads
 
+    record_dir = codex_config.state_dir()
     try:
-        count = len(codex_threads.bridge_threads(home))
-    except (codex_threads.Refused, OSError, sqlite3.Error):
+        count = len(codex_threads.bridge_threads(home, record_dir))
+        if not count:
+            return
+        if os.environ.get("EXCEL_BRIDGE_AUTO_MIGRATE", "").strip() == "0":
+            _print(f"  {count} conversation(s) under the bridge's own provider open only while it is on:\n"
+                   "  `excel-codex threads migrate` moves them into the shared list.")
+            return
+        if codex_threads.codex_running():
+            _print(f"  {count} conversation(s) under the bridge's own provider open only while it is on. They move\n"
+                   "  into the shared list when this starts while Codex (desktop app, IDE, `codex` in a\n"
+                   "  terminal) is fully quit, or with `excel-codex threads migrate` then.")
+            return
+        result = codex_threads.migrate(home, record_dir)
+    except (codex_threads.Refused, OSError, sqlite3.Error) as exc:
+        _print(f"  Could not move the bridge's own conversations into the shared list: {exc}")
         return
-    if count:
-        _print(f"  {count} bridge conversation(s) from 0.5.3 and earlier are not in that list yet:\n"
-               "  `excel-codex threads migrate` moves them in (`excel-codex threads` shows which).")
+    if result.threads:
+        _print(f"  Moved {len(result.threads)} conversation(s) from the bridge's own provider into the shared list,\n"
+               "  so they open with the bridge off too (`excel-codex threads undo` puts them back).")
+    if result.left:
+        _print(f"  {len(result.left)} conversation(s) could not be moved; `excel-codex threads` lists them.")
 
 
 def cmd_desktop(args) -> int:
@@ -590,7 +613,7 @@ def cmd_desktop(args) -> int:
     _print("  Fully quit and reopen the Codex desktop app (or reload the IDE window) to pick it up.")
     _print(_SHARED if shared else _SEPARATE)
     if shared:
-        _print_unshared_threads(desktop_config.codex_home())
+        _move_bridge_threads(desktop_config.codex_home())
     if args.keep_config:
         _print("  Keep this window open. `excel-codex desktop --off` puts your config back.")
     else:
@@ -717,7 +740,11 @@ def _put_back_windows_timezone(keeper) -> None:
 
 # ─── threads ──────────────────────────────────────────────────────────────────
 
-_REOPEN_FOR_LIST = "  Fully quit and reopen the Codex desktop app (or reload the IDE window) to see the list again."
+_REOPEN_FOR_LIST = "  Open Codex again (or reload the IDE window) to see the new list."
+_QUIT_CODEX = (
+    "Nothing was changed: Codex is running. Fully quit the Codex desktop app, IDE windows that use\n"
+    "Codex, and `codex` in any terminal first: Codex puts back what changes while it runs."
+)
 
 
 def _thread_line(thread) -> str:
@@ -732,22 +759,36 @@ def cmd_threads(args) -> int:
     home = desktop_config.codex_home()
     record_dir = codex_config.state_dir()
     try:
-        if args.action == "migrate":
+        threads = [] if args.action == "undo" else codex_threads.bridge_threads(home, record_dir)
+        if args.action == "migrate" and threads:
+            # Not signed in: `migrate` refuses first, saying why.
+            if codex_config.codex_signed_in(home) and codex_threads.codex_running():
+                _print(_QUIT_CODEX)
+                return 1
             result = codex_threads.migrate(home, record_dir)
         elif args.action == "undo":
+            if (record_dir / codex_threads.RECORD_NAME).exists() and codex_threads.codex_running():
+                _print(_QUIT_CODEX)
+                return 1
             undone = codex_threads.undo(home, record_dir)
-        else:
-            threads = codex_threads.bridge_threads(home)
     except (codex_threads.Refused, OSError, sqlite3.Error) as exc:
         _print(f"Nothing was changed: {exc}")
         return 1
 
     if args.action == "migrate":
-        if not result.threads:
+        if not threads:
             _print("No conversations are filed under the bridge's own provider; nothing to move.")
             return 0
-        _print(f"Moved {len(result.threads)} conversation(s) into the list shared with Codex's official sign-in.")
-        _print(f"  Codex's conversation index was copied to {result.backup} first.")
+        if result.threads:
+            _print(f"Moved {len(result.threads)} conversation(s) into the list shared with Codex's official sign-in;")
+            _print("  they open with the bridge off too.")
+            _print(f"  Codex's conversation index was copied to {result.backup} first.")
+        if result.left:
+            _print(f"Could not move {len(result.left)} conversation(s): their file is missing or not laid out as expected.")
+            for thread in result.left[:10]:
+                _print(_thread_line(thread))
+        if not result.threads:
+            return 1
         _print(_REOPEN_FOR_LIST)
         _print("  `excel-codex threads undo` puts them back.")
         return 0
@@ -774,12 +815,12 @@ def cmd_threads(args) -> int:
     if len(threads) > 10:
         _print(f"    … and {len(threads) - 10} more")
     if shared:
-        _print("They are listed only while the bridge is its own provider, which it no longer is now that\n"
-               "Codex is signed in. `excel-codex threads migrate` moves them into the shared list\n"
-               "(best with the Codex desktop app quit; the index is copied first, and `threads undo` puts them back).")
+        _print("With the bridge off, Codex cannot open them (\"Model provider `excel-bridge` not found\").\n"
+               "`excel-codex desktop` and `excel-codex` move them into the shared list by themselves when\n"
+               "started while Codex is fully quit; `excel-codex threads migrate` does it now (Codex quit too).")
     else:
         _print("Codex is not signed in, so the bridge is still their provider and lists them while it is on.\n"
-               "After `codex login`, `excel-codex threads migrate` moves them into the list shared with it.")
+               "After `codex login`, they move into the list shared with it.")
     return 0
 
 
@@ -882,12 +923,13 @@ def _parser() -> argparse.ArgumentParser:
     sync.add_argument("--probe", action="store_true", help="only show what it would set")
     actions.add_parser("restore", help="Windows: put back the timezone from before excel-codex first changed it")
     threads = sub.add_parser(
-        "threads", help="show conversations Codex lists only under the bridge's own provider (0.5.3 and earlier)"
+        "threads", help="show conversations filed under the bridge's own provider, which need the bridge on"
     )
     moves = threads.add_subparsers(dest="action")
     moves.add_parser(
         "migrate",
-        help="move them into the list shared with Codex's official sign-in (Codex's index is copied first)",
+        help="move them into the list shared with Codex's official sign-in now; with Codex quit "
+        "(`desktop` does it by itself)",
     )
     moves.add_parser("undo", help="put back what `threads migrate` moved")
     sub.add_parser("sub2api", add_help=False, help="opt-in SUB2API sidecar and SSH session sync")

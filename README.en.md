@@ -143,7 +143,7 @@ excel-codex status                            which sign-in is used, is it usabl
 excel-codex --login codex                      use Codex's own sign-in only (never touch Excel)
 excel-codex login                             open Excel's ChatGPT pane to sign in or refresh
 excel-codex desktop                           route the Codex desktop app / IDE extension here
-excel-codex threads migrate                   move bridge conversations from 0.5.3 and earlier into the shared list
+excel-codex threads migrate                   move the bridge's own conversations into the shared list (done at start too)
 ```
 
 Launcher options: `--login <auto|codex|excel>`, `--model`, `--proxy`, `--timezone <auto|off>`,
@@ -288,31 +288,40 @@ at the bridge (`openai_base_url`) and use OpenAI's model names. So:
 
 When Codex is not signed in, its own provider asks for a sign-in first, so the bridge stays the
 separate `excel-bridge` provider and behaves as before: conversations started with the bridge on
-are listed only while it is on.
+are listed only while it is on. After `codex login` they move into the shared list by themselves,
+as the next section describes.
 
-### Bridge conversations from 0.5.3 and earlier
+### The bridge's own conversations
 
-These are filed under `excel-bridge` and are not in the shared list. `excel-codex threads` lists
-them, and `excel-codex threads migrate` moves them into the shared list:
+Conversations started through the bridge with 0.5.3 and earlier, or while Codex was not signed in,
+are filed under `excel-bridge`. They are not in the shared list, and with the bridge off Codex
+cannot open them: "Model provider `excel-bridge` not found". When Codex is signed in
+(`codex login`), the bridge moves them into the shared list by itself:
 
-1. Fully quit the Codex desktop app first (or close the IDE window). Codex has to be signed in
-   (`codex login`).
-2. Run `excel-codex threads migrate`. It files them under `openai`, with OpenAI's model names
-   (`gpt-6-sol-excel` → `gpt-6-sol`; the 1M versions stay as they are).
-3. Reopen Codex: they are in the same list as the other conversations.
+- `excel-codex-desktop.cmd` (`excel-codex desktop`) and `excel-codex` move them when they start
+  while Codex is fully quit; the window says `Moved N conversation(s) … into the shared list`.
+- While Codex runs (the desktop app, an IDE extension, or `codex` in a terminal) nothing is moved,
+  and the window says so: a running Codex puts the change back, and may be writing to those
+  conversation files. So **start the bridge first, then the desktop app**; or quit Codex and run
+  `excel-codex threads migrate`.
+- Moved conversations are filed under `openai`, with OpenAI's model names (`gpt-6-sol-excel` →
+  `gpt-6-sol`; the 1M versions stay as they are). They open and carry on with the bridge off, and
+  renaming or archiving them no longer moves them back.
 
-- Only Codex's conversation index changes (the threads table in `~/.codex/state_<n>.sqlite`), never
-  the conversations themselves (the files under `~/.codex/sessions`). The index is copied first,
+What changes:
+
+- Codex's conversation index (the threads table in `~/.codex/state_<n>.sqlite`). It is copied first,
   to `state_<n>.sqlite.before-excel-codex-<time>` in the same folder.
-- `excel-codex threads undo` undoes it: conversations the migration changed, and Codex has not
-  changed since, go back under `excel-bridge`.
-- When a migrated conversation that has not been continued yet is renamed or archived in Codex,
-  Codex rebuilds it from its conversation file and it goes back under `excel-bridge`; run
-  `excel-codex threads migrate` again. Once it has been continued, this no longer happens.
-- Without migrating, they still carry on in a terminal while the bridge is on, with
-  `excel-codex -- resume <session ID>` (the session ID is in the file names under
-  `~/.codex/sessions`).
-- When Codex is signed in, `excel-codex-desktop.cmd` mentions it when there are such conversations.
+- The provider on the first line of each of those conversation files (under `~/.codex/sessions`).
+  Codex rebuilds the index from that line, so a change to the index alone is put back to
+  `excel-bridge`; that is all `threads migrate` did in 0.5.4 and 0.5.5, and conversations it moved
+  are finished now. Only that one field changes: the rest of the file, the conversation itself and
+  the file's modification time stay as they are.
+- `excel-codex threads` lists the conversations still under `excel-bridge`. `excel-codex threads undo`
+  (also with Codex quit) undoes the move: conversations it changed, and Codex has not changed since,
+  go back under `excel-bridge`.
+- To keep it from moving them at start, set `EXCEL_BRIDGE_AUTO_MIGRATE=0` and run
+  `excel-codex threads migrate` when you want.
 
 ## Exit timezone
 
@@ -502,6 +511,7 @@ running from source, `git pull` is enough.
 | `EXCEL_BRIDGE_HOME` | State folder for the model catalog JSON, `bridge.log`, the sign-in workbook, and `tool-calls.sqlite3`, which lets earlier tool calls replay exactly after a restart (kept 60 days). Default `%LOCALAPPDATA%\excel-codex-bridge` or `~/.excel-codex-bridge` |
 | `EXCEL_BRIDGE_AUTO_SIGNIN` | `0` keeps the tool from opening Excel (same as `--no-auto-signin`) |
 | `EXCEL_BRIDGE_UPDATE_CHECK` | `0` turns off the update check |
+| `EXCEL_BRIDGE_AUTO_MIGRATE` | `0` keeps the bridge from moving its own conversations into the shared list at start, see [The bridge's own conversations](#the-bridges-own-conversations) |
 | `EXCEL_BRIDGE_TIMEZONE` | `auto` (default) / `off`, same as `--timezone`, see [Exit timezone](#exit-timezone) |
 | `EXCEL_BRIDGE_IMAGE_MODEL` | The model Codex's image tool asks the backend for, default `gpt-image-2` (same as `--image-model`), see [Image generation](#image-generation) |
 | `CODEX_HOME` | Codex config folder whose `config.toml` `desktop` edits. Default `~/.codex` |

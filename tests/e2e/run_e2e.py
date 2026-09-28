@@ -35,6 +35,13 @@ the conversation is filed under ``openai`` with the model's official name,
 the way the official sign-in files it.  Codex tries a WebSocket first there;
 the bridge's 426 must send it to HTTP.
 
+``--migrate`` starts a conversation the 0.5.3 way, filed under the bridge's own
+``excel-bridge`` provider, then signs Codex in and moves it into the shared
+list with ``threads migrate`` (``--migrate desktop``: by starting ``desktop``,
+which moves it by itself).  A plain ``codex exec resume --last`` then carries
+it on with only Codex's own providers, the way the desktop app has them with
+the bridge off; its ``openai`` provider reaches the bridge through ``serve``.
+
 ``--images`` also attaches a picture (``codex exec -i``).  Like the real
 backend, the fake one refuses a user message with an inline picture; the
 bridge must then upload it once to the attachments endpoint, the way the
@@ -49,6 +56,7 @@ import datetime as dt
 import itertools
 import json
 import os
+import queue
 import shutil
 import signal
 import socket
@@ -331,30 +339,62 @@ def run_launcher(launcher, args, webview: Path, project: Path, env: dict) -> tup
     return result.stdout, [(result.returncode == 0, f"launcher exit code {result.returncode}")]
 
 
+def in_background(command: list[str], *, cwd: Path, env: dict, log: Path) -> subprocess.Popen:
+    """``command`` in a process group of its own, so that ``stop`` reaches it like Ctrl+C would."""
+    print("$", subprocess.list2cmdline(command), "&", flush=True)
+    group = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
+    with open(log, "wb") as out:
+        return subprocess.Popen(
+            command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **group
+        )
+
+
+def wait_healthy(process: subprocess.Popen, port: int, timeout: int) -> bool:
+    deadline = time.monotonic() + timeout
+    while not healthy(port) and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.5)
+    return healthy(port)
+
+
+def stop(process: subprocess.Popen) -> int:
+    if process.poll() is None:
+        if sys.platform == "win32":
+            os.kill(process.pid, signal.CTRL_BREAK_EVENT)
+        else:
+            os.killpg(process.pid, signal.SIGINT)
+    try:
+        return process.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        return process.wait()
+
+
+def loopback_direct(env: dict) -> dict:
+    """``env`` with the bridge on 127.0.0.1 kept away from any proxy."""
+    env = dict(env)
+    for key in ("NO_PROXY", "no_proxy"):
+        env[key] = ",".join(filter(None, [env.get(key, ""), "127.0.0.1", "localhost"]))
+    return env
+
+
 def run_desktop(launcher, args, root: Path, webview: Path, project: Path, env: dict) -> tuple[str, list]:
     config = Path(env["CODEX_HOME"]) / "config.toml"
     config.write_bytes(USER_CONFIG.encode())
     port = free_port()
     # On Windows, desktop also sets the system timezone to the exit's; put back afterwards.
     windows_zone = tzutil("/g") if sys.platform == "win32" else None
-    command = [*launcher, "desktop", "--webview-dir", str(webview), "--model", args.model, "--port", str(port)]
-    print("$", subprocess.list2cmdline(command), "&", flush=True)
-    group = (
-        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
-        else {"start_new_session": True}
-    )
     log = root / "desktop.log"
-    with open(log, "wb") as out:
-        desktop = subprocess.Popen(
-            command, cwd=project, env=env, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, **group
-        )
+    desktop = in_background(
+        [*launcher, "desktop", "--webview-dir", str(webview), "--model", args.model, "--port", str(port)],
+        cwd=project, env=env, log=log,
+    )
     checks = []
     output = ""
     try:
-        deadline = time.monotonic() + args.timeout
-        while not healthy(port) and desktop.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.5)
-        checks.append((healthy(port), "the desktop bridge did not come up"))
+        checks.append((wait_healthy(desktop, port, args.timeout), "the desktop bridge did not come up"))
         enabled = config.read_text(encoding="utf-8")
         provider = "openai" if args.shared else "excel-bridge"
         checks.append((f"model_provider = '{provider}'" in enabled
@@ -362,25 +402,13 @@ def run_desktop(launcher, args, root: Path, webview: Path, project: Path, env: d
                        "config.toml was not pointed at the bridge"))
         codex = shutil.which("codex", path=env.get("PATH"))
         if codex and healthy(port):
-            codex_env = dict(env)
-            for key in ("NO_PROXY", "no_proxy"):
-                codex_env[key] = ",".join(filter(None, [codex_env.get(key, ""), "127.0.0.1", "localhost"]))
-            result = run([codex, *args.codex_args], cwd=project, env=codex_env, timeout=args.timeout)
+            result = run([codex, *args.codex_args], cwd=project, env=loopback_direct(env), timeout=args.timeout)
             output = result.stdout
             checks.append((result.returncode == 0, f"codex exit code {result.returncode}"))
         else:
             checks.append((False, "codex not found on PATH" if not codex else "skipped codex"))
     finally:
-        if desktop.poll() is None:
-            if sys.platform == "win32":
-                os.kill(desktop.pid, signal.CTRL_BREAK_EVENT)
-            else:
-                os.killpg(desktop.pid, signal.SIGINT)
-        try:
-            code = desktop.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            desktop.kill()
-            code = desktop.wait()
+        code = stop(desktop)
     desktop_output = log.read_text(encoding="utf-8", errors="replace")
     print("--- desktop window\n" + desktop_output)
     backup = config.with_name("config.toml.before-excel-codex")
@@ -413,35 +441,182 @@ def sign_codex_in(home: Path) -> None:
         json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-e2e-not-a-key"}), encoding="utf-8")
 
 
-def migrate_then_resume(launcher, args, webview: Path, project: Path, env: dict) -> tuple[str, list]:
-    """A conversation filed the 0.5.3 way, moved by `threads migrate`, then carried on shared."""
+def migrate_then_resume(launcher, args, root: Path, webview: Path, project: Path, env: dict) -> tuple[str, list]:
+    """A conversation filed the 0.5.3 way, moved into the shared list, then carried on without the bridge's provider."""
     home = Path(env["CODEX_HOME"])
+    # This machine may run a Codex of its own; this run's Codex home is used by nothing else.
+    env = dict(env, EXCEL_BRIDGE_ASSUME_CODEX_QUIT="1")
     first = shlex.split(args.first_launcher) if args.first_launcher else launcher
     output, checks = run_launcher(first, args, webview, project, env)
     args.first_requests = len(args.backend.requests)
     before = codex_threads(home)
-    checks.append((len(before) == 1 and before[0][0] == "excel-bridge",
-                   f"the first conversation should be filed under excel-bridge, got {before}"))
+    checks += [
+        (len(before) == 1 and before[0][0] == "excel-bridge",
+         f"the first conversation should be filed under excel-bridge, got {before}"),
+        (rollout_providers(home) == ["excel-bridge"], "the first conversation's file should name excel-bridge"),
+    ]
     sign_codex_in(home)
-    moved = run([*launcher, "threads", "migrate"], cwd=project, env=env, timeout=120)
-    print(moved.stdout)
+    if args.migrate == "desktop":
+        moved, moved_checks = desktop_moves_them(launcher, args, root, webview, project, env)
+        expected = "Moved 1 conversation(s) from the bridge's own provider into the shared list"
+    else:
+        result = run([*launcher, "threads", "migrate"], cwd=project, env=env, timeout=120)
+        moved, moved_checks = result.stdout, [(result.returncode == 0, f"`threads migrate` exit code {result.returncode}")]
+        expected = "Moved 1 conversation(s) into the list shared"
+    print(moved)
     after = codex_threads(home)
     official = codex_config.codex_model(args.model)
-    checks += [
-        (moved.returncode == 0 and "Moved 1 conversation(s)" in moved.stdout,
-         "`threads migrate` did not move the conversation"),
-        (after == [("openai", official)], f"`threads migrate` should file it as ('openai', {official}), got {after}"),
+    checks += moved_checks + [
+        (expected in moved, "the conversation was not moved"),
+        (after == [("openai", official)], f"it should be filed as ('openai', {official}), got {after}"),
+        (rollout_providers(home) == ["openai"], "its file should name openai now"),
         (len(list(home.glob("state_*.sqlite.before-excel-codex-*"))) == 1, "no copy of Codex's index"),
     ]
     args.shared = True
     args.codex_args = list(RESUME_ARGS)
-    output, resumed = run_launcher(launcher, args, webview, project, env)
+    output, resumed = resume_with_codex_providers_only(launcher, args, root, webview, project, env)
     carried = args.backend.requests[args.first_requests:]
     checks += resumed + [
         (len(carried) == 1 and "bridge-e2e-42" in json.dumps(carried[0]),
-         "`resume --last` did not carry the migrated conversation on"),
+         "`resume --last` did not carry the moved conversation on"),
     ]
     return output, checks
+
+
+def desktop_moves_them(launcher, args, root: Path, webview: Path, project: Path, env: dict) -> tuple[str, list]:
+    """Start `desktop` with Codex quit, then leave it: what it printed, and that it put everything back."""
+    config = Path(env["CODEX_HOME"]) / "config.toml"
+    config.write_bytes(USER_CONFIG.encode())
+    windows_zone = tzutil("/g") if sys.platform == "win32" else None
+    port = free_port()
+    desktop = in_background(
+        [*launcher, "desktop", "--webview-dir", str(webview), "--model", args.model, "--port", str(port)],
+        cwd=project, env=env, log=root / "desktop.log",
+    )
+    try:
+        up = wait_healthy(desktop, port, args.timeout)
+    finally:
+        code = stop(desktop)
+        if windows_zone is not None and tzutil("/g") != windows_zone:
+            tzutil("/s", windows_zone)
+    return _desktop_log(root), [
+        (up, "the desktop bridge did not come up"),
+        (code == 0, f"desktop exit code {code}"),
+        (config.read_bytes() == USER_CONFIG.encode(), "config.toml was not restored exactly"),
+    ]
+
+
+def resume_with_codex_providers_only(launcher, args, root: Path, webview: Path, project: Path,
+                                     env: dict) -> tuple[str, list]:
+    """``codex exec resume --last`` with no ``excel-bridge`` provider, as with the bridge off.
+
+    Codex's ``openai`` provider reaches the bridge through ``serve``, standing
+    in for the official service.  A conversation still filed under
+    ``excel-bridge`` fails here: "Model provider `excel-bridge` not found".
+    """
+    port = free_port()
+    bridge = in_background([*launcher, "serve", "--webview-dir", str(webview), "--port", str(port)],
+                           cwd=project, env=env, log=root / "serve.log")
+    checks = []
+    output = ""
+    try:
+        checks.append((wait_healthy(bridge, port, args.timeout), "`serve` did not come up"))
+        codex = shutil.which("codex", path=env.get("PATH"))
+        if codex and healthy(port):
+            base = ["-c", f"openai_base_url='{codex_config.base_url(port)}'"]
+            # The desktop app opens it through `codex app-server`, which takes the provider from its file.
+            opened, said = app_server_opens(codex, base, codex_thread_ids(Path(env["CODEX_HOME"])),
+                                            project, loopback_direct(env), args.timeout)
+            # `codex exec resume` takes Codex's default model; the desktop app keeps the conversation's.
+            overrides = [*base, "-c", f"model='{codex_config.codex_model(args.model)}'"]
+            result = run(codex_config.codex_command(codex, overrides, args.codex_args),
+                         cwd=project, env=loopback_direct(env), timeout=args.timeout)
+            output = result.stdout
+            checks += [
+                (opened, f"the desktop app's `thread/resume` could not open it: {said}"),
+                (result.returncode == 0, f"codex exit code {result.returncode}"),
+                ("`excel-bridge` not found" not in output, "Codex still looked for the excel-bridge provider"),
+            ]
+        else:
+            checks.append((False, "codex not found on PATH" if not codex else "skipped codex"))
+    finally:
+        stop(bridge)
+    return output, checks
+
+
+def app_server_opens(codex: str, overrides: list[str], thread_ids: list[str], project: Path, env: dict,
+                     timeout: int) -> tuple[bool, str]:
+    """Open the one conversation the way the desktop app does: `codex app-server`, list, `thread/resume`.
+
+    Listing matters: Codex rebuilds each listed row from its conversation file.
+    """
+    if len(thread_ids) != 1:
+        return False, f"expected one conversation, got {thread_ids}"
+    command = [codex, *overrides, "app-server"]
+    print("$", subprocess.list2cmdline(command), flush=True)
+    server = subprocess.Popen(command, cwd=project, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", bufsize=1)
+    lines: queue.Queue = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(line) for line in server.stdout], daemon=True).start()
+
+    def send(message: dict) -> None:
+        server.stdin.write(json.dumps(message) + "\n")
+        server.stdin.flush()
+
+    def call(request_id: int, method: str, params: dict) -> dict:
+        send({"id": request_id, "method": method, "params": params})
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                message = json.loads(lines.get(timeout=1))
+            except (queue.Empty, ValueError):
+                continue
+            if message.get("id") == request_id and "method" not in message:
+                return message
+        raise TimeoutError(method)
+
+    try:
+        call(1, "initialize", {"clientInfo": {"name": "excel-codex-e2e", "title": None, "version": "0"},
+                               "capabilities": None})
+        send({"method": "initialized"})
+        # The desktop app lists its own (interactive) ones; this one was started by `codex exec`.
+        listed = call(2, "thread/list", {"modelProviders": [], "sourceKinds": ["cli", "vscode", "exec"]})
+        reply = call(3, "thread/resume", {"threadId": thread_ids[0], "excludeTurns": True})
+    except (OSError, TimeoutError) as exc:
+        return False, repr(exc)
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+    shown = [(item.get("id"), item.get("modelProvider")) for item in (listed.get("result") or {}).get("data") or []]
+    if shown != [(thread_ids[0], "openai")]:
+        return False, f"listed as {shown}"
+    if "error" in reply:
+        return False, json.dumps(reply["error"])
+    provider = (reply.get("result") or {}).get("modelProvider")
+    return provider == "openai", f"provider {provider}"
+
+
+def codex_thread_ids(home: Path) -> list[str]:
+    found = []
+    for path in sorted(home.glob("state_*.sqlite")):
+        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            found += [row[0] for row in connection.execute("SELECT id FROM threads")]
+        finally:
+            connection.close()
+    return found
+
+
+def rollout_providers(home: Path) -> list[str]:
+    """The provider on the first line of each conversation file in this run's own Codex home."""
+    found = []
+    for path in sorted((home / "sessions").rglob("rollout-*.jsonl")):
+        with path.open(encoding="utf-8") as handle:
+            found.append(json.loads(handle.readline())["payload"].get("model_provider"))
+    return found
 
 
 def codex_threads(home: Path) -> list[tuple[str, str]]:
@@ -476,8 +651,10 @@ def main() -> int:
                         help="also sign Codex in with ChatGPT; `refused` makes the backend turn it down")
     parser.add_argument("--shared", action="store_true",
                         help="sign Codex itself in, so the bridge stands in for its openai provider")
-    parser.add_argument("--migrate", action="store_true",
-                        help="file a conversation the 0.5.3 way, `threads migrate` it, then carry it on shared")
+    parser.add_argument("--migrate", nargs="?", const="command", choices=["command", "desktop"],
+                        help="file a conversation the 0.5.3 way, move it into the shared list (by "
+                        "`threads migrate`, or by starting `desktop`), then carry it on with the bridge's "
+                        "provider gone")
     parser.add_argument("--first-launcher",
                         help="with --migrate: the command that starts that conversation, e.g. a 0.5.3 checkout's")
     parser.add_argument("--timeout", type=int, default=900, help="seconds for each long step")
@@ -527,7 +704,7 @@ def main() -> int:
         args.codex_args += ["-i", str(project / "picture.png")]
     started = time.monotonic()
     if args.migrate:
-        output, checks = migrate_then_resume(launcher, args, webview, project, env)
+        output, checks = migrate_then_resume(launcher, args, root, webview, project, env)
     elif args.desktop:
         output, checks = run_desktop(launcher, args, root, webview, project, env)
     else:

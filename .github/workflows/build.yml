@@ -75,8 +75,10 @@ jobs:
         run: python tests/e2e/run_e2e.py --shared -- ./excel-codex.sh
       - name: e2e (excel-codex.sh desktop, conversations shared with Codex's own sign-in)
         run: python tests/e2e/run_e2e.py --desktop --shared -- ./excel-codex.sh
-      - name: e2e (excel-codex.sh, conversations from 0.5.3 and earlier moved by threads migrate)
+      - name: e2e (excel-codex.sh, the bridge's own conversations moved by threads migrate)
         run: python tests/e2e/run_e2e.py --migrate -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh desktop, the bridge's own conversations moved at start)
+        run: python tests/e2e/run_e2e.py --migrate desktop -- ./excel-codex.sh
 
   windows:
     needs: test
@@ -126,8 +128,10 @@ jobs:
         run: python tests/e2e/run_e2e.py --shared -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.exe desktop, conversations shared with Codex's own sign-in)
         run: python tests/e2e/run_e2e.py --desktop --shared -- dist/excel-codex/excel-codex.exe
-      - name: e2e (excel-codex.exe, conversations from 0.5.3 and earlier moved by threads migrate)
+      - name: e2e (excel-codex.exe, the bridge's own conversations moved by threads migrate)
         run: python tests/e2e/run_e2e.py --migrate -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe desktop, the bridge's own conversations moved at start)
+        run: python tests/e2e/run_e2e.py --migrate desktop -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.cmd)
         run: python tests/e2e/run_e2e.py -- excel-codex.cmd
 
