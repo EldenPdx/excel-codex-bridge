@@ -1,22 +1,22 @@
-升级后模型菜单变回旧版时说清原因、手动 serve 跟着更新模型列表 · Says why the model menu is an old one after an update; manual serve updates the model list
+压缩长对话、写长工具调用时不再报 idle timeout waiting for SSE · No more "idle timeout waiting for SSE" during long compactions and long tool calls
 
 > **非官方项目**，与 OpenAI、Microsoft 无关联。使用加载项后端可能违反 OpenAI 服务条款，风险自负。
 > **Unofficial.** Not affiliated with OpenAI or Microsoft. Using the add-in's backend may violate OpenAI's terms; use at your own risk.
 
 ## 变化
 
-- **升级后模型菜单还是旧的，现在能看出原因**：桌面版只在启动时读取模型列表，从没在托盘里完全退出过的话，
-  升级后菜单里还是旧版的模型（比如 0.5.1 及更早版本只有 5.6-Sol、6-Astra、5.6-Terra、5.6-Luna，没有 6-Sol、
-  6-Luna 和 1M 版）。现在桥接窗口启动时看到 Codex 在运行，会提示先从托盘退出再打开；窗口里
-  `now use the Excel bridge 0.5.15` 这一行写着正在运行的版本，打开的是旧文件夹里的旧版时一眼就能看出来。
-- **全手动用法（`serve` + `print-config`）升级后模型列表跟着更新**：以前 `serve` 不更新 `print-config`
-  片段指向的模型列表文件，菜单一直停在当初运行 `print-config` 的那个版本；现在 `serve` 每次启动都会更新它。
+- **压缩长对话、写长工具调用、后端迟迟不开始回复时，不再报 `idle timeout waiting for SSE`**：Codex 连续
+  5 分钟没收到任何数据就当作断线，显示“正在重新连接 x/5”重发请求，每次重发又要等 5 分钟，最后报
+  `stream disconnected before completion: idle timeout waiting for SSE`。以前桥接只在模型思考时每 15 秒告诉
+  Codex 还在进行；压缩请求（不带工具）、写到一半被桥接暂扣的工具调用、后端还没开始回复这三种时候，桥接
+  什么都不发。现在这些时候也照样每 15 秒告诉 Codex 还在进行。
 - 详见 README 的
   [在 Codex 桌面版 / IDE 插件中使用](https://github.com/Kaixxrua/excel-codex-bridge#在-codex-桌面版--ide-插件中使用)。
 
 0.5.13 起双击 `excel-codex-desktop.cmd` 会自动装上这一版；0.5.12 及更早的版本需要手动下载替换一次。
 
-0.5.14 的变化（中转站 / Cockpit 下不再报 `exec is not a tool in the catalog`）见
+0.5.15 的变化（升级后模型菜单还是旧的时说清原因、手动 `serve` 跟着更新模型列表）见
+[v0.5.15 发布说明](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.15)；0.5.14 的变化（中转站 / Cockpit 下不再报 `exec is not a tool in the catalog`）见
 [v0.5.14 发布说明](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.14)；0.5.13 的变化（双击 `excel-codex-desktop.cmd` 自动更新）见
 [v0.5.13 发布说明](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.13)；0.5.12 的变化（子代理不再报加密内容无法解码、老会话的工具调用不再越错越多）见
 [v0.5.12 发布说明](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.12)；0.5.11 的变化（桌面版不再卡加载、网络闪断自动重连、长对话不再报请求过大、系统时区不再来回跳）见
@@ -31,18 +31,18 @@
 
 ## 下载
 
-- **Windows**：`excel-codex-bridge-0.5.15-windows-x64.zip`。解压后双击 `excel-codex.exe` 打开 Codex CLI，
+- **Windows**：`excel-codex-bridge-0.5.16-windows-x64.zip`。解压后双击 `excel-codex.exe` 打开 Codex CLI，
   双击 `excel-codex-desktop.cmd` 给桌面版用。
-- **macOS（Apple 芯片）**：`excel-codex-bridge-0.5.15-macos-arm64.tar.gz`
-- **macOS（Intel）**：`excel-codex-bridge-0.5.15-macos-x64.tar.gz`
+- **macOS（Apple 芯片）**：`excel-codex-bridge-0.5.16-macos-arm64.tar.gz`
+- **macOS（Intel）**：`excel-codex-bridge-0.5.16-macos-x64.tar.gz`
 - **Linux / WSL 或从源码运行**：下载 Source code，使用 `excel-codex.sh`（需要 Python 3.10+）。
-- **Linux / VPS 的 SUB2API 部署**：下载本版本 Source code，按 [部署文档](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.15/docs/sub2api.md) 构建 `packaging/sub2api/compose.yaml`。
+- **Linux / VPS 的 SUB2API 部署**：下载本版本 Source code，按 [部署文档](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.16/docs/sub2api.md) 构建 `packaging/sub2api/compose.yaml`。
 
 macOS 推荐在终端用 `curl` 下载，这样不会被"无法验证开发者"拦下（Intel 芯片把 `arm64` 换成 `x64`）：
 
 ```
-curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.15/excel-codex-bridge-0.5.15-macos-arm64.tar.gz | tar xz
-./excel-codex-bridge-0.5.15-macos-arm64/excel-codex status
+curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.16/excel-codex-bridge-0.5.16-macos-arm64.tar.gz | tar xz
+./excel-codex-bridge-0.5.16-macos-arm64/excel-codex status
 ```
 
 用浏览器下载的，解压后先运行一次 `xattr -dr com.apple.quarantine <解压出的目录>`。
@@ -59,23 +59,22 @@ curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.1
 
 ## Changes
 
-- **Why the model menu is an old one after an update now shows**: the desktop app reads the model
-  list only when it starts, so one never fully quit from the tray keeps an older release's models
-  after an update (0.5.1 and earlier, for instance, list only 5.6-Sol, 6-Astra, 5.6-Terra and
-  5.6-Luna, without 6-Sol, 6-Luna and the 1M versions). The bridge window now says to quit it from the
-  tray and open it again when it starts while it sees Codex running, and its
-  `now use the Excel bridge 0.5.15` line names the release it runs, which shows at a glance when an old
-  folder's copy was opened.
-- **Fully manual use (`serve` plus `print-config`) gets the new model list after an update**: `serve`
-  did not update the model list file the `print-config` lines point at, so the menu stayed at the
-  release `print-config` was run with; `serve` now updates it each time it starts.
+- **No more `idle timeout waiting for SSE` while a long conversation is compacted, the model writes a
+  long tool call, or the backend is slow to start answering**: Codex takes five minutes without any data
+  as a broken connection, shows "Reconnecting x/5" and sends the request again, which waits five minutes of
+  its own, and in the end fails with `stream disconnected before completion: idle timeout waiting for SSE`.
+  The bridge told Codex every 15 seconds that the answer was still going only while the model thought; for
+  a compaction (which declares no tools), a tool call it holds back until whole, and a backend yet to start
+  answering, it sent nothing. Now it tells Codex then too.
 - See [Codex desktop app / IDE extension](https://github.com/Kaixxrua/excel-codex-bridge/blob/main/README.en.md#codex-desktop-app--ide-extension)
   in the README.
 
 From 0.5.13, double-clicking `excel-codex-desktop.cmd` installs this release by itself; 0.5.12 and
 earlier need it downloaded and replaced by hand once.
 
-For 0.5.14's changes (no more `exec is not a tool in the catalog` through relays and Cockpit), see the
+For 0.5.15's changes (saying why the model menu is an old one after an update, manual `serve` updating
+the model list), see the
+[v0.5.15 release notes](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.15); for 0.5.14's changes (no more `exec is not a tool in the catalog` through relays and Cockpit), see the
 [v0.5.14 release notes](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.14); for 0.5.13's changes (`excel-codex-desktop.cmd` updating itself), see the
 [v0.5.13 release notes](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.13); for 0.5.12's changes (subagents getting their task as text, older conversations no longer failing tool
 calls more and more), see the
@@ -93,19 +92,19 @@ the [v0.5.4 release notes](https://github.com/Kaixxrua/excel-codex-bridge/releas
 
 ## Download
 
-- **Windows**: `excel-codex-bridge-0.5.15-windows-x64.zip`. Double-click `excel-codex.exe` for the
+- **Windows**: `excel-codex-bridge-0.5.16-windows-x64.zip`. Double-click `excel-codex.exe` for the
   Codex CLI, or `excel-codex-desktop.cmd` for the desktop app.
-- **macOS (Apple silicon)**: `excel-codex-bridge-0.5.15-macos-arm64.tar.gz`
-- **macOS (Intel)**: `excel-codex-bridge-0.5.15-macos-x64.tar.gz`
+- **macOS (Apple silicon)**: `excel-codex-bridge-0.5.16-macos-arm64.tar.gz`
+- **macOS (Intel)**: `excel-codex-bridge-0.5.16-macos-x64.tar.gz`
 - **Linux / WSL, or from source**: download the source code and use `excel-codex.sh` (Python 3.10+).
-- **Linux / VPS with SUB2API**: download this release's source and follow the [deployment guide](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.15/docs/sub2api.en.md).
+- **Linux / VPS with SUB2API**: download this release's source and follow the [deployment guide](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.16/docs/sub2api.en.md).
 
 On a Mac, downloading with `curl` avoids the "developer cannot be verified" block (Intel: replace
 `arm64` with `x64`):
 
 ```
-curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.15/excel-codex-bridge-0.5.15-macos-arm64.tar.gz | tar xz
-./excel-codex-bridge-0.5.15-macos-arm64/excel-codex status
+curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.16/excel-codex-bridge-0.5.16-macos-arm64.tar.gz | tar xz
+./excel-codex-bridge-0.5.16-macos-arm64/excel-codex status
 ```
 
 If you downloaded with a browser, run `xattr -dr com.apple.quarantine <extracted folder>` once.

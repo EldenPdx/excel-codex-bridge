@@ -287,6 +287,16 @@ reload IDE windows that use Codex, then open Codex again and it uses the officia
 window says so when it closes; closed with Ctrl+C while it still sees a Codex process, it adds
 `Codex is still running right now`.
 
+**After a few minutes a turn fails with `stream disconnected before completion: idle timeout waiting
+for SSE` and "Reconnecting x/5"**: Codex takes five minutes without any data as a broken connection and
+sends the request again, which then waits five minutes of its own. Up to 0.5.15 the bridge left it waiting
+three ways: while a long conversation was compacted (a compaction declares no tools, and the bridge did
+not tell Codex it was still going), while the model wrote a long tool call (passed on only once whole),
+and while the backend took the request but was slow to start answering. From 0.5.16 the bridge tells
+Codex every 15 seconds that the answer is still going then too; update. If it still happens, check whether
+the bridge window is paused: clicking into a console window on Windows starts selecting text (the title
+starts with "Select"), and the bridge stops at its next log line until Esc or Enter.
+
 **After an update the model menu is the old one: only 5.6-Sol, 6-Astra, 5.6-Terra and 5.6-Luna,
 without 6-Sol, 6-Luna and the 1M versions**. That is the model list of 0.5.1 and earlier. The
 desktop app reads the model list only when it starts. Common causes:
