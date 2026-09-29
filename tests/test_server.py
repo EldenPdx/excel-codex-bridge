@@ -204,6 +204,30 @@ class SharedProviderTests(unittest.TestCase):
         self.assertIn("hello", texts)
         self.assertIn("again", texts)
 
+    def test_message_another_backend_encrypted_is_replaced_once(self):
+        sealed = "gAAAAA" + "B" * 80
+        body = self.conversation()
+        body["input"] = [item for item in body["input"] if item["type"] != "reasoning"]
+        body["input"].insert(1, {
+            "type": "agent_message", "author": "/root", "recipient": "/root/helper",
+            "content": [{"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
+                        {"type": "encrypted_content", "encrypted_content": sealed}],
+        })
+        answers = iter([
+            httpx.Response(400, json={"error": {"message": "Encrypted content could not be decrypted."}}),
+            ok_stream(None),
+        ])
+        harness = BridgeHarness(lambda _r: next(answers))
+        with self.assertLogs("excel_codex_bridge", "WARNING"):
+            response = harness.request("POST", "/v1/responses", json=body)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(harness.upstream_requests), 2)
+        self.assertIn(sealed, json.dumps(harness.upstream_json(0)["input"]))
+        retried = json.dumps(harness.upstream_json(1)["input"])
+        self.assertNotIn(sealed, retried)
+        self.assertIn("encrypted message from another backend", retried)
+        self.assertIn("NEW_TASK", retried)
+
     def test_other_400s_are_not_retried(self):
         harness = BridgeHarness(lambda _r: httpx.Response(400, json={"error": {"message": "bad input"}}))
         response = harness.request("POST", "/v1/responses", json=self.conversation())

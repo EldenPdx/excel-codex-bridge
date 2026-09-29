@@ -110,12 +110,21 @@ _TOOL_CALL_PATTERN = re.compile(
 )
 _JSON_ESCAPE_CHARS = frozenset('\"\\/bfnrt')
 _TRANSPORT_RETRY_GUIDANCE = (
-    "The previous run_officejs relay was rejected because its transport envelope was malformed. "
+    "The previous run_officejs relay was rejected: {reason}. "
     "Retry once with exactly one outer run_officejs call. Its code field is JSON text, not "
     "JavaScript or OfficeJS, and must contain one catalog-tool object; do not put another "
     "run_officejs wrapper inside it. Serialize the inner JSON before placing it in code, "
     "including any backslashes or quotes in shell commands, and do not repeat the identical payload."
 )
+_MALFORMED_TRANSPORT = "its transport envelope was malformed"
+# Codex takes the message of a collaboration call (spawn_agent, send_message,
+# followup_task) for content the backend encrypted unless the call says its
+# arguments are plain text, and hands it on to the other agent as such; the
+# backend then cannot decrypt it.  Every call the bridge makes has plain arguments.
+PLAIN_ARGUMENTS = "encrypted_function_args"
+# What the Responses API encrypts (reasoning, agent messages) is a Fernet token.
+_SEALED = re.compile(r"gAAAAA[A-Za-z0-9_\-]{40,}={0,2}")
+_SEALED_ELSEWHERE = "(an encrypted message from another backend, which cannot be read here)"
 RESPONSES_URL = os.environ.get(
     "GHCP_EXCEL_RESPONSES_URL",
     "https://bps.openai.com/basispoints/api/responses",
@@ -819,6 +828,7 @@ def _client_call_from_native(
                 separators=(",", ":"),
                 ensure_ascii=False,
             ),
+            PLAIN_ARGUMENTS: [],
         }
         if tool_info["namespace"]:
             result["namespace"] = tool_info["namespace"]
@@ -1046,6 +1056,7 @@ def extract_client_tool_call(
                 separators=(",", ":"),
                 ensure_ascii=False,
             ),
+            PLAIN_ARGUMENTS: [],
         }
     if tool_type == "custom":
         custom_input = marker.get("input")
@@ -1432,13 +1443,86 @@ def _item_text(value: object) -> str:
     return ""
 
 
+def _sealed(text: object) -> bool:
+    return isinstance(text, str) and _SEALED.fullmatch(text.strip()) is not None
+
+
+def _readable_parts(parts: list, *, sealed_too: bool = False) -> list:
+    """``parts`` with ``encrypted_content`` that is plain text as ``input_text``.
+
+    Codex labels a message the model sent another agent as encrypted unless
+    the call said its arguments were plain (bridges up to 0.5.11 did not), and
+    keeps it so in the conversation.  ``sealed_too`` also replaces what really
+    is encrypted, which only the backend that encrypted it can read.
+    """
+    readable = []
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "encrypted_content":
+            text = part.get("encrypted_content")
+            if not _sealed(text):
+                part = {"type": "input_text", "text": text if isinstance(text, str) else ""}
+            elif sealed_too:
+                part = {"type": "input_text", "text": _SEALED_ELSEWHERE}
+        readable.append(part)
+    return readable
+
+
+def _decoded_arguments(value: object) -> object:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    return value
+
+
+def _transport_failure(item: dict, allowed_tools: dict[str, str] | None) -> str:
+    """Why a run_officejs call of the model's could not become one of Codex's tools."""
+    arguments = _decoded_arguments(item.get("arguments"))
+    if not isinstance(arguments, dict):
+        return "its arguments were not a JSON object"
+    envelope = _decode_transport_code(arguments.get("code"))
+    wrappers = 0
+    while envelope is not None and _is_transport_name(envelope.get("name")):
+        wrappers += 1
+        nested = _decoded_arguments(envelope.get("arguments"))
+        if not isinstance(nested, dict):
+            return "a run_officejs wrapper inside its code field had no JSON object as arguments"
+        envelope = _decode_transport_code(nested.get("code"))
+    if envelope is None:
+        return "its code field did not hold a JSON object"
+    if wrappers > 2:
+        return "it wrapped run_officejs inside run_officejs more than twice"
+    name = envelope.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return "the object in its code field named no tool"
+    name = name.strip()
+    tools = allowed_tools or {}
+    tool = _original_client_tool_name(name, tools)
+    if tool is None:
+        namespaced = sorted(key for key in tools if key.rsplit(".", 1)[-1] == name)
+        return f"{name} is not a tool in the catalog" + (
+            f"; the catalog calls it {namespaced[0]}" if namespaced else ""
+        )
+    if tools[tool] == "custom":
+        if not isinstance(envelope.get("input"), str):
+            return f"{tool} is a custom tool: its text goes in input, as a string, not in arguments"
+        return _MALFORMED_TRANSPORT
+    if not isinstance(_decoded_arguments(envelope.get("arguments")), dict):
+        return f"the arguments for {tool} were not a JSON object"
+    return f"its arguments did not match the parameters of {tool}"
+
+
 def _normalized_tool_output(
     item: dict,
     call_origins: dict[str, str],
+    transport_failures: dict[str, str] | None = None,
 ) -> dict:
     call_id = item.get("call_id")
     origin = call_origins.get(call_id) if isinstance(call_id, str) else None
     normalized = item
+    if isinstance(normalized.get("output"), list):
+        normalized = {**normalized, "output": _readable_parts(normalized["output"])}
     if origin == "update_plan":
         # The Basispoints update_plan executor returns this object. Codex's
         # client-side status tool instead returns the display string
@@ -1465,7 +1549,8 @@ def _normalized_tool_output(
         origin == CLIENT_TOOL_TRANSPORT_NAME
         and output_text.strip().lower().startswith("unsupported call: run_officejs")
     ):
-        return {**normalized, "output": _TRANSPORT_RETRY_GUIDANCE}
+        reason = (transport_failures or {}).get(call_id, _MALFORMED_TRANSPORT)
+        return {**normalized, "output": _TRANSPORT_RETRY_GUIDANCE.format(reason=reason)}
     if not output_text.strip() and isinstance(
         normalized.get("output"), (str, type(None))
     ):
@@ -1477,7 +1562,11 @@ def _normalized_tool_output(
 
 def _fallback_transport_call(item: dict) -> dict:
     """Rebuild a transport call if the proxy restarted between call and result."""
-    name = str(item.get("name") or "")
+    # The catalog names a namespaced tool (collaboration.spawn_agent) the way the model must.
+    namespace = item.get("namespace")
+    name = _client_tool_key(
+        str(item.get("name") or ""), namespace if isinstance(namespace, str) and namespace else None
+    )
     if item.get("type") == "custom_tool_call":
         envelope: dict[str, object] = {
             "name": name,
@@ -1527,12 +1616,16 @@ def _strip_client_only_item_metadata(item: dict) -> dict:
 
     Native calls remembered from the Basispoints response bypass this helper
     and are replayed exactly, preserving the server item identity required by
-    encrypted reasoning.
+    encrypted reasoning.  An empty ``encrypted_function_args`` is the bridge's
+    own mark on the calls it gave Codex, not the backend's.
     """
-    if "internal_chat_message_metadata_passthrough" not in item:
+    plain_mark = item.get(PLAIN_ARGUMENTS) == []
+    if "internal_chat_message_metadata_passthrough" not in item and not plain_mark:
         return item
     sanitized = dict(item)
     sanitized.pop("internal_chat_message_metadata_passthrough", None)
+    if plain_mark:
+        sanitized.pop(PLAIN_ARGUMENTS)
     return sanitized
 
 
@@ -1564,6 +1657,7 @@ def translate_input_items(
         return []
 
     call_origins: dict[str, str] = {}
+    transport_failures: dict[str, str] = {}
     result: list = []
     for item in raw_input:
         if not isinstance(item, dict):
@@ -1588,6 +1682,20 @@ def translate_input_items(
                 if isinstance(call_id, str):
                     call_origins[call_id] = upstream_name
                 result.append({**item, "name": upstream_name})
+            elif _is_transport_name(name):
+                # A relay call of the model's that did not become a Codex tool
+                # reached Codex as it was; wrapping it again would nest it.
+                if isinstance(call_id, str):
+                    call_origins[call_id] = CLIENT_TOOL_TRANSPORT_NAME
+                    transport_failures[call_id] = _transport_failure(item, allowed_tools)
+                leaked = {
+                    **item,
+                    "type": "function_call",
+                    "name": CLIENT_TOOL_TRANSPORT_NAME,
+                    "id": item.get("id") or responses_replay_ids.function_item_id(str(call_id or "")),
+                }
+                leaked.pop("namespace", None)
+                result.append(leaked)
             elif isinstance(name, str) and name:
                 if name == "update_plan":
                     if isinstance(call_id, str):
@@ -1610,7 +1718,10 @@ def translate_input_items(
                 result.append(item)
             continue
         if item_type in {"function_call_output", "custom_tool_call_output"}:
-            result.append(_normalized_tool_output(item, call_origins))
+            result.append(_normalized_tool_output(item, call_origins, transport_failures))
+            continue
+        if item_type == "agent_message" and isinstance(item.get("content"), list):
+            result.append({**item, "content": _readable_parts(item["content"])})
             continue
         if item_type == "reasoning":
             encrypted = item.get("encrypted_content")
@@ -1629,16 +1740,32 @@ def translate_input_items(
     return result
 
 
-def without_encrypted_reasoning(body: dict) -> dict:
-    """``body`` without its encrypted reasoning items; ``body`` itself when it has none."""
+def without_sealed_content(body: dict) -> dict:
+    """``body`` without what another backend encrypted; ``body`` itself when it has none.
+
+    Encrypted reasoning items are left out.  An encrypted message between
+    agents, or in a tool's output, is replaced by a note saying so, since the
+    conversation has to keep the item.
+    """
     items = body.get("input")
     if not isinstance(items, list):
         return body
-    kept = [
-        item for item in items
-        if not (isinstance(item, dict) and item.get("type") == "reasoning" and item.get("encrypted_content"))
-    ]
-    return body if len(kept) == len(items) else {**body, "input": kept}
+    changed = False
+    kept = []
+    for item in items:
+        if isinstance(item, dict):
+            if item.get("type") == "reasoning" and item.get("encrypted_content"):
+                changed = True
+                continue
+            key = "content" if item.get("type") == "agent_message" else "output"
+            parts = item.get(key)
+            if isinstance(parts, list):
+                readable = _readable_parts(parts, sealed_too=True)
+                if readable != parts:
+                    changed = True
+                    item = {**item, key: readable}
+        kept.append(item)
+    return {**body, "input": kept} if changed else body
 
 
 def _conversation_fingerprint(input_items: list) -> str:

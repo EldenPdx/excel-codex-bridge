@@ -788,13 +788,14 @@ class Bridge:
         response = await self._send_once(headers, body, original)
         if response.status_code != 400 or "encrypted content" not in _error_text(response).lower():
             return response
-        # A conversation that went on with the bridge off carries reasoning another
-        # backend encrypted; without it the history still reads the same.
-        kept = excel_upstream.without_encrypted_reasoning(body)
+        # A conversation that went on with the bridge off carries reasoning (and
+        # messages between agents) another backend encrypted; without them the
+        # history still reads the same.
+        kept = excel_upstream.without_sealed_content(body)
         if kept is body:
             return response
         log.warning(
-            "the Excel backend could not read reasoning from another backend (%s); "
+            "the Excel backend could not read what another backend encrypted (%s); "
             "sending the conversation without it",
             _error_text(response),
         )

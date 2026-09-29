@@ -54,11 +54,16 @@ add-in does, and name it by its file id from then on.
 ``--network-drop`` cuts every connection to the backend for a while after the
 first, the way a proxy node that went away does: the bridge must keep trying,
 and Codex must see an answer, not the drop.
+
+``--subagent`` turns on Codex's ``multi_agent_v2`` and has the first answer
+also spawn a helper agent (``collaboration.spawn_agent``).  The helper must be
+given the task as text: labelled encrypted, the backend could not read it.
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import contextlib
 import datetime as dt
@@ -175,6 +180,8 @@ def transport_call(n: int, name: str, arguments: dict) -> dict:
 
 
 IMAGE_PROMPT = "a blue whale in a spreadsheet"
+# --subagent: what the model asks the helper it spawns to do.
+SUBAGENT_TASK = "Count the rows of the sheet and say subagent-task-e2e."
 EXIT_IP = "1.1.1.1"
 
 
@@ -186,8 +193,11 @@ def exit_zone_for(now: dt.datetime) -> str:
 class FakeExcelBackend:
     def __init__(self, parallel: bool = False, imagegen: bool = False, refuse: str | None = None,
                  exit_zone: str = "Pacific/Kiritimati", rate_limited: int = 0,
-                 rate_limited_for: float = 0.0) -> None:
+                 rate_limited_for: float = 0.0, subagent: bool = False) -> None:
         self.requests: list[dict] = []
+        # With subagent: the helper's own requests, kept apart since they come alongside the rest.
+        self.helper_requests: list[dict] = []
+        helper_asked = asyncio.Event()
         # Requests failed on the shared tokens-per-minute limit, before any other is answered:
         # the first ``rate_limited``, and all in the first ``rate_limited_for`` seconds.
         self.limited: list[dict] = []
@@ -264,9 +274,20 @@ class FakeExcelBackend:
                         yield event
 
                 return StreamingResponse(failing(), media_type="text/event-stream")
+            if subagent and any(isinstance(item, dict) and item.get("type") == "agent_message"
+                                and str(item.get("recipient", "")).endswith("/helper")
+                                for item in body.get("input", [])):
+                self.helper_requests.append(body)
+                helper_asked.set()
+                return StreamingResponse(iter(message_events("helper", "helper done", body.get("model"))),
+                                         media_type="text/event-stream")
             n = next(counter)
             self.requests.append(body)
             raw = json.dumps(body)
+            if subagent and n > 1:
+                # A turn over before the helper asks anything ends it with Codex.
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(helper_asked.wait(), 60)
             if n == 1:
                 name, arguments = shell_call(raw)
                 self.shell_tool = name
@@ -275,6 +296,9 @@ class FakeExcelBackend:
                     items = [transport_call(1, "image_gen.imagegen", {"prompt": IMAGE_PROMPT})]
                 if parallel:
                     items.append(transport_call(2, *shell_call(raw, SECOND_PROBE)))
+                if subagent:
+                    items.append(transport_call(len(items) + 1, "collaboration.spawn_agent",
+                                                {"message": SUBAGENT_TASK, "task_name": "helper"}))
                 events = [sse("response.created", {"type": "response.created",
                               "response": {"id": "resp_1", "status": "in_progress", "output": []}})]
                 for index, item in enumerate(items):
@@ -298,23 +322,7 @@ class FakeExcelBackend:
                 if imagegen:
                     seen = f"data:image/png;base64,{self.drawn}" in raw
                 text = "done: tool output seen" if seen else "done: tool output MISSING"
-                msg = {"type": "message", "id": f"msg_{n}", "role": "assistant", "status": "completed",
-                       "content": [{"type": "output_text", "text": text, "annotations": []}]}
-                events = [
-                    sse("response.created", {"type": "response.created",
-                        "response": {"id": f"resp_{n}", "status": "in_progress", "output": []}}),
-                    sse("response.output_item.added", {"type": "response.output_item.added", "output_index": 0,
-                        "item": {**msg, "content": [], "status": "in_progress"}}),
-                    sse("response.output_text.delta", {"type": "response.output_text.delta", "output_index": 0,
-                        "item_id": msg["id"], "content_index": 0, "delta": text}),
-                    sse("response.output_text.done", {"type": "response.output_text.done", "output_index": 0,
-                        "item_id": msg["id"], "content_index": 0, "text": text}),
-                    sse("response.output_item.done", {"type": "response.output_item.done",
-                        "output_index": 0, "item": msg}),
-                    sse("response.completed", {"type": "response.completed", "response": {
-                        "id": f"resp_{n}", "status": "completed", "model": body.get("model"),
-                        "output": [msg], "usage": USAGE}}),
-                ]
+                events = message_events(n, text, body.get("model"))
 
             async def stream():
                 for event in events:
@@ -328,6 +336,26 @@ class FakeExcelBackend:
             return JSONResponse({"error": {"message": "not here"}}, status_code=404)
 
         self.app = app
+
+
+def message_events(n: object, text: str, model: object) -> list[bytes]:
+    msg = {"type": "message", "id": f"msg_{n}", "role": "assistant", "status": "completed",
+           "content": [{"type": "output_text", "text": text, "annotations": []}]}
+    return [
+        sse("response.created", {"type": "response.created",
+            "response": {"id": f"resp_{n}", "status": "in_progress", "output": []}}),
+        sse("response.output_item.added", {"type": "response.output_item.added", "output_index": 0,
+            "item": {**msg, "content": [], "status": "in_progress"}}),
+        sse("response.output_text.delta", {"type": "response.output_text.delta", "output_index": 0,
+            "item_id": msg["id"], "content_index": 0, "delta": text}),
+        sse("response.output_text.done", {"type": "response.output_text.done", "output_index": 0,
+            "item_id": msg["id"], "content_index": 0, "text": text}),
+        sse("response.output_item.done", {"type": "response.output_item.done",
+            "output_index": 0, "item": msg}),
+        sse("response.completed", {"type": "response.completed", "response": {
+            "id": f"resp_{n}", "status": "completed", "model": model,
+            "output": [msg], "usage": USAGE}}),
+    ]
 
 
 RATE_LIMITED = ("Rate limit reached for gpt-5.6-sol in organization org-e2e on tokens per min (TPM): "
@@ -871,6 +899,8 @@ def main() -> int:
                         help="fail the first two requests on the shared tokens-per-minute limit, or (long) "
                         f"all in the first {LONG_RATE_LIMIT_SECONDS} s with Codex dropping a stream silent for "
                         f"{CODEX_IDLE_MS // 1000} s; the bridge waits them out")
+    parser.add_argument("--subagent", action="store_true",
+                        help="also spawn a helper agent (Codex's multi_agent_v2); it must get the task as text")
     parser.add_argument("--network-drop", action="store_true",
                         help=f"cut every connection to the backend for {NETWORK_DROP_SECONDS} s after the first; "
                         "the bridge keeps trying")
@@ -902,7 +932,8 @@ def main() -> int:
     backend = FakeExcelBackend(parallel=args.parallel, imagegen=args.imagegen,
                                refuse="e2e-codex-account" if args.codex_login == "refused" else None,
                                exit_zone=exit_zone, rate_limited=2 if args.rate_limited == "briefly" else 0,
-                               rate_limited_for=LONG_RATE_LIMIT_SECONDS if args.rate_limited == "long" else 0)
+                               rate_limited_for=LONG_RATE_LIMIT_SECONDS if args.rate_limited == "long" else 0,
+                               subagent=args.subagent)
     server, port = start_server(backend.app)
     gate = Gate(port, NETWORK_DROP_SECONDS) if args.network_drop else None
 
@@ -923,6 +954,8 @@ def main() -> int:
     args.codex_args = list(CODEX_ARGS)
     if args.rate_limited == "long":
         args.codex_args[-1:-1] = ["-c", f"model_providers.excel-bridge.stream_idle_timeout_ms={CODEX_IDLE_MS}"]
+    if args.subagent:
+        args.codex_args[-1:-1] = ["-c", "features.multi_agent_v2=true"]
     args.backend, args.first_requests = backend, 0
     picture = png()
     if args.images:
@@ -979,7 +1012,8 @@ def main() -> int:
     if args.shared:
         threads = codex_threads(Path(env["CODEX_HOME"]))
         official = codex_config.codex_model(args.model)
-        checks.append((threads == [("openai", official)],
+        # A helper agent is a conversation of its own.
+        checks.append((threads == [("openai", official)] * (2 if args.subagent else 1),
                        f"the conversation should be filed as the official sign-in files it, got {threads}"))
     if args.parallel and len(backend.requests) >= 2:
         replayed = [(item.get("type"), item.get("call_id") if item.get("type") == "function_call_output"
@@ -1042,6 +1076,21 @@ def main() -> int:
              "the bridge did not say it was waiting"),
             (not any(said in output.lower() for said in ("rate limit", "reconnecting", "disconnected")),
              "Codex saw the rate limit, or gave up on the stream"),
+        ]
+    if args.subagent:
+        # Codex labels the task encrypted unless the call says its arguments are
+        # plain; the backend then cannot read it ("encrypted content ... could not be decoded").
+        told = [part for body in backend.helper_requests for item in body.get("input", [])
+                if isinstance(item, dict) and item.get("type") == "agent_message"
+                for part in item.get("content", []) if isinstance(part, dict)]
+        checks += [
+            (bool(backend.requests) and "collaboration.spawn_agent" in json.dumps(backend.requests[0]),
+             "Codex did not offer spawn_agent"),
+            (bool(backend.helper_requests), "the helper never asked the backend anything"),
+            (any(part.get("type") == "input_text" and SUBAGENT_TASK in part.get("text", "") for part in told),
+             f"the helper was not given the task as text: {told}"),
+            (not any(part.get("type") == "encrypted_content" for part in told),
+             f"the helper was given the task as encrypted content: {told}"),
         ]
     if gate:
         bridge_log = root / "bridge-home" / "bridge.log"

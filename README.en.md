@@ -516,6 +516,35 @@ bps.openai.com (ConnectError)`. From 0.5.11 the bridge keeps trying itself:
 - `EXCEL_BRIDGE_CONNECT_WAIT=<seconds>` sets how long to keep trying: `120` by default, at most
   `1800`; `0` for no second try, the error then reaching Codex as it came.
 
+## Subagents
+
+Codex's subagents (multi-agent v2's `collaboration.spawn_agent` / `send_message` / `followup_task`)
+work. 0.5.11 and earlier had two problems with them, more often in older conversations:
+
+- **The subagent fails with "encrypted content could not be decoded"**: the calls the bridge passed on
+  did not say their arguments were plain text, so Codex labelled the task it gave the subagent as
+  encrypted content, which the Excel backend cannot decrypt. Those messages stay in the conversation,
+  so an older conversation kept failing, while a new one that had not used a subagent did not.
+- **Tool calls failing more and more often**: when the bridge cannot recall the original call (after a
+  restart, or under SUB2API when many users push it out of the cache) it rebuilds it, and it dropped the
+  `collaboration.` prefix, or wrapped a `run_officejs` call the model got wrong in another one. The model
+  copies its history, so it went wrong more and more, told only that the format was wrong.
+
+From 0.5.12:
+
+- Every call the bridge passes on says its arguments are plain text, so the subagent gets its task as
+  text.
+- Messages an older conversation has labelled encrypted go to the backend as text again; no need for a
+  new conversation.
+- A rebuilt call keeps the tool's full name; a call that could not be converted is replayed as it was,
+  not wrapped again, and the model is told what exactly was wrong (say, "`spawn_agent` is not a tool in
+  the catalog; the catalog calls it `collaboration.spawn_agent`").
+
+What another backend really encrypted (left, say, by carrying a conversation on with the bridge off and
+the official sign-in) the Excel backend cannot read. When the backend fails on it, the bridge replaces
+it with a note and sends the request again; the window says `the Excel backend could not read what
+another backend encrypted`.
+
 ## Pictures
 
 Screenshots pasted into Codex, `codex -i picture.png` and the model's `view_image` all work, with

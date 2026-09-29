@@ -93,6 +93,10 @@ jobs:
         run: python tests/e2e/run_e2e.py --network-drop -- ./excel-codex.sh
       - name: e2e (excel-codex.sh desktop, a network drop waited out)
         run: python tests/e2e/run_e2e.py --desktop --shared --network-drop -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh, a helper agent given its task as text)
+        run: python tests/e2e/run_e2e.py --subagent -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh desktop, a helper agent given its task as text)
+        run: python tests/e2e/run_e2e.py --desktop --shared --subagent -- ./excel-codex.sh
 
   windows:
     needs: test
@@ -160,6 +164,10 @@ jobs:
         run: python tests/e2e/run_e2e.py --network-drop -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.exe desktop, a network drop waited out)
         run: python tests/e2e/run_e2e.py --desktop --shared --network-drop -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe, a helper agent given its task as text)
+        run: python tests/e2e/run_e2e.py --subagent -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe desktop, a helper agent given its task as text)
+        run: python tests/e2e/run_e2e.py --desktop --shared --subagent -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.cmd)
         run: python tests/e2e/run_e2e.py -- excel-codex.cmd
 
@@ -236,6 +244,8 @@ jobs:
         run: python tests/e2e/run_e2e.py --desktop --shared --rate-limited -- dist/excel-codex/excel-codex
       - name: e2e (excel-codex, a rate limit longer than Codex waits for a silent stream)
         run: python tests/e2e/run_e2e.py --rate-limited long -- dist/excel-codex/excel-codex
+      - name: e2e (excel-codex, a helper agent given its task as text)
+        run: python tests/e2e/run_e2e.py --subagent -- dist/excel-codex/excel-codex
 
       - name: Package
         run: |
