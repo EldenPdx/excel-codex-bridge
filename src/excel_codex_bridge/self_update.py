@@ -519,6 +519,15 @@ class Installer:
         return f"excel-codex-bridge {version} is out; installing it failed a moment ago, so it is tried again after {when}."
 
 
+def _canonical(path: str) -> str:
+    """One spelling per file: long names, links resolved, case folded (on Windows)."""
+    try:
+        path = os.path.realpath(path)
+    except (OSError, ValueError):
+        pass
+    return os.path.normcase(os.path.abspath(path))
+
+
 def running_from(folder: Path) -> bool:
     """Whether another process runs a program from ``folder`` (Windows; False when unsure)."""
     if sys.platform != "win32":
@@ -536,8 +545,8 @@ def running_from(folder: Path) -> bool:
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     query_limited_information = 0x1000
 
-    prefixes = {os.path.normcase(os.path.abspath(str(folder))), os.path.normcase(str(folder.resolve()))}
-    prefixes = {prefix.rstrip("\\/") + os.sep for prefix in prefixes}
+    prefixes = tuple({_canonical(str(folder)), os.path.normcase(os.path.abspath(str(folder)))})
+    prefixes = tuple(prefix.rstrip("\\/") + os.sep for prefix in prefixes)
     size = 1024
     while True:
         pids = (wintypes.DWORD * size)()
@@ -558,7 +567,12 @@ def running_from(folder: Path) -> bool:
             length = wintypes.DWORD(32768)
             path = ctypes.create_unicode_buffer(length.value)
             if kernel32.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(length)):
-                if os.path.normcase(path.value).startswith(tuple(prefixes)):
+                image = os.path.normcase(path.value)
+                if image.startswith(prefixes):
+                    return True
+                # Started through a short (8.3) or otherwise different spelling of the same folder.
+                name = os.path.basename(image)
+                if ("~" in image or name == "excel-codex.exe") and _canonical(image).startswith(prefixes):
                     return True
         finally:
             kernel32.CloseHandle(handle)
