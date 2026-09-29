@@ -38,8 +38,17 @@ from pathlib import Path
 MARKER = "UPDATED-BY-E2E.txt"
 
 
+def annotate(level: str, title: str, message: str) -> None:
+    """A GitHub Actions annotation: readable on the run page without the log."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    text = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::{level} title={title}::{text}", flush=True)
+
+
 def fail(message: str, output: str = "") -> None:
     print(output)
+    annotate("error", "update e2e", f"{message}\n{output[-6000:]}")
     raise SystemExit(f"FAIL: {message}")
 
 
@@ -158,6 +167,7 @@ def main() -> None:
         if result.returncode != 0:
             fail(f"{step}: exit code {result.returncode}", output)
         expect(output, "Nothing to undo in")
+        annotate("notice", step, output[-3000:])
         return output
 
     def staged(app: Path) -> bool:
