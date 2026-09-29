@@ -1,0 +1,1 @@
+Python >=3.10; setuptools build backend; package metadata in `pyproject.toml`. Runtime dependencies: FastAPI, Uvicorn, httpx[socks], zstandard, tzdata. Optional test dependency: pytest. Docker Compose sidecar config at `packaging/sub2api/compose.yaml`.

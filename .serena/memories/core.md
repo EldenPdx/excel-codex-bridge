@@ -1,0 +1,1 @@
+Python package in `src/excel_codex_bridge`. Local bridge reads an existing Codex or Excel ChatGPT session, adapts Responses/SSE and tools to the Excel backend. Optional SUB2API sidecar in `packaging/sub2api` is a separate upstream; see `mem:sub2api/core` for its deployment/security invariants. Read `mem:tech_stack` for dependencies and `mem:conventions` for code patterns.

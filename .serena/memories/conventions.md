@@ -1,0 +1,1 @@
+Package uses `src` layout. CLI entrypoints are declared in `pyproject.toml`: `excel-codex-bridge` and `excel-sub2api`. SUB2API sidecar configuration is file-based via Compose secrets; keep API and admin keys separate. Tests use pytest with `pythonpath = ["src"]`.

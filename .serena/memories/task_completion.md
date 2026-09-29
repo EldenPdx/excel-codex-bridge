@@ -1,0 +1,1 @@
+For Python coding changes run `python -m pytest -q`; for SUB2API-specific changes at least `python -m pytest tests/test_sub2api.py -q`. For Docker packaging changes, validate Compose with `docker compose -f packaging/sub2api/compose.yaml config --quiet` after setting required environment/secrets; optional smoke test instructions live in `docs/sub2api.md`.
