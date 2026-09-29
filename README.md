@@ -236,8 +236,18 @@ auth.openai.com 换一个稳定的代理节点；桥接窗口里出现 `could no
 加载窗口，再打开 Codex 就走官方链路了。桥接窗口关闭时会提示这一点；按 Ctrl+C 关闭时如果还看得到 Codex
 进程，会多一句 `Codex is still running right now`。
 
+**升级后模型菜单还是旧的：只有 5.6-Sol、6-Astra、5.6-Terra、5.6-Luna，没有 6-Sol、6-Luna 和 1M 版**：
+这是 0.5.1 及更早版本的模型列表。桌面版只在启动时读取模型列表，常见原因：
+
+- 桌面版从那时起一直没有完全退出过（关掉窗口后它还在托盘里运行）：从托盘图标右键退出，再打开。
+  0.5.15 起桥接窗口启动时如果看到 Codex 在运行，会提示 `Codex is running right now`；
+- 打开的是旧文件夹里的 `excel-codex-desktop.cmd`（比如桌面快捷方式还指向旧版）：0.5.15 起桥接窗口里
+  `now use the Excel bridge 0.5.15` 这一行写着正在运行的版本；
+- 全手动用法（`serve` + `print-config`）：0.5.14 及更早版本的 `serve` 不更新模型列表文件，升级后
+  重新运行一次 `print-config`；0.5.15 起 `serve` 启动时会自己更新。
+
 也可以全手动：`excel-codex serve` 常驻桥接，再把 `excel-codex print-config` 输出的片段加进
-`config.toml`，不用时删掉。
+`config.toml`，不用时删掉。`serve` 每次启动都会把片段指向的模型列表文件更新成当前版本的（0.5.15 起）。
 
 ## 会话互通
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import signal
 import socket
@@ -13,7 +14,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from excel_codex_bridge import cli, codex_threads, desktop_config
+from excel_codex_bridge import __version__, cli, codex_config, codex_threads, desktop_config
 
 from helpers import write_webview_session
 
@@ -319,6 +320,20 @@ class DesktopCommandTests(unittest.TestCase):
         self.assertIn(cli._SHARED, [call.args[0] for call in printed.call_args_list])
         self.assertEqual(self.config.read_text(), USER_CONFIG)
 
+    def test_it_says_which_release_it_is(self):
+        with mock.patch.object(cli, "_print") as printed:
+            code, _ = self.run_desktop()
+        self.assertEqual(code, 0)
+        said = [call.args[0] for call in printed.call_args_list]
+        self.assertIn(f"now use the Excel bridge {__version__} (gpt-5.6-sol).", "\n".join(said))
+
+    def test_it_writes_this_release_s_model_list(self):
+        catalog = Path(os.environ["EXCEL_BRIDGE_HOME"]) / "codex-model-catalog.json"
+        code, seen = self.run_desktop()
+        self.assertEqual(code, 0)
+        self.assertEqual(Path(tomllib.loads(seen["config"])["model_catalog_json"]), catalog)
+        self.assertEqual(json.loads(catalog.read_text(encoding="utf-8")), codex_config.catalog_payload())
+
     def test_without_codex_sign_in_the_bridge_is_its_own_provider(self):
         with mock.patch.object(cli, "_print") as printed:
             code, seen = self.run_desktop()
@@ -337,7 +352,13 @@ class DesktopCommandTests(unittest.TestCase):
                 self.assertIn(cli._REOPEN_AFTER_RESTORE, said)
                 # Only when a Codex process is seen: not when the process list cannot be read.
                 self.assertEqual(cli._STILL_RUNNING in said, running is True)
+                # A Codex already open keeps its old model list; said as this starts, too.
+                self.assertEqual(cli._RUNNING_AT_START in said, running is True)
+                if running:
+                    self.assertLess(said.index(cli._RUNNING_AT_START), said.index(cli._QUIT_WHEN_DONE))
         self.assertIn("tray icon", cli._QUIT_WHEN_DONE)
+        self.assertIn("tray icon", cli._RUNNING_AT_START)
+        self.assertTrue(cli._RUNNING_AT_START.isascii())
         self.assertIn("os error 10061", cli._REOPEN_AFTER_RESTORE)
 
     def test_off_says_so_too(self):
@@ -414,6 +435,49 @@ detach = base_events.Server._detach
 base_events.Server._detach = lambda self: setattr(base_events.Server, "_detach", detach)
 sys.exit(cli.main(sys.argv[1:]))
 """
+
+
+class ServeCommandTests(unittest.TestCase):
+    """`serve`, run by hand next to a config from `print-config`."""
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp())
+        self.webview = write_webview_session(root / "webview", time.time() + 3 * 86400)
+        self.home = root / "bridge-home"
+        env = {"CODEX_HOME": str(root / "codex-home"), "EXCEL_BRIDGE_HOME": str(self.home),
+               "EXCEL_BRIDGE_UPDATE_CHECK": "0"}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def serve(self, *extra):
+        with mock.patch.object(cli, "_run_bridge") as run, mock.patch.object(cli, "_print"):
+            code = cli.main(["serve", "--webview-dir", str(self.webview), "--no-auto-signin", *extra])
+        run.assert_called_once()
+        return code
+
+    def test_an_earlier_release_s_model_list_is_brought_up_to_date(self):
+        # What 0.5.1's print-config left: four models, none of them 1M.
+        self.home.mkdir()
+        catalog = self.home / "codex-model-catalog.json"
+        catalog.write_text('{"models": [{"slug": "gpt-5.6-sol-excel"}]}', encoding="utf-8")
+        self.assertEqual(self.serve(), 0)
+        self.assertEqual(json.loads(catalog.read_text(encoding="utf-8")), codex_config.catalog_payload())
+
+    def test_a_model_list_it_cannot_write_does_not_stop_it(self):
+        with mock.patch.object(codex_config, "write_catalog", side_effect=PermissionError("read-only")), \
+             self.assertLogs("excel_codex_bridge.cli", "WARNING") as logs:
+            self.assertEqual(self.serve(), 0)
+        self.assertIn("read-only", logs.output[0])
+
+    def test_the_bridge_excel_codex_starts_leaves_the_list_to_it(self):
+        # `excel-codex` writes the list itself before it starts `serve --log-file` in the background.
+        log = self.home / "bridge.log"
+        self.home.mkdir()
+        with mock.patch.object(codex_config, "write_catalog") as write, \
+             mock.patch.object(cli.logging, "basicConfig"):
+            self.assertEqual(self.serve("--log-file", str(log)), 0)
+        write.assert_not_called()
 
 
 class DesktopShutdownTests(unittest.TestCase):

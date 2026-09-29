@@ -287,8 +287,23 @@ reload IDE windows that use Codex, then open Codex again and it uses the officia
 window says so when it closes; closed with Ctrl+C while it still sees a Codex process, it adds
 `Codex is still running right now`.
 
+**After an update the model menu is the old one: only 5.6-Sol, 6-Astra, 5.6-Terra and 5.6-Luna,
+without 6-Sol, 6-Luna and the 1M versions**. That is the model list of 0.5.1 and earlier. The
+desktop app reads the model list only when it starts. Common causes:
+
+- The desktop app has not been fully quit since then (after closing its window it keeps running in
+  the tray): quit it from its tray icon and open it again. From 0.5.15 the bridge window says
+  `Codex is running right now` when it starts while it sees Codex running.
+- The `excel-codex-desktop.cmd` opened is in an old folder (a desktop shortcut still pointing at an
+  old release, for instance): from 0.5.15 the bridge window's `now use the Excel bridge 0.5.15` line
+  says which release runs.
+- Fully manual use (`serve` plus `print-config`): `serve` in 0.5.14 and earlier does not update the
+  model list file, so run `print-config` once more after updating; from 0.5.15 `serve` updates it
+  when it starts.
+
 Fully manual alternative: run `excel-codex serve` and add the output of `excel-codex print-config`
-to `config.toml`; remove those lines to go back.
+to `config.toml`; remove those lines to go back. Each time `serve` starts it brings the model list
+file those lines point at up to date with its release (0.5.15 and later).
 
 ## Session sharing
 

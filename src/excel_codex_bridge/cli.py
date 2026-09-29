@@ -83,6 +83,13 @@ def _write_catalog(directory: Path | None = None) -> Path:
     return codex_config.write_catalog(directory)
 
 
+def _refresh_catalog() -> None:
+    try:
+        _write_catalog()
+    except OSError as exc:
+        logging.getLogger(__name__).warning("could not update the model list for Codex: %s", exc)
+
+
 def _image_model(value: str) -> str:
     value = value.strip()
     if not image_generation.valid_model(value):
@@ -234,6 +241,8 @@ def cmd_serve(args) -> int:
         _exit_when_stdin_closes()
     reader = _reader(args)
     if not args.log_file:
+        # A config from `print-config` points at this file; keep its model list this release's.
+        _refresh_catalog()
         _, message = _describe_session(reader.refresh(force=True))
         _print(message)
         _print(_pictures_line())
@@ -548,6 +557,11 @@ _REOPEN_AFTER_RESTORE = (
     "  (os error 10061), and the app still offers the bridge's models (1M ones fail without it)."
 )
 _STILL_RUNNING = "  Codex is still running right now: quit it as above before carrying on."
+_RUNNING_AT_START = (
+    "  Codex is running right now: until it is fully quit (Windows: right-click its tray icon > Quit)\n"
+    "  and opened again, it keeps the model list it started with, such as an older bridge's without\n"
+    "  the 1M and 6-Sol models."
+)
 _QUIT_WHEN_DONE = (
     "  When done, fully quit Codex too (Windows: its tray icon > Quit) before using it without the\n"
     "  bridge: conversations opened meanwhile keep going to this window until then."
@@ -679,7 +693,8 @@ def cmd_desktop(args) -> int:
 
     keep = _undo_on_exit(undo)
 
-    _print(f"Codex desktop app and IDE extension now use the Excel bridge ({codex_config.codex_model(args.model)}).")
+    _print(f"Codex desktop app and IDE extension now use the Excel bridge {__version__} "
+           f"({codex_config.codex_model(args.model)}).")
     _print(f"  Updated {config}" + (f"; the original is saved as {backup.name}" if backup else ""))
     text = config.read_text(encoding="utf-8-sig")
     if not args.keep_apps:
@@ -688,6 +703,7 @@ def cmd_desktop(args) -> int:
     if profile:
         _print(f"  Note: your active profile '{profile}' sets its own model and may override this.")
     _print("  Fully quit and reopen the Codex desktop app (or reload the IDE window) to pick it up.")
+    _say_if_codex_runs(_RUNNING_AT_START)
     _print(_SHARED if shared else _SEPARATE)
     if shared:
         _move_bridge_threads(desktop_config.codex_home())
@@ -714,11 +730,11 @@ def cmd_desktop(args) -> int:
     return 0
 
 
-def _say_if_codex_runs() -> None:
+def _say_if_codex_runs(message: str = _STILL_RUNNING) -> None:
     from . import codex_threads
 
     if codex_threads.codex_seen():
-        _print(_STILL_RUNNING)
+        _print(message)
 
 
 # ─── timezone ─────────────────────────────────────────────────────────────────
