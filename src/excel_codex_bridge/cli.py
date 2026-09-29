@@ -21,6 +21,7 @@ from pathlib import Path
 
 from . import __version__, codex_config, desktop_config, excel_signin, excel_upstream, exit_timezone, images, updates
 from . import image_generation
+from . import self_update
 from . import session
 from .session import SessionReader
 
@@ -112,7 +113,7 @@ def _announce_update(release: updates.Release | None, stream=None) -> None:
     if release is None:
         return
     stream = stream or sys.stdout
-    text = updates.notice(release)
+    text = updates.notice(release, installs_itself=self_update.installs_itself())
     try:
         print(text, file=stream, flush=True)
     except UnicodeEncodeError:  # output redirected to a file in a narrow code page
@@ -125,6 +126,34 @@ def _watch_for_updates() -> None:
     check = _update_check()
     if check is not None:
         updates.watch(check, _announce_update)
+
+
+def cmd_update(args) -> int:
+    app = self_update.install_dir()
+    if args.launcher:
+        # excel-codex-desktop.cmd, before it starts the bridge: never in its way.
+        if app is None or not self_update.enabled():
+            return 0
+        try:
+            return self_update.installer(app, codex_config.state_dir()).launcher()
+        except Exception as exc:
+            _print(f"Could not check for updates ({type(exc).__name__}: {exc}); starting the current version.")
+            return 0
+    if app is not None:
+        return self_update.installer(app, codex_config.state_dir()).by_hand()
+    release = updates.fetch_latest()
+    if release is None:
+        _print("Could not read the latest release from GitHub (offline, or behind a proxy?).")
+        return 1
+    if not updates.is_newer(release.version):
+        _print(f"You have the newest release ({__version__}).")
+        return 0
+    _announce_update(release)
+    if _frozen():
+        _print("  Only the Windows package installs updates itself; download this one and replace your folder.")
+    else:
+        _print("  Running from the source code: `git pull` updates it.")
+    return 0
 
 
 # ─── automatic sign-in through Excel ──────────────────────────────────────────
@@ -1111,6 +1140,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     migrate.add_argument("--from", dest="source", metavar="PROVIDER", default=argparse.SUPPRESS, help=from_help)
     moves.add_parser("undo", help="put back what `threads migrate` moved")
+    update = sub.add_parser(
+        "update",
+        help="download the newest release; the Windows package installs it the next time "
+        "excel-codex-desktop.cmd starts, which checks by itself",
+    )
+    update.add_argument("--launcher", action="store_true", help=argparse.SUPPRESS)
     sub.add_parser("sub2api", add_help=False, help="opt-in SUB2API sidecar and SSH session sync")
     return parser
 
@@ -1149,7 +1184,7 @@ def _main(argv: list[str]) -> int:
     if argv and argv[0] == "sub2api":
         from .sub2api_cli import main as sub2api_main
         return sub2api_main(argv[1:])
-    known = {"codex", "desktop", "serve", "status", "login", "print-config", "timezone", "threads",
+    known = {"codex", "desktop", "serve", "status", "login", "print-config", "timezone", "threads", "update",
              "-h", "--help", "--version"}
     if not argv or argv[0] not in known:
         argv = ["codex", *argv]
@@ -1172,4 +1207,6 @@ def _main(argv: list[str]) -> int:
         return cmd_timezone(args)
     if args.command == "threads":
         return cmd_threads(args)
+    if args.command == "update":
+        return cmd_update(args)
     return cmd_codex(args, codex_args)

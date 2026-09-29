@@ -4,7 +4,8 @@ The check is one GET to GitHub's public releases API, at most every twelve
 hours, sending nothing but this version in the User-Agent; it uses the same
 proxy settings as the bridge. The answer is kept in the state folder, and the
 check runs in the background, so starting never waits on GitHub. A failed
-check prints nothing. ``EXCEL_BRIDGE_UPDATE_CHECK=0`` turns it off.
+check prints nothing. ``EXCEL_BRIDGE_UPDATE_CHECK=0`` turns it off. The
+Windows package also installs the update (see ``self_update``).
 """
 
 from __future__ import annotations
@@ -147,11 +148,15 @@ class UpdateCheck:
         return release if release is not None and is_newer(release.version) else None
 
 
-def notice(release: Release) -> str:
+def notice(release: Release, *, installs_itself: bool = False) -> str:
     lines = [f"Update available: {release.version} (you have {__version__})."]
     if release.summary:
         lines.append(f"  {release.summary}")
-    lines.append(f"  -> Download: {release.url}")
+    if installs_itself:
+        lines.append("  -> It installs itself the next time you start excel-codex-desktop.cmd.")
+        lines.append(f"     What changed: {release.url}")
+    else:
+        lines.append(f"  -> Download: {release.url}")
     return "\n".join(lines)
 
 

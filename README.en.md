@@ -226,7 +226,8 @@ the bridge for as long as you need it:
 
 1. Double-click **`excel-codex-desktop.cmd`** from the release zip (or run `excel-codex desktop`).
    It checks the session (signing in if needed), points `config.toml` at the bridge and runs the
-   bridge on `127.0.0.1:8765`.
+   bridge on `127.0.0.1:8765`. First it checks for a newer release and, if there is one, installs
+   it and opens that instead, see [Automatic update](#automatic-update-windows-release-zip).
 2. **Fully quit and reopen the Codex desktop app** (or reload the IDE window); the model list
    shows the bridge's models (their display names say Excel). If Codex is signed in, earlier
    conversations are in the list too and carry on, see [Session sharing](#session-sharing).
@@ -621,11 +622,41 @@ and, if there is one, shows its version, what changed and the download link:
 
 The request goes only to `api.github.com`, carries nothing but the version in its User-Agent, and
 uses the same proxy settings as the bridge. If GitHub cannot be reached, nothing is shown and nothing
-else changes. Set `EXCEL_BRIDGE_UPDATE_CHECK=0` to turn it off.
+else changes. Set `EXCEL_BRIDGE_UPDATE_CHECK=0` to turn it off (the automatic update goes with it).
 
-To update, close any running bridge window and Codex, then extract the new release over the old folder
-(or into a new one). Settings and state are not kept in the install folder, so nothing is lost. When
-running from source, `git pull` is enough.
+To update by hand, close any running bridge window and Codex, then extract the new release over the old
+folder (or into a new one). Settings and state are not kept in the install folder, so nothing is lost.
+When running from source, `git pull` is enough.
+
+### Automatic update (Windows release zip)
+
+From 0.5.13 on, double-clicking `excel-codex-desktop.cmd` first checks for a newer release and, if
+there is one, updates before it opens:
+
+1. It downloads the new Windows zip and checks it against the SHA-256 that GitHub's API lists for it.
+2. It unpacks it into a `.update` folder inside the install folder and runs the new `excel-codex.exe`
+   once, to make sure it starts.
+3. Once the current program has exited, it swaps in the new `excel-codex.exe`, `_internal` and
+   `excel-codex-desktop.cmd`, then opens the new version.
+
+The window shows the download's progress; Esc skips the update this time and opens the current
+version. If any step fails (the download, the checksum, the new version not starting, a file in use),
+the current version opens as usual, and a failed update is tried again an hour later. While
+excel-codex from the same folder is still running in another window, nothing is swapped: close it and
+double-click again, and what was downloaded is used without downloading it again.
+
+- 0.5.12 and earlier cannot do this yet; update those by hand once.
+- Only `excel-codex-desktop.cmd` updates itself. Double-clicking `excel-codex.exe`, the macOS builds
+  and running from source still just show the notice. In the release zip, `excel-codex update`
+  downloads it ahead of time, to be installed the next time `excel-codex-desktop.cmd` starts.
+- The folder's name keeps the old version number; the startup message and `excel-codex --version`
+  tell the version you have.
+- `EXCEL_BRIDGE_AUTO_UPDATE=0` keeps the notice but installs nothing.
+- If downloads from GitHub are slow, set `EXCEL_BRIDGE_DOWNLOAD_MIRROR` to a mirror's prefix (such
+  as `https://<mirror>/`, put in front of the GitHub download link). The file is still checked
+  against the SHA-256 GitHub's API lists, so a mirror that changed it is not installed.
+- The builds are not code-signed: the checksum catches a broken download or an altered mirror, not a
+  compromise of the GitHub repository itself.
 
 ## Limitations
 
@@ -657,7 +688,9 @@ running from source, `git pull` is enough.
 | `EXCEL_BRIDGE_PROXY` | Outbound proxy (same as `--proxy`) |
 | `EXCEL_BRIDGE_HOME` | State folder for the model catalog JSON, `bridge.log`, the sign-in workbook, and `tool-calls.sqlite3`, which lets earlier tool calls replay exactly after a restart (kept 60 days). Default `%LOCALAPPDATA%\excel-codex-bridge` or `~/.excel-codex-bridge` |
 | `EXCEL_BRIDGE_AUTO_SIGNIN` | `0` keeps the tool from opening Excel (same as `--no-auto-signin`) |
-| `EXCEL_BRIDGE_UPDATE_CHECK` | `0` turns off the update check |
+| `EXCEL_BRIDGE_UPDATE_CHECK` | `0` turns off the update check, and with it the automatic update |
+| `EXCEL_BRIDGE_AUTO_UPDATE` | `0` keeps `excel-codex-desktop.cmd` to the notice, without installing, see [Automatic update](#automatic-update-windows-release-zip) |
+| `EXCEL_BRIDGE_DOWNLOAD_MIRROR` | A mirror prefix put in front of the GitHub download link for the automatic update; still checked against GitHub's SHA-256 |
 | `EXCEL_BRIDGE_AUTO_MIGRATE` | `0` keeps the bridge from moving its own conversations into the shared list at start, see [The bridge's own conversations](#the-bridges-own-conversations) |
 | `EXCEL_BRIDGE_TIMEZONE` | `auto` (default) / `off`, same as `--timezone`, see [Exit timezone](#exit-timezone) |
 | `EXCEL_BRIDGE_IMAGE_MODEL` | The model Codex's image tool asks the backend for, default `gpt-image-2` (same as `--image-model`), see [Image generation](#image-generation) |
