@@ -531,6 +531,16 @@ _SEPARATE = (
     "  Codex is not signed in, so the bridge is a provider of its own: conversations started now\n"
     "  are listed only while it is on. `codex login` once to share them with the official sign-in."
 )
+# Signed in with ChatGPT, Codex waits on chatgpt.com for these when a conversation opens
+# (apps, up to 30 s) and on every turn (plugin suggestions, 5 s).
+_APPS_OFF = (
+    "  Codex's apps and plugin suggestions are off while this runs: they wait on chatgpt.com, so a\n"
+    "  slow proxy kept conversations loading. --keep-apps leaves them on."
+)
+_APPS_LEFT_ON = (
+    "  Codex's apps and plugin suggestions stay on: config.toml sets [features] in a way this cannot\n"
+    "  change. Through a slow proxy they can keep conversations loading for up to 30 s."
+)
 
 
 def _move_bridge_threads(home: Path) -> None:
@@ -621,7 +631,8 @@ def cmd_desktop(args) -> int:
     shared = codex_config.codex_signed_in(desktop_config.codex_home())
     try:
         backup = desktop_config.enable_file(
-            config, port=args.port, catalog=catalog, model=args.model, shared=shared
+            config, port=args.port, catalog=catalog, model=args.model, shared=shared,
+            quiet_features=not args.keep_apps,
         )
     except (desktop_config.ConfigError, OSError, UnicodeError) as exc:
         _print(f"Could not update {config}: {exc}")
@@ -641,7 +652,10 @@ def cmd_desktop(args) -> int:
 
     _print(f"Codex desktop app and IDE extension now use the Excel bridge ({codex_config.codex_model(args.model)}).")
     _print(f"  Updated {config}" + (f"; the original is saved as {backup.name}" if backup else ""))
-    profile = desktop_config.profile_override(config.read_text(encoding="utf-8-sig"))
+    text = config.read_text(encoding="utf-8-sig")
+    if not args.keep_apps:
+        _print(_APPS_OFF if desktop_config.features_quiet(text) else _APPS_LEFT_ON)
+    profile = desktop_config.profile_override(text)
     if profile:
         _print(f"  Note: your active profile '{profile}' sets its own model and may override this.")
     _print("  Fully quit and reopen the Codex desktop app (or reload the IDE window) to pick it up.")
@@ -681,26 +695,45 @@ def _say_if_codex_runs() -> None:
 # ─── timezone ─────────────────────────────────────────────────────────────────
 
 def _redacted(url: str | None) -> str:
-    if not url:
-        return "no proxy"
-    scheme, _, rest = url.partition("://")
-    return f"{scheme}://{rest.rpartition('@')[2]}" if rest else url
+    from . import system_timezone
+
+    return system_timezone.redacted(url)
+
+
+# ASCII only: piped on Windows, output takes the ANSI code page.
+_CODEX_NEEDS_CHATGPT = (
+    "  Codex itself reaches chatgpt.com through this proxy too (sign-in, apps, plugins): while it\n"
+    "  cannot, new tasks can hang on \"starting\" and conversations on loading. Pick a steady proxy\n"
+    "  node for chatgpt.com and auth.openai.com.")
 
 
 def _describe_sync(result: dict) -> str:
+    from . import system_timezone
+
     status = result.get("status")
     if status == "error":
-        return f"Error: {result.get('error')}"
+        text = f"Error: {result.get('error')}"
+        return f"{text}\n{_CODEX_NEEDS_CHATGPT}" if result.get("unreachable") else text
     if status == "skipped":
         return f"Skipped: {result.get('reason')}"
     windows = result.get("windows_timezone")
+    exit_windows = result.get("exit_windows_timezone") or windows
     before = result.get("previous_timezone")
     country = result.get("exit_country")
     text = (f"{result.get('route')} -> {result.get('exit_host')} via {_redacted(result.get('proxy'))}: "
             f"exit {result.get('exit_ip')}" + (f" (Cloudflare: {country})" if country else "")
-            + f" is in {result.get('iana_timezone')}" + (f" ({windows})" if windows else ""))
+            + f" is in {result.get('iana_timezone')}" + (f" ({exit_windows})" if exit_windows else ""))
+    if status == "updated" and result.get("reverted"):
+        why = ("Windows \"Set time zone automatically\" is on and changes it back: turn it off in\n"
+               "  Settings > Time & language > Date & time" if result.get("automatic")
+               else "Something changed it back (Windows \"Set time zone automatically\", or another program)")
+        return (f"{text}\n  Windows timezone had gone back to {before}; set {windows} again.\n"
+                f"  {why}, or use --timezone off. Later changes back are put right without a message.")
     if status == "updated":
         return f"{text}\n  Windows timezone changed from {before} to {windows}."
+    if status == "waiting":
+        return (f"{text}\n  Windows stays on {windows}: the proxy's exit moves between places, and another\n"
+                f"  exit's timezone is taken once it holds for {system_timezone.SETTLE_CHECKS} checks in a row.")
     if status == "unchanged":
         return f"{text}\n  Windows timezone is already {before}."
     here = before or _dt.datetime.now().astimezone().strftime("UTC%z")
@@ -767,7 +800,11 @@ def _keep_windows_timezone():
     from . import system_timezone
 
     _print("Windows timezone: kept on Codex's proxy exit while this window is open and put back when it\n"
-           "  closes (--timezone off leaves it alone).")
+           "  closes (--timezone off leaves it alone). Times in this window stay in the timezone it\n"
+           "  started in.")
+    if system_timezone.automatic_timezone():
+        _print("  Windows \"Set time zone automatically\" is on and may change it back; turn it off in\n"
+               "  Settings > Time & language > Date & time.")
     return system_timezone.Keeper(lambda result: _print(f"Windows timezone: {_describe_sync(result)}")).start()
 
 
@@ -1028,6 +1065,10 @@ def _parser() -> argparse.ArgumentParser:
     desktop.add_argument("--off", action="store_true", help="only put the Codex config back, then exit")
     desktop.add_argument(
         "--keep-config", action="store_true", help="leave the config in place when this window closes"
+    )
+    desktop.add_argument(
+        "--keep-apps", action="store_true",
+        help="leave Codex's apps and plugin suggestions on (they wait on chatgpt.com)",
     )
     desktop.add_argument(
         "--skip-session-check", action="store_true", help="start even if no session is found yet"

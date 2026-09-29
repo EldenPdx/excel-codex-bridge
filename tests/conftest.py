@@ -9,6 +9,8 @@ os.environ["EXCEL_BRIDGE_CODEX_AUTH"] = str(Path(tempfile.mkdtemp(prefix="no-cod
 os.environ.pop("EXCEL_BRIDGE_LOGIN", None)
 # Nor look up where this machine's proxy exit is; test_exit_timezone.py turns it on where needed.
 os.environ["EXCEL_BRIDGE_TIMEZONE"] = "off"
+# Nor wait for the backend to come back; test_reconnect.py turns it on where needed.
+os.environ["EXCEL_BRIDGE_CONNECT_WAIT"] = "0"
 # Nor draw with an image model chosen on this machine; test_image_generation.py sets its own.
 os.environ.pop("EXCEL_BRIDGE_IMAGE_MODEL", None)
 

@@ -44,16 +44,25 @@ TRACE_ENV = "EXCEL_BRIDGE_TIMEZONE_TRACE"
 # A looked-up exit keeps its timezone this long; the exit IP is checked every CHECK_SECONDS.
 ZONE_CACHE = dt.timedelta(hours=24)
 CHECK_SECONDS = 60
+# A proxy that spreads requests over nodes in several countries would flip
+# Windows every minute; another exit's timezone is taken once it held this many checks in a row.
+SETTLE_CHECKS = 3
 TIMEOUT = httpx.Timeout(12.0)
 _TOP_LEVEL = re.compile(r"""^\s*model_provider\s*=\s*["']([^"']+)["']""", re.M)
 _INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
 _TIME_ZONES = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Time Zones"
+# Windows' "Set time zone automatically": the service's Start is 4 while it is off.
+_AUTO_TIMEZONE = r"SYSTEM\CurrentControlSet\Services\tzautoupdate"
 # Held while the timezone is changed, so a sync cannot change it again after it was put back.
 _changing = threading.Lock()
 
 
 class Refused(RuntimeError):
     """Something that stops a sync, said in words for the user."""
+
+
+class Unreachable(Refused):
+    """Codex's exit host could not be reached through Codex's proxy."""
 
 
 @dataclass(frozen=True)
@@ -177,10 +186,32 @@ def trace_url(host: str) -> str:
     return os.environ.get(TRACE_ENV, "").strip() or f"https://{host}/cdn-cgi/trace"
 
 
-def find_exit(client: httpx.Client, host: str) -> exit_timezone.Exit:
+def redacted(proxy: str | None) -> str:
+    """``proxy`` without a user name or password in it."""
+    if not proxy:
+        return "no proxy"
+    scheme, _, rest = proxy.partition("://")
+    return f"{scheme}://{rest.rpartition('@')[2]}" if rest else proxy
+
+
+def _network_reason(exc: Exception) -> str:
+    text = str(exc)
+    if "UNEXPECTED_EOF" in text or "EOF occurred in violation of protocol" in text:
+        return "the connection was closed during the TLS handshake, as a proxy node that is down does"
+    if isinstance(exc, httpx.TimeoutException):
+        return f"no answer within {TIMEOUT.connect:g} s ({type(exc).__name__})"
+    return exit_timezone._reason(exc)
+
+
+def find_exit(client: httpx.Client, host: str, proxy: str | None = None) -> exit_timezone.Exit:
     """The exit IP ``host``'s Cloudflare trace sees, and the country Cloudflare places it in."""
     url = _checked_url(trace_url(host))
-    response = client.get(url)
+    try:
+        response = client.get(url)
+    except httpx.TransportError as exc:
+        via = f"through the proxy {redacted(proxy)}" if proxy else "without a proxy"
+        raise Unreachable(f"could not reach {host} {via} ({_network_reason(exc)}); "
+                          "the timezone is left as it is") from exc
     response.raise_for_status()
     return exit_timezone.parse_trace(response.text, urlsplit(url).hostname)
 
@@ -249,6 +280,19 @@ def current_zone() -> str:
     return _run("tzutil", "/g")
 
 
+def automatic_timezone() -> bool | None:
+    """Whether Windows' "Set time zone automatically" is on; None when that cannot be told."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _AUTO_TIMEZONE) as key:
+            return winreg.QueryValueEx(key, "Start")[0] != 4
+    except (ImportError, OSError):
+        return None
+
+
 def _same_zone(a: str, b: str) -> bool:
     return a.removesuffix("_dstoff") == b.removesuffix("_dstoff")
 
@@ -290,39 +334,83 @@ def _record(status: str, **details) -> dict:
     return result
 
 
-def sync(*, probe: bool = False, stopped: threading.Event | None = None) -> dict:
+class Settle:
+    """The timezone the keeper holds Windows on, from one check to the next.
+
+    The first exit's timezone is taken at once.  Another exit's is taken once
+    it held ``checks`` checks in a row: a proxy that spreads requests over nodes
+    in several countries would otherwise flip Windows every minute.
+    """
+
+    def __init__(self, checks: int = SETTLE_CHECKS) -> None:
+        self.checks = checks
+        self.kept: str | None = None
+        self._candidate: str | None = None
+        self._seen = 0
+
+    def target(self, found: str) -> tuple[str, bool]:
+        """(the timezone Windows should be on now, whether ``found`` is still waiting to be taken)."""
+        if self.kept is None or _same_zone(found, self.kept):
+            self._candidate, self._seen = None, 0
+            return found, False
+        if self._candidate is not None and _same_zone(found, self._candidate):
+            self._seen += 1
+        else:
+            self._candidate, self._seen = found, 1
+        if self._seen >= self.checks:
+            self._candidate, self._seen = None, 0
+            return found, False
+        return self.kept, True
+
+
+def sync(*, probe: bool = False, stopped: threading.Event | None = None, settle: Settle | None = None) -> dict:
     """Set Windows to the exit's timezone (``probe``: only say what it would be).
 
     Once ``stopped`` is set the timezone is left alone: it is being put back.
+    With ``settle`` (the keeper), another exit's timezone waits until it held
+    a few checks, and Windows going off the kept timezone counts as ``reverted``.
     """
     now = _now()
     route = codex_route()
     with _client(route.proxy) as client:
-        exit = find_exit(client, route.host)
+        exit = find_exit(client, route.host, route.proxy)
         cached = _cached(exit, now)
         if cached:
-            iana, target, looked_up = cached
+            iana, found, looked_up = cached
         else:
             iana = lookup(client, exit).name
-            target = windows_zone_for(iana) if sys.platform == "win32" else ""
+            found = windows_zone_for(iana) if sys.platform == "win32" else ""
             looked_up = now.isoformat()
+        target, waiting = settle.target(found) if settle is not None and found else (found, False)
         before = current_zone() if sys.platform == "win32" else ""
         details = dict(route=route.name, exit_host=route.host, proxy=route.proxy, exit_ip=exit.ip,
                        exit_country=exit.country, iana_timezone=iana, windows_timezone=target, previous_timezone=before,
                        looked_up_at=looked_up)
+        if waiting:
+            details["exit_windows_timezone"] = found
         if probe or sys.platform != "win32":
             # Not saved: timezone-state.json keeps what the last real sync did.
             return {"checked_at": _now().isoformat(), "status": "probe", **details}
         if _same_zone(before, target):
-            return _record("unchanged", **details)
-        # Look again right before changing anything: the proxy may have just switched.
-        if codex_route() != route or find_exit(client, route.host) != exit:
+            if settle is not None:
+                settle.kept = target
+            return _record("waiting" if waiting else "unchanged", **details)
+        # Windows went off the timezone it was kept on: something else changed it.
+        reverted = settle is not None and settle.kept is not None and _same_zone(target, settle.kept)
+        # Look again right before a first change: the proxy may have just switched.
+        # (A kept or settled timezone has been seen for several checks already.)
+        if (settle is None or settle.kept is None) and (
+                codex_route() != route or find_exit(client, route.host, route.proxy) != exit):
             return _record("skipped", reason="the exit changed during the lookup")
         with _changing:
             if stopped is not None and stopped.is_set():
                 return _record("skipped", reason="the window is closing")
             _remember(before)
             set_zone(target)
+        if settle is not None:
+            settle.kept = target
+        if reverted:
+            details.update(reverted=True, automatic=automatic_timezone())
         return _record("updated", **details)
 
 
@@ -359,9 +447,10 @@ class Keeper:
     ``report(result)`` hears the first result, every change, and every new error.
     """
 
-    def __init__(self, report, *, interval: float = CHECK_SECONDS) -> None:
+    def __init__(self, report, *, interval: float = CHECK_SECONDS, settle: Settle | None = None) -> None:
         self._report = report
         self._interval = interval
+        self._settle = settle or Settle()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="windows-timezone", daemon=True)
 
@@ -378,15 +467,41 @@ class Keeper:
         return restore()
 
     def _run(self) -> None:
-        last: dict | None = None
+        first = True
+        # The kind of error last reported, until a check works again.
+        reported_error: str | None = None
+        # An error once, not yet reported: a proxy node that fails one check is not worth a line.
+        pending_error: str | None = None
+        told_waiting = told_reverted = False
         while not self._stop.is_set():
             try:
-                result = sync(stopped=self._stop)
+                result = sync(stopped=self._stop, settle=self._settle)
             except Exception as exc:  # noqa: BLE001 - network, proxy, tzutil
-                result = _record("error", error=str(exc) or type(exc).__name__)
-            if (last is None or result["status"] == "updated"
-                    or result["status"] == "error" and result.get("error") != last.get("error")
-                    or result["status"] != "error" and last.get("status") == "error"):
-                self._report(result)
-            last = result
+                result = _record("error", error=str(exc) or type(exc).__name__,
+                                 unreachable=isinstance(exc, Unreachable))
+            status = result["status"]
+            if status == "error":
+                kind = _error_kind(result)
+                if kind != reported_error and (first or kind == pending_error):
+                    self._report(result)
+                    reported_error = kind
+                pending_error = kind
+            else:
+                pending_error = None
+                if status == "updated" and result.get("reverted"):
+                    # Said once; every later change back is put right without a word.
+                    tell, told_reverted = not told_reverted, True
+                elif status == "waiting":
+                    tell, told_waiting = not told_waiting, True
+                else:
+                    tell = first or status == "updated" or reported_error is not None
+                if tell:
+                    self._report(result)
+                reported_error = None
+            first = False
             self._stop.wait(self._interval)
+
+
+def _error_kind(result: dict) -> str:
+    """Errors that differ only in their details are one kind, reported once."""
+    return str(result.get("error", "")).split(" (", 1)[0]

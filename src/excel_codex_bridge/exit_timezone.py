@@ -226,6 +226,9 @@ class ExitTimezone:
         self.zone: Zone | None = None
         self._exit: Exit | None = None
         self._looked_up: float | None = None
+        # Exits seen before, with their timezone and when it was looked up: a proxy that
+        # takes turns between nodes gets each one's timezone straight away.
+        self._known: dict[Exit, tuple[Zone, float]] = {}
         self._next_check = 0.0
         self._checked = False
         self._task: asyncio.Task | None = None
@@ -271,12 +274,21 @@ class ExitTimezone:
         if exit == self._exit and fresh and self.zone is not None:
             return
         if exit != self._exit:
+            known = self._known.get(exit)
+            if known is not None and self._clock() - known[1] < LOOKUP_SECONDS:
+                if known[0] != self.zone:
+                    log.debug("proxy exit timezone: back to %s", known[0].name)
+                self._exit, (self.zone, self._looked_up) = exit, known
+                return
             # A new exit: the old timezone may be wrong now, so it goes until the lookup works.
             self._exit, self.zone, self._looked_up = exit, None, None
         zone = await self._lookup(client, exit)
-        if zone != self.zone:
+        if zone != self.zone and self._known.get(exit, (None,))[0] != zone:
             log.info("proxy exit timezone: %s; Codex is told this one instead of this computer's", zone.name)
         self.zone, self._looked_up = zone, self._clock()
+        self._known = {seen: entry for seen, entry in self._known.items()
+                       if self._looked_up - entry[1] < LOOKUP_SECONDS}
+        self._known[exit] = (zone, self._looked_up)
 
     async def _lookup(self, client: httpx.AsyncClient, exit: Exit) -> Zone:
         reasons = []

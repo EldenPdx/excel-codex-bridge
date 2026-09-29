@@ -19,6 +19,8 @@ import logging
 import math
 import os
 import re
+import time
+import uuid
 import zlib
 from urllib.parse import urlsplit
 
@@ -37,10 +39,15 @@ from .session import SessionReader
 
 log = logging.getLogger("excel_codex_bridge")
 
-MAX_BODY_BYTES = 64 * 1024 * 1024
+# A long conversation carries every picture and every reasoning item since it
+# began: past 64 MB well before the 450k tokens at which Codex compacts it.
+# Codex compresses what it sends, so the limit is on the decompressed JSON.
+MAX_BODY_BYTES = 1024 * 1024 * 1024
+_DECODE_CHUNK = 16 * 1024 * 1024
 NON_STREAMING_ATTEMPTS = 2
-# Upstream answers when it will not take a request's pictures as they are.
-PICTURE_RETRY_STATUSES = {400, 422}
+# Upstream answers when it will not take a request's pictures as they are; 413
+# (too large) too, since uploaded pictures leave only their file ids in it.
+PICTURE_RETRY_STATUSES = {400, 413, 422}
 # Drawing a picture takes a minute or two; the add-in waits five minutes for an edit.
 IMAGE_TIMEOUT = httpx.Timeout(600.0, connect=30.0)
 _LOOPBACK_NAMES = {"localhost"}
@@ -59,6 +66,22 @@ RATE_LIMIT_KEEPALIVE = 10.0
 # Codex tries again after any rate limit, and each try would be waited out afresh;
 # a failure under this code it shows as it is and leaves to the user.
 GAVE_UP_CODE = "invalid_prompt"
+# A proxy node that drops out, or the network going away for a moment, fails
+# every request at once; Codex tries five times within seconds and gives up on
+# the turn.  The bridge tries to reach the backend again first, for up to
+# ``EXCEL_BRIDGE_CONNECT_WAIT`` seconds.
+CONNECT_WAIT = 120.0
+MAX_CONNECT_WAIT = 1800.0
+CONNECT_DELAYS = (0.5, 1.0, 2.0, 4.0, 8.0, 15.0)
+# Tries made before Codex hears anything; after these a stream opens and says it is still going.
+CONNECT_HOLD = 5.0
+# Failures from before the backend answered at all: the request can go again as it is.
+_RECONNECT_ERRORS = (
+    httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.RemoteProtocolError,
+    httpx.ReadError, httpx.WriteError, httpx.WriteTimeout,
+)
+# The code of a failure Codex should try again itself, through the ordinary path.
+UPSTREAM_ERROR_CODE = "upstream_error"
 _STREAM_OPENING = {"response.created", "response.in_progress", "response.queued"}
 # How much of a stream is read looking for its first event past the opening ones.
 _STREAM_HEAD_LIMIT = 4 * 1024 * 1024
@@ -132,26 +155,68 @@ async def _refuse_websocket(scope, receive, send) -> None:
     await send({"type": "websocket.http.response.body", "body": bytes(response.body)})
 
 
-def _zstd_decompress(raw: bytes) -> bytes:
+class BodyTooLarge(ValueError):
+    pass
+
+
+def _too_large(limit: int) -> BodyTooLarge:
+    size = f"{limit // (1024 * 1024)} MB" if limit >= 1024 * 1024 else f"{limit} bytes"
+    return BodyTooLarge(f"request body is too large (over {size} decompressed)")
+
+
+def _zstd_decompress(raw: bytes, limit: int) -> bytes:
     try:
         import zstandard
     except ImportError as exc:  # pragma: no cover - dependency is declared
         raise ValueError("zstd request bodies need the zstandard package") from exc
-    return zstandard.ZstdDecompressor().decompressobj().decompress(raw)
+    out = bytearray()
+    try:
+        with zstandard.ZstdDecompressor().stream_reader(raw, read_across_frames=True) as reader:
+            while chunk := reader.read(_DECODE_CHUNK):
+                out += chunk
+                if len(out) > limit:
+                    raise _too_large(limit)
+    except zstandard.ZstdError as exc:
+        raise ValueError(f"invalid zstd body: {exc}") from None
+    # A cut-off frame decodes to what came of it, without an error; a cut-off JSON
+    # object fails to parse, unless nothing at all came of it.
+    if raw and not out:
+        raise ValueError("the zstd body is incomplete")
+    return bytes(out)
 
 
-def _decode_body(raw: bytes, content_encoding: str) -> dict:
+def _zlib_decompress(raw: bytes, wbits: int, limit: int) -> bytes:
+    decoder = zlib.decompressobj(wbits)
+    out = bytearray()
+    data = raw
+    while data:
+        out += decoder.decompress(data, _DECODE_CHUNK)
+        if len(out) > limit:
+            raise _too_large(limit)
+        data = decoder.unconsumed_tail
+    out += decoder.flush()
+    if len(out) > limit:
+        raise _too_large(limit)
+    if not decoder.eof:
+        raise ValueError("the compressed body is incomplete")
+    return bytes(out)
+
+
+def _decode_body(raw: bytes, content_encoding: str, limit: int = MAX_BODY_BYTES) -> dict:
+    """The JSON object in ``raw``; decompressing stops as soon as it passes ``limit``."""
     encoding = content_encoding.strip().lower()
     if encoding == "gzip" or (not encoding and raw.startswith(b"\x1f\x8b")):
-        raw = gzip.decompress(raw)
+        raw = _zlib_decompress(raw, 16 + zlib.MAX_WBITS, limit)
     elif encoding == "deflate":
-        raw = zlib.decompress(raw)
+        raw = _zlib_decompress(raw, zlib.MAX_WBITS, limit)
     elif encoding == "zstd" or (not encoding and raw.startswith(b"\x28\xb5\x2f\xfd")):
-        raw = _zstd_decompress(raw)
+        raw = _zstd_decompress(raw, limit)
     elif encoding not in {"", "identity"}:
         raise ValueError(f"unsupported content-encoding {encoding!r}")
-    if len(raw) > MAX_BODY_BYTES:
-        raise ValueError("request body is too large")
+    if len(raw) > limit:
+        raise _too_large(limit)
+    if len(raw) > 64 * 1024 * 1024:
+        log.info("a %d MB request came in", len(raw) // (1024 * 1024))
     payload = json.loads(raw) if raw else {}
     if not isinstance(payload, dict):
         raise ValueError("request body must be a JSON object")
@@ -239,6 +304,83 @@ def rate_limit_wait() -> float:
     return min(max(seconds, 0.0), MAX_RATE_LIMIT_WAIT)
 
 
+def connect_wait() -> float:
+    """Seconds the bridge goes on trying to reach the backend (``EXCEL_BRIDGE_CONNECT_WAIT``)."""
+    value = os.environ.get("EXCEL_BRIDGE_CONNECT_WAIT", "").strip()
+    try:
+        seconds = float(value) if value else CONNECT_WAIT
+    except ValueError:
+        return CONNECT_WAIT
+    if math.isnan(seconds):
+        return CONNECT_WAIT
+    return min(max(seconds, 0.0), MAX_CONNECT_WAIT)
+
+
+def _backend_host() -> str:
+    return urlsplit(excel_upstream.RESPONSES_URL).hostname or "the Excel backend"
+
+
+def _failure_detail(exc: Exception) -> str:
+    kind = type(exc).__name__
+    return f"{kind}: {exc}" if str(exc).strip() else kind
+
+
+class _Reconnect:
+    """The tries of one request that could not reach the backend."""
+
+    def __init__(self, wait: float) -> None:
+        self.wait = wait
+        self.started = time.monotonic()
+        self.attempt = 0
+        self.error: httpx.RequestError | None = None
+
+    def spent(self) -> float:
+        return time.monotonic() - self.started
+
+    def next_delay(self) -> float | None:
+        """How long to wait before the next try; None once the wait is used up."""
+        left = self.wait - self.spent()
+        if left <= 0:
+            return None
+        return min(CONNECT_DELAYS[min(self.attempt, len(CONNECT_DELAYS) - 1)], left)
+
+    def failed(self, exc: httpx.RequestError, delay: float) -> None:
+        if self.attempt == 0:
+            log.warning("could not reach %s (%s); trying again for up to %s",
+                        _backend_host(), _failure_detail(exc), _duration(self.wait))
+        self.error = exc
+
+    def reached(self) -> None:
+        if self.attempt:
+            log.info("reached %s again after %s", _backend_host(), _duration(self.spent()))
+
+
+def _duration(seconds: float) -> str:
+    return f"{seconds / 60:.3g} minutes" if seconds >= 120 else f"{seconds:.3g} seconds"
+
+
+async def _reach(send, reconnect: _Reconnect, hold: float = math.inf) -> httpx.Response | None:
+    """``send()``, sent again while it cannot reach the backend and ``hold`` seconds allow.
+
+    None once the next try would come after ``hold``; the last failure once the wait is used up.
+    """
+    while True:
+        try:
+            response = await send()
+        except _RECONNECT_ERRORS as exc:
+            delay = reconnect.next_delay()
+            if delay is None:
+                raise
+            reconnect.failed(exc, delay)
+            if reconnect.spent() + delay > hold:
+                return None
+            await asyncio.sleep(delay)
+            reconnect.attempt += 1
+            continue
+        reconnect.reached()
+        return response
+
+
 def _rate_limit_delay(message: str, attempt: int, left: float) -> float | None:
     """How long to wait before the next try; None once ``left`` is used up."""
     if left <= 0:
@@ -280,6 +422,11 @@ def _still_limited(response: dict, message: str, waited: float) -> bytes:
     return sse.sse_encode("response.failed", {"type": "response.failed", "response": {**response, "error": error}})
 
 
+def _failed_event(response: dict, code: str, message: str) -> bytes:
+    failed = {**response, "status": "failed", "error": {"code": code, "message": message}}
+    return sse.sse_encode("response.failed", {"type": "response.failed", "response": failed})
+
+
 def _refused(response: Response) -> bool:
     return response.status_code in PICTURE_RETRY_STATUSES
 
@@ -294,8 +441,8 @@ def _request_error_response(exc: httpx.RequestError, timeout: httpx.Timeout) -> 
     """Say which step of reaching the backend failed: Codex shows only this text."""
     status, message = sse.upstream_request_error_status_and_message(exc)
     kind = type(exc).__name__
-    detail = f"{kind}: {exc}" if str(exc).strip() else kind
-    host = urlsplit(excel_upstream.RESPONSES_URL).hostname or "the Excel backend"
+    detail = _failure_detail(exc)
+    host = _backend_host()
     check = "Check this computer's network or proxy (--proxy or EXCEL_BRIDGE_PROXY), then retry."
     if isinstance(exc, httpx.ConnectTimeout):
         message = f"Could not connect to {host}{_seconds(timeout.connect)} ({kind}). {check}"
@@ -326,10 +473,21 @@ class _PastRateLimits:
     not try again itself; when a try cannot be sent it goes as it came.
     """
 
-    def __init__(self, upstream: httpx.Response, send, wait: float) -> None:
+    def __init__(self, upstream: httpx.Response | None, send, wait: float, *,
+                 reconnect: _Reconnect | None = None, opening: dict | None = None, rejected=None,
+                 timeout: httpx.Timeout | None = None) -> None:
+        """With no ``upstream`` yet, ``reconnect`` goes on trying to reach the backend first.
+
+        Codex then gets ``opening`` as the response at once, and ``rejected(response)``
+        makes an error answer of the backend into what Codex hears.
+        """
         self.upstream = upstream
         self._send = send
         self._wait = wait
+        self._reconnect = reconnect
+        self._opening = opening
+        self._rejected = rejected
+        self._timeout = timeout or httpx.Timeout(30.0)
         self._closed = False
         self._chunks = self._relay()
 
@@ -342,15 +500,76 @@ class _PastRateLimits:
     async def aclose(self) -> None:
         """Stop, and send no further try, even while a keepalive's read of this waits in another task."""
         self._closed = True
-        await self.upstream.aclose()
+        if self.upstream is not None:
+            await self.upstream.aclose()
         with contextlib.suppress(RuntimeError):  # that read is running; it stops by itself now
             await self._chunks.aclose()
+
+    async def _keepalive(self, delay: float, keepalive: bytes):
+        """Wait ``delay`` seconds, saying now and then that the answer is still coming."""
+        while delay > 0 and not self._closed:
+            step = min(RATE_LIMIT_KEEPALIVE, delay)
+            await asyncio.sleep(step)
+            delay -= step
+            if delay > 0 and not self._closed:
+                yield keepalive
+
+    async def _reconnecting(self, opened: dict):
+        """Try to reach the backend until it answers or the wait is used up."""
+        reconnect = self._reconnect
+        keepalive = sse.sse_encode("response.in_progress", {"type": "response.in_progress", "response": opened})
+        while True:
+            delay = reconnect.next_delay()
+            if delay is None:
+                message = _error_text(_request_error_response(reconnect.error, self._timeout))
+                log.warning("gave up reaching %s after %s", _backend_host(), _duration(reconnect.spent()))
+                yield _failed_event(opened, GAVE_UP_CODE, (
+                    f"Still no connection after {_duration(reconnect.spent())} of trying again. {message} "
+                    "Send the message again once the network is back."))
+                return
+            async for chunk in self._keepalive(delay, keepalive):
+                yield chunk
+            if self._closed:
+                return
+            reconnect.attempt += 1
+            try:
+                response = await self._send()
+            except _RECONNECT_ERRORS as exc:
+                reconnect.error = exc
+                yield keepalive
+                continue
+            except httpx.RequestError as exc:
+                yield _failed_event(opened, UPSTREAM_ERROR_CODE,
+                                    _error_text(_request_error_response(exc, self._timeout)))
+                return
+            if self._closed:
+                await response.aclose()
+                return
+            if response.status_code >= 400:
+                try:
+                    await response.aread()
+                finally:
+                    await response.aclose()
+                log.warning("upstream returned HTTP %s", response.status_code)
+                # Codex sends it again, and the ordinary path then deals with the answer.
+                yield _failed_event(opened, UPSTREAM_ERROR_CODE, _error_text(self._rejected(response)))
+                return
+            reconnect.reached()
+            self.upstream = response
+            return
 
     async def _relay(self):
         waited = 0.0
         # The response Codex was told of, once it has been.
         opened: dict | None = None
         try:
+            if self.upstream is None:
+                opened = self._opening
+                yield sse.sse_encode("response.created", {"type": "response.created", "response": opened})
+                async for chunk in self._reconnecting(opened):
+                    yield chunk
+                if self.upstream is None:
+                    return
             for attempt in itertools.count():
                 chunks = self.upstream.aiter_bytes()
                 forward_opening = opened is None
@@ -418,7 +637,8 @@ class _PastRateLimits:
                     return
                 self.upstream = retried
         finally:
-            await self.upstream.aclose()
+            if self.upstream is not None:
+                await self.upstream.aclose()
 
 
 class Bridge:
@@ -510,7 +730,10 @@ class Bridge:
             headers = {key: value for key, value in headers.items() if key.lower() != "content-type"}
         model = (send.get("json") or send.get("data") or {}).get("model")
         try:
-            upstream = await self.client.post(url, headers=headers, timeout=IMAGE_TIMEOUT, **send)
+            upstream = await _reach(
+                lambda: self.client.post(url, headers=headers, timeout=IMAGE_TIMEOUT, **send),
+                _Reconnect(connect_wait()),
+            )
         except httpx.RequestError as exc:
             return _request_error_response(exc, IMAGE_TIMEOUT)
         if upstream.status_code >= 400:
@@ -598,22 +821,29 @@ class Bridge:
             )
             return await self.client.send(request, stream=True)
 
+        reconnect = _Reconnect(connect_wait())
         try:
-            upstream = await send()
+            upstream = await _reach(send, reconnect, CONNECT_HOLD)
         except httpx.RequestError as exc:
             return _request_error_response(exc, self.client.timeout)
-        if upstream.status_code >= 400:
+        if upstream is not None and upstream.status_code >= 400:
             try:
                 await upstream.aread()
             finally:
                 await upstream.aclose()
             log.warning("upstream returned HTTP %s", upstream.status_code)
             return self._rejected(upstream)
+        # Still trying to reach the backend: Codex hears of a response now, to wait with it.
+        opening = None if upstream is not None else {
+            "id": f"resp_{uuid.uuid4().hex}", "object": "response", "created_at": int(time.time()),
+            "status": "in_progress", "model": upstream_body.get("model"), "output": [],
+        }
 
         transform = excel_tool_stream_transform(source_body)
 
         async def relay():
-            source = _PastRateLimits(upstream, send, rate_limit_wait())
+            source = _PastRateLimits(upstream, send, rate_limit_wait(), reconnect=reconnect, opening=opening,
+                                     rejected=self._rejected, timeout=self.client.timeout)
             try:
                 chunks = transform(source) if transform is not None else source
                 async for chunk in chunks:
@@ -628,7 +858,7 @@ class Bridge:
 
         return StreamingResponse(
             relay(),
-            status_code=upstream.status_code,
+            status_code=200 if upstream is None else upstream.status_code,
             media_type="text/event-stream",
             headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
         )
@@ -658,10 +888,12 @@ class Bridge:
         for attempt in range(NON_STREAMING_ATTEMPTS):
             upstream = None
             try:
-                request = self.client.build_request(
-                    "POST", excel_upstream.RESPONSES_URL, headers=headers, json=upstream_body
+                upstream = await _reach(
+                    lambda: self.client.send(self.client.build_request(
+                        "POST", excel_upstream.RESPONSES_URL, headers=headers, json=upstream_body
+                    ), stream=True),
+                    _Reconnect(connect_wait()),
                 )
-                upstream = await self.client.send(request, stream=True)
                 if upstream.status_code >= 400:
                     await upstream.aread()
                     return self._rejected(upstream)
@@ -742,11 +974,17 @@ def create_app(reader: SessionReader | None = None, *, client_factory=build_upst
         }
 
     async def json_body(request: Request) -> dict | Response:
-        raw = await request.body()
-        if len(raw) > MAX_BODY_BYTES:
-            return sse.openai_error_response(413, "Request body is too large")
+        limit = MAX_BODY_BYTES
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw += chunk
+            if len(raw) > limit:
+                return sse.openai_error_response(413, str(_too_large(limit)).capitalize())
         try:
-            return _decode_body(raw, request.headers.get("content-encoding", ""))
+            return _decode_body(bytes(raw), request.headers.get("content-encoding", ""), limit)
+        except BodyTooLarge as exc:
+            log.warning("refused a request: %s", exc)
+            return sse.openai_error_response(413, str(exc).capitalize())
         except (ValueError, OSError, zlib.error, json.JSONDecodeError, UnicodeDecodeError) as exc:
             return sse.openai_error_response(400, f"Invalid request body: {exc}")
 

@@ -109,7 +109,7 @@ excel-sub2api push-session --ssh operator@your-vps --sudo --watch 60
 | `GET/POST/DELETE /admin/session` | 回环 + 管理 key | 状态/导入/清除 |
 
 不提供 Chat Completions、Anthropic Messages、`/responses/compact`、WebSocket、管理面板。
-请求与解压后体积均限 64 MiB，管理请求限 64 KiB。上游 401/403/429、`Retry-After`
+请求与解压后体积均限 256 MiB，管理请求限 64 KiB。上游 401/403/429、`Retry-After`
 沿用桥接错误语义；token 过期后重新登录并同步即可。不要启动多个 Uvicorn worker
 共享同一端口，因为不同进程的内存会话不会同步。
 

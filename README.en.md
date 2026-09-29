@@ -244,6 +244,18 @@ Details:
 - To keep it on: `excel-codex desktop --keep-config`, and later `excel-codex desktop --off`
   (also the fix if the window was killed before it could restore the config).
 - Other model: `excel-codex desktop --model gpt-5.6-terra`; other port: `--port`.
+- While the window is open, Codex's apps and plugin suggestions (`features.apps`,
+  `features.remote_plugin`) are off; they come back with the config. Signed in with ChatGPT, Codex
+  waits on chatgpt.com for both when a conversation opens (apps, up to 30 seconds) and on every turn
+  (plugin suggestions, 5 seconds), so with a proxy node that is down the desktop app sits on
+  "loading". `--keep-apps` leaves them on.
+
+**The desktop app keeps loading a conversation, or a new task stays on "starting"**: most likely
+Codex itself cannot reach chatgpt.com (its sign-in, apps and plugins go there), and those requests
+do not go through the bridge. From 0.5.11 the apps and plugin suggestions are off while the bridge
+window is open, which leaves at most about 5 seconds on a conversation's first turn (Codex reading
+the account's settings). If it is still slow, use a steady proxy node for chatgpt.com and
+auth.openai.com; `could not reach chatgpt.com through the proxy` in the bridge window means this.
 
 **Error `The '…' model is not supported when using Codex with a ChatGPT account`** (after signing
 out of Codex it becomes `401 Unauthorized: Missing bearer or basic authentication` for
@@ -406,6 +418,17 @@ Notes:
 - Only the exit IP is sent to these lookup services, through the same proxy; nothing else is sent.
   The answer for an IP is cached.
 - `--timezone off` (or `EXCEL_BRIDGE_TIMEZONE=off`) turns both off.
+- A proxy that takes turns between nodes (say Taiwan and Japan) does not make the system timezone
+  flip back and forth: another exit's timezone is taken once it holds for 3 checks in a row (one a
+  minute, so about 2 minutes), and the window says once that it is waiting. The bridge also keeps
+  each exit IP's timezone for 12 hours, so switching back needs no new lookup.
+- With Windows "Set time zone automatically" on, Windows changes the timezone back to the local
+  one. The window sets it again and, the first time, says why; you can turn that setting off in
+  Settings > Time & language > Date & time.
+- Apart from the first check at start, a single failed check is not reported in the window: the
+  same error is reported when it comes twice in a row, and the recovery after it. A proxy node that
+  cannot be reached shows as `could not reach … through the proxy` (without the proxy's password).
+- Times in the window's log stay in the timezone the window started in.
 - `excel-codex timezone` shows the exit timezone and the current state;
   `excel-codex timezone sync --probe` looks up without changing anything.
 - A country you did not expect, such as `(Cloudflare: TW)`, means your proxy sends OpenAI's traffic
@@ -474,6 +497,24 @@ each of its retries would wait another 5 minutes. You can interrupt in Codex at 
 - `EXCEL_BRIDGE_RATE_LIMIT_WAIT=<seconds>` sets how long to wait: `300` by default, at most `1800`;
   `0` for no wait, the error then reaching Codex as it came (it retries five times, quickly, its own
   way).
+
+## Network drops
+
+When a proxy node goes down or the network drops out, requests cannot reach `bps.openai.com`, and
+Codex retries five times within seconds before showing `502 Bad Gateway: Could not connect to
+bps.openai.com (ConnectError)`. From 0.5.11 the bridge keeps trying itself:
+
+- A request the backend has not answered yet (no connection, TLS handshake cut off, and so on) is
+  sent again after 0.5, 1, 2, 4, 8 and 15 seconds (then every 15 seconds), for up to 2 minutes.
+  Codex sees nothing for the first 5 seconds; after that it just shows it is working, the bridge
+  telling it every 10 seconds that the response is still going. Once connected it answers as usual.
+- If there is still no connection after 2 minutes, Codex shows `Still no connection after 2
+  minutes …` and the turn ends; send the message again once the network is back. Codex does not
+  retry that itself. You can interrupt in Codex at any time.
+- A request that fails after the backend has answered (a read timeout, say) is not sent again, so
+  nothing is repeated.
+- `EXCEL_BRIDGE_CONNECT_WAIT=<seconds>` sets how long to keep trying: `120` by default, at most
+  `1800`; `0` for no second try, the error then reaching Codex as it came.
 
 ## Pictures
 
@@ -560,6 +601,9 @@ running from source, `git pull` is enough.
 ## Limitations
 
 - Responses API only; there is no `/responses/compact` endpoint.
+- A request can be up to 1 GiB once decompressed. Up to 0.5.10 the limit was 64 MiB, which long
+  conversations (with pictures above all) passed before the 450k auto-compaction, failing with
+  `Invalid request body: request body is too large`.
 - The Excel backend adds a fixed prefix of about 22k tokens to every request (mostly served from
   cache); usage counts against your ChatGPT plan, and more sessions at once use it up faster.
 - It relies on a private backend of the Excel add-in and may break whenever OpenAI changes it.
@@ -589,6 +633,7 @@ running from source, `git pull` is enough.
 | `EXCEL_BRIDGE_TIMEZONE` | `auto` (default) / `off`, same as `--timezone`, see [Exit timezone](#exit-timezone) |
 | `EXCEL_BRIDGE_IMAGE_MODEL` | The model Codex's image tool asks the backend for, default `gpt-image-2` (same as `--image-model`), see [Image generation](#image-generation) |
 | `EXCEL_BRIDGE_RATE_LIMIT_WAIT` | Seconds to wait out a rate limit before Codex gets the error: `300` (5 minutes) by default, `0` for none, at most `1800`; see [Rate limits](#rate-limits) |
+| `EXCEL_BRIDGE_CONNECT_WAIT` | Seconds to keep trying when the backend cannot be reached: `120` (2 minutes) by default, `0` for no second try, at most `1800`; see [Network drops](#network-drops) |
 | `CODEX_HOME` | Codex config folder whose `config.toml` `desktop` edits. Default `~/.codex` |
 | `GHCP_EXCEL_WEBVIEW2_DATA_DIR` | Windows WebView2 data root (same as `--webview-dir`) |
 | `GHCP_EXCEL_WEBKIT_WEBSITE_DATA_DIR` | macOS WebKit data folder |

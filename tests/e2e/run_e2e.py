@@ -50,6 +50,10 @@ place.  ``threads migrate --from OpenAI`` then moves it under ``openai``.
 backend, the fake one refuses a user message with an inline picture; the
 bridge must then upload it once to the attachments endpoint, the way the
 add-in does, and name it by its file id from then on.
+
+``--network-drop`` cuts every connection to the backend for a while after the
+first, the way a proxy node that went away does: the bridge must keep trying,
+and Codex must see an answer, not the drop.
 """
 
 from __future__ import annotations
@@ -66,6 +70,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import re
@@ -330,6 +335,83 @@ RATE_LIMITED = ("Rate limit reached for gpt-5.6-sol in organization org-e2e on t
 # --rate-limited long: limited for longer than Codex, told to, waits for a silent stream.
 LONG_RATE_LIMIT_SECONDS = 40
 CODEX_IDLE_MS = 20000
+
+
+# --network-drop: every connection to the backend is cut for this long after the first one.
+NETWORK_DROP_SECONDS = 12
+
+
+class Gate:
+    """Passes connections on to the fake backend, but cuts requests to it for ``drop`` seconds after the first.
+
+    Only POSTs: the bridge's look-up of the exit IP on the same host goes through.
+    """
+
+    def __init__(self, port: int, drop: float) -> None:
+        self.target, self.drop = port, drop
+        self.cut = 0
+        self.down_until: float | None = None
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(64)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                client, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(client,), daemon=True).start()
+
+    def _down_for(self, data: bytes) -> bool:
+        if not data.startswith(b"POST"):
+            return False
+        now = time.monotonic()
+        if self.down_until is None:
+            self.down_until = now + self.drop
+        return now < self.down_until
+
+    def _cut(self, client: socket.socket) -> None:
+        self.cut += 1
+        # Reset rather than closed, the way a connection through a node that went away ends.
+        linger = struct.pack("HH" if sys.platform == "win32" else "ii", 1, 0)
+        with contextlib.suppress(OSError):
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+        client.close()
+
+    def _handle(self, client: socket.socket) -> None:
+        try:
+            upstream = socket.create_connection(("127.0.0.1", self.target))
+        except OSError:
+            client.close()
+            return
+
+        def back() -> None:
+            with contextlib.suppress(OSError):
+                while data := upstream.recv(65536):
+                    client.sendall(data)
+            with contextlib.suppress(OSError):
+                client.shutdown(socket.SHUT_WR)
+
+        replies = threading.Thread(target=back, daemon=True)
+        replies.start()
+        with contextlib.suppress(OSError):
+            # On a kept-alive connection each request starts a read of its own.
+            while data := client.recv(65536):
+                if self._down_for(data):
+                    self._cut(client)
+                    break
+                upstream.sendall(data)
+        with contextlib.suppress(OSError):
+            upstream.shutdown(socket.SHUT_WR)
+        replies.join(timeout=30)
+        client.close()
+        upstream.close()
+
+    def close(self) -> None:
+        self.sock.close()
 
 
 def start_server(app) -> tuple[uvicorn.Server, int]:
@@ -789,6 +871,9 @@ def main() -> int:
                         help="fail the first two requests on the shared tokens-per-minute limit, or (long) "
                         f"all in the first {LONG_RATE_LIMIT_SECONDS} s with Codex dropping a stream silent for "
                         f"{CODEX_IDLE_MS // 1000} s; the bridge waits them out")
+    parser.add_argument("--network-drop", action="store_true",
+                        help=f"cut every connection to the backend for {NETWORK_DROP_SECONDS} s after the first; "
+                        "the bridge keeps trying")
     parser.add_argument("--first-launcher",
                         help="with --migrate: the command that starts that conversation, e.g. a 0.5.3 checkout's")
     parser.add_argument("--timeout", type=int, default=900, help="seconds for each long step")
@@ -819,13 +904,14 @@ def main() -> int:
                                exit_zone=exit_zone, rate_limited=2 if args.rate_limited == "briefly" else 0,
                                rate_limited_for=LONG_RATE_LIMIT_SECONDS if args.rate_limited == "long" else 0)
     server, port = start_server(backend.app)
+    gate = Gate(port, NETWORK_DROP_SECONDS) if args.network_drop else None
 
     env = dict(os.environ)
     env.update(
         CODEX_HOME=str(root / "codex-home"),
         EXCEL_BRIDGE_CODEX_AUTH=str(codex_auth),
         EXCEL_BRIDGE_HOME=str(root / "bridge-home"),
-        GHCP_EXCEL_RESPONSES_URL=f"http://127.0.0.1:{port}/basispoints/api/responses",
+        GHCP_EXCEL_RESPONSES_URL=f"http://127.0.0.1:{gate.port if gate else port}/basispoints/api/responses",
         EXCEL_BRIDGE_TIMEZONE="auto",
         EXCEL_BRIDGE_TIMEZONE_LOOKUP=f"http://127.0.0.1:{port}/geo/{{ip}}",
         EXCEL_BRIDGE_TIMEZONE_TRACE=f"http://127.0.0.1:{port}/cdn-cgi/trace",
@@ -851,6 +937,8 @@ def main() -> int:
     else:
         output, checks = run_launcher(launcher, args, webview, project, env)
     server.should_exit = True
+    if gate:
+        gate.close()
 
     upstream_model = excel_upstream.EXCEL_MODEL_UPSTREAMS[args.model]
     # A --first-launcher from before 0.5.4 does not move the timezone.
@@ -954,6 +1042,17 @@ def main() -> int:
              "the bridge did not say it was waiting"),
             (not any(said in output.lower() for said in ("rate limit", "reconnecting", "disconnected")),
              "Codex saw the rate limit, or gave up on the stream"),
+        ]
+    if gate:
+        bridge_log = root / "bridge-home" / "bridge.log"
+        said = bridge_log.read_text(encoding="utf-8", errors="replace") if bridge_log.exists() else ""
+        said += _desktop_log(root)
+        checks += [
+            (gate.cut >= 3, f"expected the first connections cut, got {gate.cut}"),
+            ("trying again for up to" in said and "again after" in said,
+             "the bridge did not say it was trying again, or that it got through"),
+            (not any(seen in output.lower() for seen in ("reconnecting", "disconnected", "bad gateway")),
+             "Codex saw the drop"),
         ]
     failures = [message for ok, message in checks if not ok]
 

@@ -6,6 +6,11 @@ comments out the user's own ``model`` / ``model_provider`` /
 ``model_catalog_json`` / ``openai_base_url`` lines with a marker prefix.  Removing the blocks and the
 prefix gives back the original text byte for byte; ``enable`` checks that
 before writing anything, and keeps a copy of the original next to it.
+
+It also turns off two Codex features that wait on chatgpt.com when signed in
+with ChatGPT: apps (up to 30 s when a session starts) and remote plugin
+suggestions (5 s on every turn, since failures are not remembered).  Through a
+proxy node that is down, the desktop app sits on "loading" meanwhile.
 """
 
 from __future__ import annotations
@@ -24,8 +29,12 @@ BOTTOM_START = "# >>> excel-codex-bridge provider"
 BOTTOM_END = "# <<< excel-codex-bridge provider"
 # Set on the bottom marker when the original text did not end with a newline.
 NO_EOL_FLAG = " (original had no final newline)"
+# Put inside the user's own [features] table, which the top block cannot add to.
+FEATURES_START = "# >>> excel-codex-bridge features"
+FEATURES_END = "# <<< excel-codex-bridge features"
 DISABLED_PREFIX = "# excel-codex-bridge disabled: "
 BACKUP_SUFFIX = ".before-excel-codex"
+QUIET_FEATURES = ("apps", "remote_plugin")
 
 _TABLE_HEADER = re.compile(r"\s*\[")
 _OWN_KEYS = re.compile(r"\s*(model_provider|model|model_catalog_json|openai_base_url)\s*=")
@@ -33,6 +42,11 @@ _OWN_KEYS = re.compile(r"\s*(model_provider|model|model_catalog_json|openai_base
 _OWN_TABLE = re.compile(
     rf"\s*\[\s*model_providers\s*\.\s*([\"']?){re.escape(codex_config.PROVIDER_ID)}\1\s*[.\]]"
 )
+_FEATURES_TABLE = re.compile(r"""\s*\[\s*(["']?)features\1\s*\]\s*(#.*)?$""")
+_FEATURE_KEYS = re.compile(rf"""\s*(["']?)({'|'.join(QUIET_FEATURES)})\1\s*=""")
+_ROOT_FEATURE_KEYS = re.compile(rf"""\s*(["']?)features\1\s*\.\s*(["']?)({'|'.join(QUIET_FEATURES)})\2\s*=""")
+# `features = { ... }` cannot be added to; the features are left alone then.
+_INLINE_FEATURES = re.compile(r"""\s*(["']?)features\1\s*=""")
 _BOM = "﻿"
 
 
@@ -61,6 +75,10 @@ def strip_managed(text: str) -> str:
     i = 0
     while i < len(lines):
         bare = _bare(lines[i])
+        if bare == FEATURES_START:
+            end = next((j for j in range(i + 1, len(lines)) if _bare(lines[j]) == FEATURES_END), None)
+            i = i + 1 if end is None else end + 1
+            continue
         if bare == TOP_START or bare.startswith(BOTTOM_START):
             end_marker = TOP_END if bare == TOP_START else BOTTOM_END
             if bare.startswith(BOTTOM_START):
@@ -81,31 +99,70 @@ def strip_managed(text: str) -> str:
     return result
 
 
-def _comment_out_conflicts(text: str) -> str:
+def _comment_out_conflicts(text: str, *, quiet_features: bool = False) -> str:
     out = []
     top_level = True
-    in_own_table = False
+    in_own_table = in_features = False
     for line in text.splitlines(keepends=True):
         if _TABLE_HEADER.match(line):
             top_level = False
             in_own_table = bool(_OWN_TABLE.match(line))
-        if in_own_table or (top_level and _OWN_KEYS.match(line)):
+            in_features = bool(_FEATURES_TABLE.match(line))
+        feature = quiet_features and (
+            (in_features and _FEATURE_KEYS.match(line)) or (top_level and _ROOT_FEATURE_KEYS.match(line))
+        )
+        if in_own_table or (top_level and _OWN_KEYS.match(line)) or feature:
             out.append(DISABLED_PREFIX + line)
         else:
             out.append(line)
     return "".join(out)
 
 
-def enable(text: str, *, port: int, catalog: Path, model: str, shared: bool = False) -> str:
+def _quiet_lines(prefix: str = "") -> list[str]:
+    return [f"{prefix}{name} = false" for name in QUIET_FEATURES]
+
+
+def _features_table(text: str) -> int | None:
+    """Index of the line opening the ``[features]`` table, if there is one."""
+    return next((i for i, line in enumerate(text.splitlines()) if _FEATURES_TABLE.match(line)), None)
+
+
+def _inline_features(text: str) -> bool:
+    for line in text.splitlines():
+        if _TABLE_HEADER.match(line):
+            return False
+        if _INLINE_FEATURES.match(line):
+            return True
+    return False
+
+
+def _into_features_table(body: str, index: int, nl: str) -> str:
+    lines = body.splitlines(keepends=True)
+    header = lines[index]
+    block = nl.join([FEATURES_START, *_quiet_lines(), FEATURES_END])
+    # A header on the last line without a newline: the block ends the text the same way.
+    lines[index] = header + block + nl if header.endswith("\n") else header + nl + block
+    return "".join(lines)
+
+
+def enable(
+    text: str, *, port: int, catalog: Path, model: str, shared: bool = False, quiet_features: bool = False
+) -> str:
     """``text`` with the bridge made the default provider for every Codex client.
 
     ``shared`` points Codex's own ``openai`` provider at the bridge, so the
     conversation list is the same with the bridge on or off (see
     ``codex_config``).  The ``excel-bridge`` provider is defined either way.
+    ``quiet_features`` turns off ``QUIET_FEATURES`` unless ``features`` is an
+    inline table.
     """
     base = strip_managed(text)
     nl = "\r\n" if "\r\n" in base else "\n"
-    body = _comment_out_conflicts(base)
+    quiet_features = quiet_features and not _inline_features(base)
+    body = _comment_out_conflicts(base, quiet_features=quiet_features)
+    table = _features_table(body) if quiet_features else None
+    if table is not None:
+        body = _into_features_table(body, table, nl)
     no_eol = bool(body) and not body.endswith("\n")
     toml = codex_config._toml_string
     top = [
@@ -114,6 +171,7 @@ def enable(text: str, *, port: int, catalog: Path, model: str, shared: bool = Fa
         *([f"openai_base_url = {toml(codex_config.base_url(port))}"] if shared else []),
         f"model = {toml(codex_config.codex_model(model))}",
         f"model_catalog_json = {toml(str(catalog))}",
+        *(_quiet_lines("features.") if quiet_features and table is None else []),
         TOP_END,
     ]
     bottom = [
@@ -176,10 +234,22 @@ class ConfigError(RuntimeError):
     pass
 
 
-def enable_file(path: Path, *, port: int, catalog: Path, model: str, shared: bool = False) -> Path | None:
-    """Enable in ``path``; returns the backup made of the original, if any."""
-    text, bom = _read(path)
-    new = enable(text, port=port, catalog=catalog, model=model, shared=shared)
+def features_quiet(text: str) -> bool:
+    """Whether ``text`` has ``QUIET_FEATURES`` turned off."""
+    try:
+        data = _parse(text)
+    except ValueError:
+        return False
+    if data is None:  # Python 3.10: our own lines tell
+        lines = {_bare(line) for line in text.splitlines()}
+        return FEATURES_START in lines or set(_quiet_lines("features.")) <= lines
+    features = data.get("features")
+    return isinstance(features, dict) and all(features.get(name) is False for name in QUIET_FEATURES)
+
+
+def _checked(path: Path, text: str, *, port: int, catalog: Path, model: str, shared: bool,
+             quiet_features: bool) -> str:
+    new = enable(text, port=port, catalog=catalog, model=model, shared=shared, quiet_features=quiet_features)
     original = strip_managed(text)
     if strip_managed(new) != original:
         raise ConfigError(f"{path} has a layout this tool cannot undo exactly; edit it by hand instead")
@@ -194,6 +264,27 @@ def enable_file(path: Path, *, port: int, catalog: Path, model: str, shared: boo
         or (shared and data.get("openai_base_url") != codex_config.base_url(port))
     ):
         raise ConfigError(f"could not point {path} at the bridge")
+    if quiet_features and not features_quiet(new):
+        raise ConfigError(f"could not turn off Codex features in {path}")
+    return new
+
+
+def enable_file(
+    path: Path, *, port: int, catalog: Path, model: str, shared: bool = False, quiet_features: bool = False
+) -> Path | None:
+    """Enable in ``path``; returns the backup made of the original, if any.
+
+    Should turning the features off be what stands in the way, the config is
+    written without it; ``features_quiet`` tells which way it went.
+    """
+    text, bom = _read(path)
+    settings = dict(port=port, catalog=catalog, model=model, shared=shared)
+    try:
+        new = _checked(path, text, **settings, quiet_features=quiet_features)
+    except ConfigError:
+        if not quiet_features:
+            raise
+        new = _checked(path, text, **settings, quiet_features=False)
     backup = None
     if path.exists() and not is_enabled(text):
         backup = path.with_name(path.name + BACKUP_SUFFIX)
@@ -205,7 +296,7 @@ def enable_file(path: Path, *, port: int, catalog: Path, model: str, shared: boo
 def disable_file(path: Path) -> bool:
     """Undo ``enable_file``; False when there was nothing to undo."""
     text, bom = _read(path)
-    if not is_enabled(text) and DISABLED_PREFIX not in text:
+    if not is_enabled(text) and DISABLED_PREFIX not in text and FEATURES_START not in text:
         return False
     _write(path, strip_managed(text), bom)
     return True

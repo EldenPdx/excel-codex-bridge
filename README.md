@@ -203,6 +203,15 @@ TLS 证书校验始终开启。Codex 到桥接走 `127.0.0.1`，启动器会自�
 - 想长期保持：`excel-codex desktop --keep-config`，之后用 `excel-codex desktop --off` 恢复
   （窗口意外被杀、配置没还原时也用它）。
 - 换模型：`excel-codex desktop --model gpt-5.6-terra`；换端口：`--port`。
+- 窗口开着期间会关掉 Codex 的 Apps 和插件推荐（`features.apps`、`features.remote_plugin`），
+  随配置一起恢复。Codex 用 ChatGPT 登录时，打开对话要等 chatgpt.com 回应这两项（Apps 最多 30 秒，
+  插件推荐每一轮 5 秒）；代理节点不通时，桌面版就一直停在“加载中”。想保留它们用 `--keep-apps`。
+
+**桌面版打开对话一直在加载、新任务一直“启动中”**：多半是 Codex 自己连 chatgpt.com 连不上
+（登录、Apps、插件都走它），这些请求不经过桥接。0.5.11 起桥接窗口开着时 Apps 和插件推荐已关掉，
+最多还剩每条对话第一轮约 5 秒（Codex 读取账号设置）。仍然很慢的话，给 chatgpt.com 和
+auth.openai.com 换一个稳定的代理节点；桥接窗口里出现 `could not reach chatgpt.com through the proxy`
+时就是这个原因。
 
 **报错 `The '…' model is not supported when using Codex with a ChatGPT account`**
 （在 Codex 里退出登录后会变成 `401 Unauthorized: Missing bearer or basic authentication`，
@@ -330,6 +339,14 @@ Codex 会把本机的时区和日期写进每个对话（`<environment_context>`
 - 只把出口 IP 发给这几个定位服务查时区，走的也是同一个代理，不发送别的信息。同一个 IP
   的结果会缓存。
 - `--timezone off`（或环境变量 `EXCEL_BRIDGE_TIMEZONE=off`）关掉以上两项。
+- 代理在几个节点之间轮换（比如台湾、日本来回切）时，系统时区不跟着来回跳：新的出口时区要连续
+  3 次检查都一样才采用（每分钟查一次，约 2 分钟），等待期间窗口里说一次。桥接也记得查过的出口 IP 的时区（12 小时），
+  来回切时不用重新查。
+- Windows 的“自动设置时区”开着时，系统会把时区改回本地的。窗口会再改回去，第一次时说明原因；
+  可以在 设置 > 时间和语言 > 日期和时间 里关掉“自动设置时区”。
+- 除了启动时的第一次，偶尔一次查询失败不会在窗口里报错，同一种错误连续出现两次才说，恢复时说一声。代理节点连不上时报
+  `could not reach … through the proxy`（代理地址里的密码不显示）。
+- 窗口里日志的时间一直按窗口启动时的时区显示。
 - `excel-codex timezone` 查看出口时区和当前状态；`excel-codex timezone sync --probe` 只查不改。
 - 显示 `(Cloudflare: TW)` 这类和预期不同的国家，说明代理把 OpenAI 的流量分流到了那个国家的节点，
   OpenAI 看到的就是那里；代理软件首页显示的只是默认节点。通过同一个代理打开
@@ -385,6 +402,20 @@ Codex 会把本机的时区和日期写进每个对话（`<environment_context>`
 - 回答开始后才失败的不重发，免得内容重复；别的错误照原样交给 Codex。
 - `EXCEL_BRIDGE_RATE_LIMIT_WAIT=<秒>` 改最多等多久：默认 `300`，最多 `1800`；`0` 不等，
   报错照原样交给 Codex（它会按自己的方式很快重试 5 次）。
+
+## 网络中断
+
+代理节点掉线或网络闪断时，请求发不到 `bps.openai.com`，Codex 会在几秒内重试 5 次后报
+`502 Bad Gateway: Could not connect to bps.openai.com (ConnectError)`。0.5.11 起桥接自己接着连：
+
+- 后端还没回应的请求（连不上、TLS 握手被断等），隔 0.5、1、2、4、8、15 秒（之后每次 15 秒）把同一个
+  请求再发一次，最多等 2 分钟。前 5 秒 Codex 什么都看不到；之后它只显示在工作，桥接每 10 秒告诉它还在进行。
+  连上了就照常回答。
+- 等满 2 分钟还连不上，Codex 显示 `Still no connection after 2 minutes …`，这一轮结束，网络恢复后再发一次
+  即可；Codex 不会再自己重试。中途随时可以在 Codex 里中断。
+- 后端已经回应之后才断的不重发（比如读回答时超时），免得内容重复。
+- `EXCEL_BRIDGE_CONNECT_WAIT=<秒>` 改最多等多久：默认 `120`，最多 `1800`；`0` 不重试，
+  报错照原样交给 Codex。
 
 ## 图片
 
@@ -450,6 +481,8 @@ Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图�
 ## 限制
 
 - 只实现 Responses API，没有 `/responses/compact` 端点。
+- 单个请求解压后最大 1 GiB。0.5.10 及更早是 64 MiB：长对话（尤其带图片）在 450k 自动压缩前就会超过，
+  报 `Invalid request body: request body is too large`。
 - Excel 后端会给每个请求加上约 2.2 万 token 的固定前缀，大部分命中缓存；额度按你的 ChatGPT 套餐计算，
   同时开的会话越多用得越快。
 - 依赖 Excel 加载项的非公开后端，OpenAI 一调整就可能失效。
@@ -477,6 +510,7 @@ Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图�
 | `EXCEL_BRIDGE_TIMEZONE` | `auto`（默认）/ `off`，同 `--timezone`，见[出口时区](#出口时区) |
 | `EXCEL_BRIDGE_IMAGE_MODEL` | 生图工具向后端请求的模型，默认 `gpt-image-2`（同 `--image-model`），见[生图](#生图) |
 | `EXCEL_BRIDGE_RATE_LIMIT_WAIT` | 被限流时最多等多少秒再把报错交给 Codex，默认 `300`（5 分钟），`0` 不等，最多 `1800`，见[限流](#限流) |
+| `EXCEL_BRIDGE_CONNECT_WAIT` | 连不上后端时最多再试多少秒，默认 `120`（2 分钟），`0` 不重试，最多 `1800`，见[网络中断](#网络中断) |
 | `CODEX_HOME` | Codex 配置目录，`desktop` 改写其中的 `config.toml`。默认 `~/.codex` |
 | `GHCP_EXCEL_WEBVIEW2_DATA_DIR` | Windows WebView2 数据根目录（同 `--webview-dir`） |
 | `GHCP_EXCEL_WEBKIT_WEBSITE_DATA_DIR` | macOS WebKit 数据目录 |

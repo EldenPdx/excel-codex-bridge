@@ -89,6 +89,10 @@ jobs:
         run: python tests/e2e/run_e2e.py --rate-limited long -- ./excel-codex.sh
       - name: e2e (excel-codex.sh desktop, the shared rate limit waited out)
         run: python tests/e2e/run_e2e.py --desktop --shared --rate-limited -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh, a network drop waited out)
+        run: python tests/e2e/run_e2e.py --network-drop -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh desktop, a network drop waited out)
+        run: python tests/e2e/run_e2e.py --desktop --shared --network-drop -- ./excel-codex.sh
 
   windows:
     needs: test
@@ -152,6 +156,10 @@ jobs:
         run: python tests/e2e/run_e2e.py --rate-limited long -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.exe desktop, the shared rate limit waited out)
         run: python tests/e2e/run_e2e.py --desktop --shared --rate-limited -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe, a network drop waited out)
+        run: python tests/e2e/run_e2e.py --network-drop -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe desktop, a network drop waited out)
+        run: python tests/e2e/run_e2e.py --desktop --shared --network-drop -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.cmd)
         run: python tests/e2e/run_e2e.py -- excel-codex.cmd
 

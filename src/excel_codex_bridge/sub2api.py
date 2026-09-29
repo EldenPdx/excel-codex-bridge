@@ -21,11 +21,13 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from . import excel_upstream, images, sse
-from .server import MAX_BODY_BYTES, Bridge, build_upstream_client
+from .server import Bridge, build_upstream_client
 from .session import SessionReader
 
 SESSION_PATH = "/admin/session"
 MAX_SESSION_BYTES = 64 * 1024
+# Long conversations pass 64 MB; this one faces a network, so it stays below the local bridge's limit.
+MAX_BODY_BYTES = 256 * 1024 * 1024
 API_PATHS = {"/v1/models", "/models", "/v1/responses", "/responses"}
 
 

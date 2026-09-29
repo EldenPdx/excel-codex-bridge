@@ -86,7 +86,7 @@ retries failures and restores the session after a sidecar restart without saving
 Authenticated `/v1/models` and `/v1/responses` (also available without `/v1`) reuse the
 bridge's streaming, non-streaming, tool-call and image adaptation. `/healthz` is liveness
 only. No Chat Completions, Messages, `/responses/compact`, WebSocket or dashboard.
-Request/decompressed bodies are limited to 64 MiB; session imports to 64 KiB.
+Request/decompressed bodies are limited to 256 MiB; session imports to 64 KiB.
 Do not run multiple Uvicorn workers: the session is process-local.
 
 ```sh
