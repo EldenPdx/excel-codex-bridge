@@ -439,6 +439,17 @@ Codex 的子代理（多代理 v2 的 `collaboration.spawn_agent` / `send_messag
 真正由别的后端加密的内容（比如关掉桥接、用官方登录接着聊时留下的）Excel 后端读不了。后端因此报错时，
 桥接把这些内容换成一句说明再发一次，窗口里写 `the Excel backend could not read what another backend encrypted`。
 
+## 不带本工具模型目录的 Codex（中转站配置、Cockpit）
+
+用中转站的 Codex 配置模板、Cockpit Tools 或自己写的 provider 连桥接（包括 SUB2API）时，Codex 没有本工具
+的模型目录，对 gpt-5.6 / gpt-6 用它自带的设置：工具不放在请求的 `tools` 里，而是放进一条 `additional_tools`
+输入（Responses Lite），并且只给模型 code mode 的 `exec`（在里面写 JavaScript 调用 shell 等工具）和 `wait`。
+0.5.13 及更早的桥接读不到这些工具，模型的每次调用都报 `exec is not a tool in the catalog`。
+
+0.5.14 起桥接从这条输入里读出工具和指令，模型通过 `exec` 调用工具，和官方登录时一样。模型直接调用
+`exec_command` 这类嵌在 `exec` 里的工具时，会被告知改用 `exec`；反过来，在官方 code mode 里开始的对话换到
+本工具的模型目录后，模型照着历史去调用 `exec`，也会被告知直接调用目录里的工具。
+
 ## 图片
 
 Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图都能用，不需要任何设置。桥接这样转交：

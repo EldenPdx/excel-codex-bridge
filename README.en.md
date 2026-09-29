@@ -546,6 +546,21 @@ the official sign-in) the Excel backend cannot read. When the backend fails on i
 it with a note and sends the request again; the window says `the Excel backend could not read what
 another backend encrypted`.
 
+## Codex without this tool's model catalog (relay configs, Cockpit)
+
+When Codex reaches the bridge (SUB2API included) through a relay's Codex config template, Cockpit
+Tools or a provider of your own, it has no model catalog of this tool's and uses its own settings for
+gpt-5.6 / gpt-6: the tools are not in the request's `tools` but in an `additional_tools` input item
+(Responses Lite), and the model gets only code mode's `exec` (JavaScript that calls the shell and the
+other tools) and `wait`. 0.5.13 and earlier did not read those tools, so every call the model made
+failed with `exec is not a tool in the catalog`.
+
+From 0.5.14 the bridge reads the tools and instructions from that item, and the model calls tools
+through `exec`, as with the official sign-in. A model that calls a tool nested in `exec` directly (such
+as `exec_command`) is told to go through `exec`; the other way round, when a conversation begun in the
+official code mode carries on with this tool's model catalog and the model calls `exec` as its history
+did, it is told to call the catalog's tools directly.
+
 ## Pictures
 
 Screenshots pasted into Codex, `codex -i picture.png` and the model's `view_image` all work, with

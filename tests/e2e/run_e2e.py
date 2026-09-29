@@ -58,6 +58,13 @@ and Codex must see an answer, not the drop.
 ``--subagent`` turns on Codex's ``multi_agent_v2`` and has the first answer
 also spawn a helper agent (``collaboration.spawn_agent``).  The helper must be
 given the task as text: labelled encrypted, the backend could not read it.
+
+``--lite`` runs Codex through a relay the way a relay's config template sets it
+up, with ``serve`` in the relay's place and without the bridge's model
+entries: Codex's own for this model then send the tools in an input item
+(Responses Lite), and only code mode's ``exec`` and ``wait`` to the model.
+The first answer calls ``exec`` with JavaScript that runs the shell tool
+through ``tools``; the bridge must read the tools from that item.
 """
 
 from __future__ import annotations
@@ -171,8 +178,10 @@ def shell_call(raw_request: str, command: str = PROBE) -> tuple[str, dict]:
     return "shell", {"command": ["bash", "-lc", command] if sys.platform != "win32" else ["cmd", "/c", command]}
 
 
-def transport_call(n: int, name: str, arguments: dict) -> dict:
-    code = json.dumps({"name": name, "arguments": arguments})
+def transport_call(n: int, name: str, arguments: dict | str) -> dict:
+    """A run_officejs call wrapping ``name``: a function tool's ``arguments``, or a custom tool's raw input."""
+    code = json.dumps({"name": name, "input": arguments} if isinstance(arguments, str)
+                      else {"name": name, "arguments": arguments})
     return {
         "type": "function_call", "id": f"fc_{n}", "call_id": f"call_{n}",
         "name": "run_officejs", "arguments": json.dumps({"code": code}), "status": "completed",
@@ -185,6 +194,16 @@ SUBAGENT_TASK = "Count the rows of the sheet and say subagent-task-e2e."
 EXIT_IP = "1.1.1.1"
 
 
+def code_mode_call(raw_request: str, command: str = PROBE) -> tuple[str, str]:
+    """Code mode's ``exec``, running whichever shell tool this model has through ``tools``."""
+    # exec's own description names exec_command as an example; it declares the tools it has.
+    if "{ shell_command(" in raw_request:
+        call = f"tools.shell_command({{command: {json.dumps(command)}}})"
+    else:
+        call = f"tools.exec_command({{cmd: {json.dumps(command)}}})"
+    return "exec", f"const result = await {call};\ntext(result);\n"
+
+
 def exit_zone_for(now: dt.datetime) -> str:
     """A proxy exit whose day is not today in UTC, so moving the date shows."""
     return "Pacific/Kiritimati" if now.hour >= 10 else "Pacific/Pago_Pago"
@@ -193,7 +212,7 @@ def exit_zone_for(now: dt.datetime) -> str:
 class FakeExcelBackend:
     def __init__(self, parallel: bool = False, imagegen: bool = False, refuse: str | None = None,
                  exit_zone: str = "Pacific/Kiritimati", rate_limited: int = 0,
-                 rate_limited_for: float = 0.0, subagent: bool = False) -> None:
+                 rate_limited_for: float = 0.0, subagent: bool = False, lite: bool = False) -> None:
         self.requests: list[dict] = []
         # With subagent: the helper's own requests, kept apart since they come alongside the rest.
         self.helper_requests: list[dict] = []
@@ -289,7 +308,7 @@ class FakeExcelBackend:
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(helper_asked.wait(), 60)
             if n == 1:
-                name, arguments = shell_call(raw)
+                name, arguments = code_mode_call(raw) if lite else shell_call(raw)
                 self.shell_tool = name
                 items = [transport_call(1, name, arguments)]
                 if imagegen:
@@ -653,8 +672,13 @@ def migrate_then_resume(launcher, args, root: Path, webview: Path, project: Path
     return output, checks
 
 
-def through_a_relay(launcher, args, root: Path, webview: Path, project: Path, env: dict) -> tuple[str, list]:
-    """A conversation started through a relay's own provider named ``OpenAI``; ``serve`` stands in for the relay."""
+def through_a_relay(launcher, args, root: Path, webview: Path, project: Path, env: dict,
+                    catalog: bool = True) -> tuple[str, list]:
+    """A conversation started through a relay's own provider named ``OpenAI``; ``serve`` stands in for the relay.
+
+    ``catalog=False`` leaves the bridge's model entries out, as a relay's
+    template does: Codex then sends this model's tools the Responses Lite way.
+    """
     with serving(launcher, args, root, webview, project, env, "relay.log") as (port, up):
         codex = shutil.which("codex", path=env.get("PATH"))
         if not (up and codex):
@@ -668,10 +692,9 @@ def through_a_relay(launcher, args, root: Path, webview: Path, project: Path, en
             # The key comes from auth.json's OPENAI_API_KEY, as with the relay's template.
             "-c", f"{table}.requires_openai_auth=true",
             "-c", f"model='{codex_config.codex_model(args.model)}'",
-            # The bridge's model entries: Codex's own for this model hand it the tools in a
-            # form the bridge does not read (Responses Lite), so its call would reach no tool.
-            "-c", f"model_catalog_json='{codex_config.write_catalog(root / 'catalog')}'",
         ]
+        if catalog:
+            overrides += ["-c", f"model_catalog_json='{codex_config.write_catalog(root / 'catalog')}'"]
         result = run(codex_config.codex_command(codex, overrides, args.codex_args),
                      cwd=project, env=loopback_direct(env), timeout=args.timeout)
     return result.stdout, [
@@ -901,6 +924,9 @@ def main() -> int:
                         f"{CODEX_IDLE_MS // 1000} s; the bridge waits them out")
     parser.add_argument("--subagent", action="store_true",
                         help="also spawn a helper agent (Codex's multi_agent_v2); it must get the task as text")
+    parser.add_argument("--lite", action="store_true",
+                        help="run Codex through a relay without the bridge's model entries, so it sends "
+                        "the tools the Responses Lite way and calls them through code mode's exec")
     parser.add_argument("--network-drop", action="store_true",
                         help=f"cut every connection to the backend for {NETWORK_DROP_SECONDS} s after the first; "
                         "the bridge keeps trying")
@@ -914,8 +940,10 @@ def main() -> int:
     launcher = args.launcher[1:] if args.launcher[:1] == ["--"] else args.launcher
     if not launcher:
         parser.error("give the launcher command after --")
-    if args.rate_limited == "long" and (args.shared or args.migrate):
+    if args.rate_limited == "long" and (args.shared or args.migrate or args.lite):
         parser.error("--rate-limited long sets the idle timeout of the bridge's own provider")
+    if args.lite and (args.shared or args.migrate or args.desktop):
+        parser.error("--lite runs Codex through a relay of its own")
     if Path(launcher[0]).exists():
         launcher[0] = str(Path(launcher[0]).resolve())
 
@@ -933,7 +961,7 @@ def main() -> int:
                                refuse="e2e-codex-account" if args.codex_login == "refused" else None,
                                exit_zone=exit_zone, rate_limited=2 if args.rate_limited == "briefly" else 0,
                                rate_limited_for=LONG_RATE_LIMIT_SECONDS if args.rate_limited == "long" else 0,
-                               subagent=args.subagent)
+                               subagent=args.subagent, lite=args.lite)
     server, port = start_server(backend.app)
     gate = Gate(port, NETWORK_DROP_SECONDS) if args.network_drop else None
 
@@ -965,6 +993,10 @@ def main() -> int:
     started = time.monotonic()
     if args.migrate:
         output, checks = migrate_then_resume(launcher, args, root, webview, project, env)
+    elif args.lite:
+        # The relay's key, as its template has it in auth.json.
+        sign_codex_in(Path(env["CODEX_HOME"]))
+        output, checks = through_a_relay(launcher, args, root, webview, project, env, catalog=False)
     elif args.desktop:
         output, checks = run_desktop(launcher, args, root, webview, project, env)
     else:
@@ -988,7 +1020,8 @@ def main() -> int:
          f"expected the exit IP looked up at most {lookups} time(s), got {backend.lookups}"),
         (zones == {exit_zone}, f"Codex's timezone should be the exit's ({exit_zone}), got {zones}"),
         (bool(dates) and dates <= exit_days, f"Codex's date should be the day at the exit {exit_days}, got {dates}"),
-        (f"provider: {'openai' if args.shared else 'excel-bridge'}" in output, "Codex used another provider"),
+        (f"provider: {RELAY_PROVIDER if args.lite else 'openai' if args.shared else 'excel-bridge'}" in output,
+         "Codex used another provider"),
         ("done: tool output seen" in output, "the tool output did not reach the model"),
         (len(backend.requests) >= 2, f"expected 2+ upstream requests, got {len(backend.requests)}"),
         (all(r.get("model") == upstream_model for r in backend.requests),
@@ -1091,6 +1124,20 @@ def main() -> int:
              f"the helper was not given the task as text: {told}"),
             (not any(part.get("type") == "encrypted_content" for part in told),
              f"the helper was given the task as encrypted content: {told}"),
+        ]
+    if args.lite:
+        # What the bridge told the model: its catalog is a developer message.
+        told = [part.get("text", "") for item in (backend.requests[0].get("input", []) if backend.requests else [])
+                if isinstance(item, dict) and item.get("role") == "developer"
+                for part in item.get("content", []) if isinstance(part, dict)]
+        checks += [
+            (not any(isinstance(item, dict) and item.get("type") == "additional_tools"
+                     for body in backend.requests for item in body.get("input", [])),
+             "the Responses Lite tools item reached the backend"),
+            (any('{"type":"custom","name":"exec"' in text for text in told),
+             "the catalog the model saw did not list code mode's exec"),
+            (any(text.startswith("You are Codex") for text in told),
+             "Codex's instructions did not reach the model"),
         ]
     if gate:
         bridge_log = root / "bridge-home" / "bridge.log"

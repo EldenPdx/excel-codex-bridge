@@ -2504,5 +2504,182 @@ class ExcelSessionPersistenceTests(unittest.TestCase):
             )
 
 
+
+EXEC_TOOL = {
+    "type": "custom",
+    "name": "exec",
+    "description": "Run JavaScript code to orchestrate/compose tool calls\n"
+    "declare const tools: { exec_command(args: { cmd: string; }): Promise<unknown>; };",
+    "format": {"type": "grammar", "syntax": "lark", "definition": "start: SOURCE\nSOURCE: /[\\s\\S]+/\n"},
+}
+WAIT_TOOL = {"type": "function", "name": "wait", "strict": False,
+             "parameters": {"type": "object", "properties": {"cell_id": {"type": "string"}},
+                            "required": ["cell_id"]}}
+SPAWN_TOOL = {"type": "function", "name": "spawn_agent", "strict": False,
+              "parameters": {"type": "object", "properties": {"message": {"type": "string"}}}}
+
+
+def lite_body(*history: dict, **extra) -> dict:
+    """A request the way Codex sends it with Responses Lite (its own entries for gpt-5.6 and gpt-6)."""
+    return {
+        "model": "gpt-5.6-sol",
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+        "input": [
+            {"type": "additional_tools", "id": "at_1", "role": "developer", "tools": [
+                {"type": "namespace", "name": "functions", "description": "", "tools": [EXEC_TOOL, WAIT_TOOL]},
+                {"type": "namespace", "name": "collaboration", "description": "Sub-agents.",
+                 "tools": [SPAWN_TOOL]},
+            ]},
+            {"type": "message", "id": "msg_base", "role": "developer",
+             "content": [{"type": "input_text", "text": "You are Codex, based on GPT-5."}]},
+            {"type": "message", "role": "developer",
+             "content": [{"type": "input_text", "text": "<permissions instructions>"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Run the check."}]},
+            *history,
+        ],
+        **extra,
+    }
+
+
+class ResponsesLiteTests(unittest.TestCase):
+    def test_tools_and_instructions_come_out_of_the_input(self):
+        body = excel_upstream.from_responses_lite(lite_body())
+
+        self.assertEqual(body["instructions"], "You are Codex, based on GPT-5.")
+        self.assertEqual(
+            body["tools"],
+            [EXEC_TOOL, WAIT_TOOL, {"type": "namespace", "name": "collaboration", "description": "Sub-agents.",
+                                    "tools": [SPAWN_TOOL]}],
+        )
+        self.assertEqual(
+            [part["text"] for item in body["input"] for part in item["content"]],
+            ["<permissions instructions>", "Run the check."],
+        )
+        self.assertEqual(
+            excel_upstream.client_tool_types(body),
+            {"exec": "custom", "wait": "function", "collaboration.spawn_agent": "function"},
+        )
+        self.assertFalse(body["parallel_tool_calls"])
+
+    def test_other_requests_are_left_as_they_are(self):
+        body = {"model": "gpt-5.6-sol-excel", "input": "hi", "tools": [WAIT_TOOL], "instructions": "Be brief."}
+        self.assertIs(excel_upstream.from_responses_lite(body), body)
+        listed = {"model": "gpt-5.6-sol", "tools": [WAIT_TOOL], "input": lite_body()["input"][1:]}
+        self.assertIs(excel_upstream.from_responses_lite(listed), listed)
+
+    def test_tools_already_there_are_kept_and_not_repeated(self):
+        own_wait = {**WAIT_TOOL, "description": "the request's own"}
+        body = excel_upstream.from_responses_lite(
+            lite_body(tools=[own_wait], instructions="Given instructions."))
+
+        self.assertEqual([tool["name"] for tool in body["tools"]], ["wait", "exec", "collaboration"])
+        self.assertEqual(body["tools"][0], own_wait)
+        # Instructions already given stay; the developer message stays in the conversation too.
+        self.assertEqual(body["instructions"], "Given instructions.")
+        self.assertEqual(body["input"][0]["id"], "msg_base")
+
+    def test_the_prepared_request_reads_like_one_with_tools(self):
+        lite = excel_upstream.prepare_responses_body(excel_upstream.from_responses_lite(lite_body()))
+        usual = excel_upstream.prepare_responses_body({
+            "model": "gpt-5.6-sol",
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "instructions": "You are Codex, based on GPT-5.",
+            "tools": [EXEC_TOOL, WAIT_TOOL, {"type": "namespace", "name": "collaboration",
+                                             "description": "Sub-agents.", "tools": [SPAWN_TOOL]}],
+            "input": lite_body()["input"][2:],
+        })
+
+        self.assertEqual(lite, usual)
+        self.assertNotIn("additional_tools", json.dumps(lite))
+        catalog = lite["input"][1]["content"][0]["text"]
+        self.assertIn('{"type":"custom","name":"exec"', catalog)
+        self.assertIn("code mode", catalog)
+        self.assertIn(excel_upstream.CODE_MODE_EXAMPLE, catalog)
+        reminder = lite["input"][2]["content"][0]["text"]
+        self.assertIn(excel_upstream.CODE_MODE_EXAMPLE, reminder)
+        self.assertIn("transport exec", reminder)
+
+    def test_an_exec_call_through_the_transport_becomes_codex_exec(self):
+        source = excel_upstream.from_responses_lite(lite_body())
+        script = 'const r = await tools.exec_command({cmd: "pwd"});\ntext(r.output);'
+        response = {"output": [{
+            "type": "function_call", "id": "fc_exec", "call_id": "call_exec", "name": "run_officejs",
+            "arguments": json.dumps({"code": json.dumps({"name": "exec", "input": script})}),
+        }]}
+
+        calls = excel_upstream.extract_native_client_tool_calls(response, source)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0]["type"], calls[0]["name"], calls[0]["input"]), ("custom_tool_call", "exec", script))
+        self.assertNotIn("namespace", calls[0])
+
+    def test_functions_prefix_names_the_plain_tool(self):
+        source = excel_upstream.from_responses_lite(lite_body())
+        response = {"output": [{
+            "type": "function_call", "id": "fc_wait", "call_id": "call_wait", "name": "run_officejs",
+            "arguments": json.dumps({"code": json.dumps({"name": "functions.wait",
+                                                         "arguments": {"cell_id": "1"}})}),
+        }]}
+
+        calls = excel_upstream.extract_native_client_tool_calls(response, source)
+
+        self.assertEqual([(call["type"], call["name"]) for call in calls], [("function_call", "wait")])
+
+    def _rejected(self, code: dict, allowed_tools: dict) -> str:
+        replay = excel_upstream.translate_input_items(
+            [
+                {"type": "function_call", "call_id": "call_no_tool", "name": "run_officejs",
+                 "arguments": json.dumps({"code": json.dumps(code)})},
+                {"type": "function_call_output", "call_id": "call_no_tool",
+                 "output": "unsupported call: run_officejs"},
+            ],
+            allowed_tools,
+        )
+        return replay[1]["output"]
+
+    def test_a_tool_called_directly_in_code_mode_is_pointed_at_exec(self):
+        said = self._rejected({"name": "exec_command", "arguments": {"cmd": "pwd"}},
+                              {"exec": "custom", "wait": "function"})
+        self.assertIn("exec_command is not a tool in the catalog: Codex runs in code mode here", said)
+        self.assertIn(excel_upstream.CODE_MODE_EXAMPLE, said)
+
+    def test_exec_without_code_mode_is_pointed_at_the_catalog_tools(self):
+        # A conversation begun in code mode (Codex's own entries), carried on with the bridge's.
+        for shell in ("exec_command", "shell_command"):
+            with self.subTest(shell=shell):
+                said = self._rejected({"name": "exec", "input": "text(1)"},
+                                      {shell: "function", "apply_patch": "custom"})
+                self.assertIn("exec is not a tool in the catalog: it belongs to Codex's code mode", said)
+                self.assertIn(f"({shell} for shell commands)", said)
+
+    def test_catalog_text_without_code_mode_is_unchanged(self):
+        source = {"model": "gpt-5.6-sol-excel", "input": "hi", "tools": [
+            {"type": "function", "name": "exec_command", "parameters": {"type": "object"}},
+            {"type": "custom", "name": "apply_patch"},
+        ]}
+        catalog = excel_upstream._client_tool_protocol_instructions(source)
+        reminder = excel_upstream._client_tool_protocol_reminder(source)
+
+        self.assertIn(
+            "catalog contains a suitable tool. For repository inspection, invoke a suitable catalog shell tool "
+            "(for example exec_command) through run_officejs. Transport has two layers",
+            catalog,
+        )
+        self.assertIn(
+            '{"name":"TOOL_NAME","input":"RAW_INPUT"}. Do not put JavaScript, OfficeJS, a second run_officejs '
+            "envelope, or a functions.run_officejs wrapper inside code. The field is named code for "
+            "compatibility; it is not JavaScript. Serialize the complete inner object",
+            catalog,
+        )
+        self.assertNotIn("code mode", catalog + reminder)
+        self.assertIn(
+            "The code field is not JavaScript; serialize the inner JSON and escape backslashes and quotes in "
+            'shell commands. Example inner code: {"name":"exec_command","arguments":{"cmd":"pwd"}}. Do not merely',
+            reminder,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

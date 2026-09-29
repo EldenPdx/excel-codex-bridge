@@ -671,7 +671,8 @@ class Bridge:
                 code="model_not_found",
                 param="model",
             )
-        body = {**body, "model": model_id}
+        # Codex's own entries for this model send the tools the Responses Lite way.
+        body = {**excel_upstream.from_responses_lite(body), "model": model_id}
         return await self._signed_in(
             lambda headers: self._send_with_pictures(headers, body), stream=bool(body.get("stream"))
         )

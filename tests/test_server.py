@@ -244,6 +244,61 @@ class SharedProviderTests(unittest.TestCase):
         self.assertEqual(len(harness.upstream_requests), 1)
 
 
+
+def officejs_stream(code: dict) -> bytes:
+    """The add-in's model calling a client tool through run_officejs."""
+    item = {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "run_officejs",
+            "status": "completed", "arguments": json.dumps({"code": json.dumps(code)})}
+    return b"".join([
+        sse("response.created", {"type": "response.created", "response": {"id": "resp_1"}}),
+        sse("response.output_item.added", {"type": "response.output_item.added", "output_index": 0,
+                                           "item": {**item, "arguments": "", "status": "in_progress"}}),
+        sse("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": item}),
+        sse("response.completed", {"type": "response.completed", "response": {
+            "id": "resp_1", "status": "completed", "model": "gpt-5.6-sol", "output": [item]}}),
+    ])
+
+
+class ResponsesLiteRouteTests(unittest.TestCase):
+    """Codex's own entries for gpt-5.6 and gpt-6 (no model catalog of the bridge's): Responses Lite."""
+
+    EXEC = {"type": "custom", "name": "exec", "description": "Run JavaScript code",
+            "format": {"type": "grammar", "syntax": "lark", "definition": "start: SOURCE"}}
+
+    def body(self) -> dict:
+        return {
+            "model": "gpt-5.6-sol", "stream": True, "tool_choice": "auto", "parallel_tool_calls": False,
+            "input": [
+                {"type": "additional_tools", "id": "at_1", "role": "developer", "tools": [
+                    {"type": "namespace", "name": "functions", "description": "", "tools": [self.EXEC]}]},
+                {"type": "message", "role": "developer",
+                 "content": [{"type": "input_text", "text": "You are Codex."}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Run it."}]},
+            ],
+        }
+
+    def test_the_model_sees_exec_and_its_call_reaches_codex_as_exec(self):
+        script = 'text(await tools.exec_command({cmd: "pwd"}));'
+        harness = BridgeHarness(lambda _r: httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            content=officejs_stream({"name": "exec", "input": script})))
+
+        response = harness.request("POST", "/v1/responses", json=self.body())
+
+        self.assertEqual(response.status_code, 200)
+        sent = harness.upstream_json()
+        self.assertNotIn("additional_tools", json.dumps(sent))
+        told = [part["text"] for item in sent["input"] if item.get("role") == "developer"
+                for part in item["content"]]
+        self.assertEqual(told[0], "You are Codex.")
+        self.assertIn('{"type":"custom","name":"exec"', told[1])
+        done = [json.loads(line[5:]) for line in response.text.splitlines()
+                if line.startswith("data:") and '"response.output_item.done"' in line]
+        self.assertEqual([(d["item"]["type"], d["item"]["name"], d["item"]["input"]) for d in done],
+                         [("custom_tool_call", "exec", script)])
+        self.assertNotIn("run_officejs", response.text)
+
+
 class ResponsesRouteTests(unittest.TestCase):
     def test_non_excel_model_is_rejected_before_upstream(self):
         harness = BridgeHarness(ok_stream)
