@@ -122,6 +122,7 @@ excel-codex --login codex                      只用 Codex 自己的登录（�
 excel-codex login                             打开 Excel 的 ChatGPT 面板登录或续期
 excel-codex desktop                           让 Codex 桌面版 / IDE 插件走 Excel 链路
 excel-codex threads migrate                   把桥接自己名下的对话并进共享列表（启动时会自动做）
+excel-codex threads migrate --from OpenAI     把中转站 provider（OpenAI）名下的对话并到 openai
 ```
 
 启动器自己的选项：`--login <auto|codex|excel>`、`--model`、`--proxy`、`--timezone <auto|off>`、
@@ -132,7 +133,7 @@ excel-codex threads migrate                   把桥接自己名下的对话并�
 
 每个模型都有两个版本，上游是同一个模型，只是上下文长度不同：
 
-| 272k 版 | 1M 版 | 上游模型 |
+| 普通版（500k） | 1M 版 | 上游模型 |
 | --- | --- | --- |
 | `gpt-5.6-sol`（默认） | `gpt-5.6-sol-1m-excel` | `gpt-5.6-sol` |
 | `gpt-5.6-terra` | `gpt-5.6-terra-1m-excel` | `gpt-5.6-terra` |
@@ -141,15 +142,18 @@ excel-codex threads migrate                   把桥接自己名下的对话并�
 | `gpt-6-luna` | `gpt-6-luna-1m-excel` | `gpt-6-luna` |
 | `gpt-6-astra` | `gpt-6-astra-1m-excel` | `gpt-6-astra` |
 
-- 从 0.5.4 起，272k 版在 Codex 里用和 OpenAI 官方一样的名字（模型列表里显示为「6-Sol Excel」这样），
+- 从 0.5.4 起，普通版在 Codex 里用和 OpenAI 官方一样的名字（模型列表里显示为「6-Sol Excel」这样），
   这样对话在开着桥接和关掉桥接时都能接着用，见[会话互通](#会话互通)。以前的 `gpt-6-sol-excel`
   这类名字照样能用，只是不再出现在模型列表里。1M 版官方没有，名字不变。
 
-- **272k 版**：上下文 272k，Codex 在 180k 时自动压缩。
+- **普通版**：上下文 500k，Codex 在 450k 时自动压缩（0.5.8 及更早是 272k、180k）。
 - **1M 版**：上下文 918k，Codex 在约 826k 时自动压缩。918k 是真实后端的实测上限：一次最多接受约 918k
   输入 token，再多就返回 `context_length_exceeded`。gpt-5.6-sol、gpt-6-sol、gpt-6-luna、gpt-6-astra
   实测结果相同，gpt-5.6-terra 和 gpt-5.6-luna 按同一上限设置。
-- 长对话每轮发出去的上下文更多，额度消耗也相应更多，用不到这么长时选 272k 版即可。
+- 长对话每轮发出去的上下文更多，额度消耗也相应更多，用不到这么长时选普通版即可。
+- 普通版和官方模型同名，官方链路按官方自己的上下文窗口处理。开着桥接时对话可以长到 450k 才压缩，
+  关掉桥接后接着聊，超出官方窗口的部分 Codex 会先压缩；官方后端能不能接受这么长的压缩请求还没实测。
+  对话很长又要关掉桥接时，建议开着桥接先压缩一次（`/compact`）。
 
 推理强度 `low` / `medium` / `high` / `xhigh`，默认 `medium`。
 
@@ -199,6 +203,15 @@ TLS 证书校验始终开启。Codex 到桥接走 `127.0.0.1`，启动器会自�
 - 想长期保持：`excel-codex desktop --keep-config`，之后用 `excel-codex desktop --off` 恢复
   （窗口意外被杀、配置没还原时也用它）。
 - 换模型：`excel-codex desktop --model gpt-5.6-terra`；换端口：`--port`。
+- 窗口开着期间会关掉 Codex 的 Apps 和插件推荐（`features.apps`、`features.remote_plugin`），
+  随配置一起恢复。Codex 用 ChatGPT 登录时，打开对话要等 chatgpt.com 回应这两项（Apps 最多 30 秒，
+  插件推荐每一轮 5 秒）；代理节点不通时，桌面版就一直停在“加载中”。想保留它们用 `--keep-apps`。
+
+**桌面版打开对话一直在加载、新任务一直“启动中”**：多半是 Codex 自己连 chatgpt.com 连不上
+（登录、Apps、插件都走它），这些请求不经过桥接。0.5.11 起桥接窗口开着时 Apps 和插件推荐已关掉，
+最多还剩每条对话第一轮约 5 秒（Codex 读取账号设置）。仍然很慢的话，给 chatgpt.com 和
+auth.openai.com 换一个稳定的代理节点；桥接窗口里出现 `could not reach chatgpt.com through the proxy`
+时就是这个原因。
 
 **报错 `The '…' model is not supported when using Codex with a ChatGPT account`**
 （在 Codex 里退出登录后会变成 `401 Unauthorized: Missing bearer or basic authentication`，
@@ -214,6 +227,13 @@ TLS 证书校验始终开启。Codex 到桥接走 `127.0.0.1`，启动器会自�
 解决：打开 `excel-codex-desktop.cmd`，完全退出桌面版（文件 → 退出，或从托盘退出；只关窗口它可能
 还在后台运行）再打开。发消息时桥接窗口里会出现 `"POST /v1/responses HTTP/1.1" 200`
 这样的一行（0.4.2 起）；没有就说明请求还是没经过桥接。
+
+**关掉桥接后接着聊，报 `stream disconnected before completion: 由于目标计算机积极拒绝，无法连接。
+(os error 10061)`，并显示“正在重新连接 x/5”**：桥接窗口关了，Codex 却还在运行。开着桥接时打开的
+对话会一直记着桥接的本机地址（`127.0.0.1:端口`），桥接关掉后那个端口没人监听，就被拒绝。只关窗口不够：
+桌面版在 Windows 上关掉窗口后还在托盘里运行。要从托盘图标右键退出（macOS 用 `Cmd+Q`），IDE 插件要重新
+加载窗口，再打开 Codex 就走官方链路了。桥接窗口关闭时会提示这一点；按 Ctrl+C 关闭时如果还看得到 Codex
+进程，会多一句 `Codex is still running right now`。
 
 也可以全手动：`excel-codex serve` 常驻桥接，再把 `excel-codex print-config` 输出的片段加进
 `config.toml`，不用时删掉。
@@ -251,19 +271,50 @@ Codex 没登录时，自带的 provider 会先要求登录，所以桥接仍是�
 - Codex 还开着（桌面版、IDE 插件，或终端里的 `codex`）时不迁移，只提示一句：Codex 运行时会把改动
   改回去，也可能正在写这些对话文件。所以要**先开桥接、再开桌面版**；或者退出 Codex 后运行
   `excel-codex threads migrate`。
-- 迁移后这些对话记到 `openai` 名下，模型名换成官方的（`gpt-6-sol-excel` → `gpt-6-sol`，1M 版不变），
-  关掉桥接也能打开、接着聊，改名、归档也不会再变回去。
+- 迁移后这些对话记到 `openai` 名下，模型名换成官方的（`gpt-6-sol-excel` → `gpt-6-sol`）。官方没有
+  1M 版，1M 版的对话换成同一模型的官方版（`gpt-6-sol-1m-excel` → `gpt-6-sol`）；开着桥接时想继续
+  用 1M，在模型菜单里再选回来。关掉桥接也能打开、接着聊（走官方账号或中转站都行），改名、归档也不会再
+  变回去。
 
 改动内容：
 
 - Codex 的对话索引（`~/.codex/state_<n>.sqlite` 里的 threads 表）。改之前先复制一份，存为同目录下的
   `state_<n>.sqlite.before-excel-codex-<时间>`。
-- 每个对话文件（`~/.codex/sessions` 下）第一行记的 provider。Codex 按这一行重建索引，只改索引的话，
-  它会把对话改回 `excel-bridge`。0.5.4、0.5.5 的 `threads migrate` 就只改了索引，那样迁移过的对话
-  这次会补齐。只改这一个字段，文件其余内容和修改时间都不变，对话内容不动。
+- 每个对话文件（`~/.codex/sessions` 下）里 Codex 重建索引要读的几处：第一行的 provider，以及后面
+  `turn_context`、`thread_settings_applied` 行里的模型名和 provider。Codex 会按这些重建索引，只改索引
+  的话，它会把对话改回 `excel-bridge` 或桥接的模型名。每处只原地换掉这一个值，文件其余内容、对话内容
+  和修改时间都不变。
+- 旧版本迁移过的对话会补齐：0.5.4、0.5.5 只改了索引；0.5.6 到 0.5.8 没改后面几行的模型名，1M 版也
+  没换，关掉桥接后 Codex 可能又用回桥接的模型名，走官方或中转站都会失败。下次在 Codex 完全退出时启动
+  桥接，窗口里会显示 `Finished N conversation(s) moved by an earlier excel-codex`。
 - `excel-codex threads` 列出还在 `excel-bridge` 名下的对话。`excel-codex threads undo`（同样要先退出
   Codex）撤销：迁移改过、之后没被 Codex 改过的对话放回 `excel-bridge` 名下。
 - 不想自动迁移：设置 `EXCEL_BRIDGE_AUTO_MIGRATE=0`，需要时自己运行 `excel-codex threads migrate`。
+
+### 中转站名下的对话
+
+报“Model provider `OpenAI` not found”（或别的名字）的，多半是经中转站建的对话。有的中转站生成的
+Codex 配置（例如 SUB2API 的“使用密钥 → Codex”）用的是它自己的 provider，名字叫 `OpenAI`：
+`model_provider = "OpenAI"` 加一段 `[model_providers.OpenAI]`。它和 Codex 自带的 `openai` 不是同一个，
+**provider 名字区分大小写**。经它建的对话记在 `OpenAI` 名下；`config.toml` 里一旦没有这段（换回官方
+账号、切换账号的工具改写了配置，或删掉了中转站配置），Codex 就打不开它们。这和桥接无关，但 0.5.10 起
+桥接可以把它们并到 `openai` 名下：
+
+```bash
+excel-codex threads                          # 末尾会列出其他 provider 名下各有几个对话
+excel-codex threads --from OpenAI            # 列出 OpenAI 名下的对话
+excel-codex threads migrate --from OpenAI    # 并到 openai 名下（先完全退出 Codex）
+```
+
+- 改法和上一节一样：先复制对话索引，对话文件里只原地换掉 provider（和桥接的模型名）这几处。
+  `excel-codex threads undo` 把它们放回 `OpenAI` 名下。
+- 名字要和 Codex 记的一字不差；`--from` 找不到时会列出 Codex 里实际有的 provider 名字。
+- 并过去之后，走官方账号、开着桥接都能接着聊。以后经 `OpenAI` 新建的对话还会记在 `OpenAI` 名下。
+- 想让中转站的对话也一直在同一个列表里，就把中转站配成 Codex 自带的 provider：删掉
+  `model_provider = "OpenAI"` 和 `[model_providers.OpenAI]`，改成一行
+  `openai_base_url = "https://你的中转站/v1"`，再用中转站的 key 登录 Codex
+  （`codex login --with-api-key`，从标准输入读入 key）。**`openai_base_url` 指向中转站时不要用 ChatGPT
+  账号登录**，否则 Codex 会把 ChatGPT 的登录凭据发给中转站。
 
 ## 出口时区
 
@@ -288,6 +339,14 @@ Codex 会把本机的时区和日期写进每个对话（`<environment_context>`
 - 只把出口 IP 发给这几个定位服务查时区，走的也是同一个代理，不发送别的信息。同一个 IP
   的结果会缓存。
 - `--timezone off`（或环境变量 `EXCEL_BRIDGE_TIMEZONE=off`）关掉以上两项。
+- 代理在几个节点之间轮换（比如台湾、日本来回切）时，系统时区不跟着来回跳：新的出口时区要连续
+  3 次检查都一样才采用（每分钟查一次，约 2 分钟），等待期间窗口里说一次。桥接也记得查过的出口 IP 的时区（12 小时），
+  来回切时不用重新查。
+- Windows 的“自动设置时区”开着时，系统会把时区改回本地的。窗口会再改回去，第一次时说明原因；
+  可以在 设置 > 时间和语言 > 日期和时间 里关掉“自动设置时区”。
+- 除了启动时的第一次，偶尔一次查询失败不会在窗口里报错，同一种错误连续出现两次才说，恢复时说一声。代理节点连不上时报
+  `could not reach … through the proxy`（代理地址里的密码不显示）。
+- 窗口里日志的时间一直按窗口启动时的时区显示。
 - `excel-codex timezone` 查看出口时区和当前状态；`excel-codex timezone sync --probe` 只查不改。
 - 显示 `(Cloudflare: TW)` 这类和预期不同的国家，说明代理把 OpenAI 的流量分流到了那个国家的节点，
   OpenAI 看到的就是那里；代理软件首页显示的只是默认节点。通过同一个代理打开
@@ -327,6 +386,36 @@ Codex 会把本机的时区和日期写进每个对话（`<environment_context>`
 加载项的 token 大约 10 天有效。桥接每次请求前都会检查，过期或临近过期时重新读取本机缓存；
 在 Windows 上还会在剩余不到 24 小时时[自动打开面板续期](#自动登录windows)，**不用重启**桥接或 Codex。
 `excel-codex status` 可查看剩余时间。
+
+## 限流
+
+用加载项的所有人按模型共用一份每分钟 token 额度（TPM）。额度用满时，后端立刻回一个
+`rate limit exceeded`，说几毫秒后再试；Codex 就按这个间隔重试 5 次，不到一秒就用完，这一轮报错
+（界面上显示“Reconnecting 5/5”）。
+
+所以桥接会先自己等：回答还没开始就被限流时，隔 1、2、4、8、15 秒（之后每次 15 秒）把同一个请求再发一次，
+最多等 5 分钟。这期间 Codex 只显示在工作（桥接每 10 秒告诉它还在进行，不会触发它 5 分钟无响应就断开），
+桥接窗口（CLI 模式下是 `bridge.log`）里会写 `the Excel backend is rate limited … trying again in N s`。
+等满 5 分钟还被限流，Codex 显示 `The Excel backend is still rate limited after 5 minutes …`，这一轮结束，
+稍后再发一次消息即可；Codex 不会再自己重试（否则每次重试都要再等 5 分钟）。中途随时可以在 Codex 里中断。
+
+- 回答开始后才失败的不重发，免得内容重复；别的错误照原样交给 Codex。
+- `EXCEL_BRIDGE_RATE_LIMIT_WAIT=<秒>` 改最多等多久：默认 `300`，最多 `1800`；`0` 不等，
+  报错照原样交给 Codex（它会按自己的方式很快重试 5 次）。
+
+## 网络中断
+
+代理节点掉线或网络闪断时，请求发不到 `bps.openai.com`，Codex 会在几秒内重试 5 次后报
+`502 Bad Gateway: Could not connect to bps.openai.com (ConnectError)`。0.5.11 起桥接自己接着连：
+
+- 后端还没回应的请求（连不上、TLS 握手被断等），隔 0.5、1、2、4、8、15 秒（之后每次 15 秒）把同一个
+  请求再发一次，最多等 2 分钟。前 5 秒 Codex 什么都看不到；之后它只显示在工作，桥接每 10 秒告诉它还在进行。
+  连上了就照常回答。
+- 等满 2 分钟还连不上，Codex 显示 `Still no connection after 2 minutes …`，这一轮结束，网络恢复后再发一次
+  即可；Codex 不会再自己重试。中途随时可以在 Codex 里中断。
+- 后端已经回应之后才断的不重发（比如读回答时超时），免得内容重复。
+- `EXCEL_BRIDGE_CONNECT_WAIT=<秒>` 改最多等多久：默认 `120`，最多 `1800`；`0` 不重试，
+  报错照原样交给 Codex。
 
 ## 图片
 
@@ -392,6 +481,8 @@ Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图�
 ## 限制
 
 - 只实现 Responses API，没有 `/responses/compact` 端点。
+- 单个请求解压后最大 1 GiB。0.5.10 及更早是 64 MiB：长对话（尤其带图片）在 450k 自动压缩前就会超过，
+  报 `Invalid request body: request body is too large`。
 - Excel 后端会给每个请求加上约 2.2 万 token 的固定前缀，大部分命中缓存；额度按你的 ChatGPT 套餐计算，
   同时开的会话越多用得越快。
 - 依赖 Excel 加载项的非公开后端，OpenAI 一调整就可能失效。
@@ -418,6 +509,8 @@ Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图�
 | `EXCEL_BRIDGE_AUTO_MIGRATE` | 设为 `0` 时启动不自动迁移桥接自己名下的对话，见[桥接自己名下的对话](#桥接自己名下的对话) |
 | `EXCEL_BRIDGE_TIMEZONE` | `auto`（默认）/ `off`，同 `--timezone`，见[出口时区](#出口时区) |
 | `EXCEL_BRIDGE_IMAGE_MODEL` | 生图工具向后端请求的模型，默认 `gpt-image-2`（同 `--image-model`），见[生图](#生图) |
+| `EXCEL_BRIDGE_RATE_LIMIT_WAIT` | 被限流时最多等多少秒再把报错交给 Codex，默认 `300`（5 分钟），`0` 不等，最多 `1800`，见[限流](#限流) |
+| `EXCEL_BRIDGE_CONNECT_WAIT` | 连不上后端时最多再试多少秒，默认 `120`（2 分钟），`0` 不重试，最多 `1800`，见[网络中断](#网络中断) |
 | `CODEX_HOME` | Codex 配置目录，`desktop` 改写其中的 `config.toml`。默认 `~/.codex` |
 | `GHCP_EXCEL_WEBVIEW2_DATA_DIR` | Windows WebView2 数据根目录（同 `--webview-dir`） |
 | `GHCP_EXCEL_WEBKIT_WEBSITE_DATA_DIR` | macOS WebKit 数据目录 |

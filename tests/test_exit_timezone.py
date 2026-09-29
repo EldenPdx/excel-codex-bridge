@@ -248,6 +248,24 @@ class TrackerTests(unittest.TestCase):
 
         self.assertEqual(self.run_async(steps).name, "Europe/Berlin")
 
+    def test_a_proxy_taking_turns_between_nodes_is_looked_up_once_per_node(self):
+        self.upstream.zones["8.8.8.8"] = "Asia/Taipei"
+
+        async def steps(tracker):
+            zones = [await tracker.current()]
+            for ip in ("8.8.8.8", "1.1.1.1", "8.8.8.8", "1.1.1.1"):
+                self.upstream.ip = ip
+                self.clock.now += exit_timezone.CHECK_SECONDS
+                zones.append(await self.settle(tracker))
+            return zones
+
+        with self.assertLogs("excel_codex_bridge", "INFO") as logs:
+            zones = self.run_async(steps)
+        self.assertEqual([zone.name for zone in zones], ["Asia/Tokyo", "Asia/Taipei"] * 2 + ["Asia/Tokyo"])
+        self.assertEqual(self.upstream.lookups(), 2)
+        # Said once for each node, not on every switch.
+        self.assertEqual(sum("proxy exit timezone" in line for line in logs.output), 2)
+
     def test_a_new_exit_that_cannot_be_looked_up_sends_codex_own_timezone(self):
         async def steps(tracker):
             await tracker.current()

@@ -1,40 +1,48 @@
-旧的桥接对话自动并进共享列表，关掉桥接也能打开 · The bridge's own conversations move into the shared list by themselves and open with the bridge off
+桌面版不再卡加载、网络闪断自动重连、长对话不再报请求过大 · No more stuck loading, reconnects after network drops, long conversations fit
 
 > **非官方项目**，与 OpenAI、Microsoft 无关联。使用加载项后端可能违反 OpenAI 服务条款，风险自负。
 > **Unofficial.** Not affiliated with OpenAI or Microsoft. Using the add-in's backend may violate OpenAI's terms; use at your own risk.
 
 ## 变化
 
-- **旧的桥接对话自动迁移**：0.5.3 及更早版本、或 Codex 没登录时经桥接建的对话，记在 `excel-bridge`
-  名下。关掉桥接后，桌面版打开它们会报“Model provider `excel-bridge` not found”。现在
-  `excel-codex-desktop.cmd` 和 `excel-codex` 启动时，如果 Codex 已完全退出，就自动把它们并进共享列表，
-  不用再手动运行命令。所以要**先开桥接、再开桌面版**；Codex 开着时不迁移，窗口里会提示一句。
-- **0.5.4、0.5.5 的 `threads migrate` 迁移不彻底**：它只改了 Codex 的对话索引，而 Codex 会按对话文件
-  第一行记的 provider 重建索引，对话于是又回到 `excel-bridge`，关掉桥接照样报错。现在连这一行一起改，
-  只改 provider 这一个字段，文件其余内容和修改时间都不变。以前迁移过的对话会自动补齐，迁移后改名、
-  归档也不会再变回去。
-- `excel-codex threads migrate` 和 `undo` 在 Codex 运行时不执行，因为 Codex 会把改动改回去。设置
-  `EXCEL_BRIDGE_AUTO_MIGRATE=0` 可以关掉启动时的自动迁移。
+- **长对话不再报 `Invalid request body: request body is too large`**：请求解压后的上限从 64 MiB 提到
+  1 GiB。长对话（尤其带图片）在默认 450k 自动压缩前就会超过 64 MiB，大任务跑到一半就报这个错。
+  截断的压缩请求现在报 400，不会被当成空请求。SUB2API 部署的上限提到 256 MiB。
+- **网络闪断不再直接 502**：代理节点掉线时，Codex 几秒内重试 5 次就报
+  `502 Bad Gateway: Could not connect to bps.openai.com (ConnectError)`。现在后端还没回应的请求由桥接
+  接着重试，最多 2 分钟：前 5 秒 Codex 看不到，之后显示在工作；连上了照常回答，2 分钟还连不上就结束这一轮，
+  Codex 不再自己重试。`EXCEL_BRIDGE_CONNECT_WAIT` 可改时长（`0` 关掉）。
+- **桌面版不再一直“加载中”**：Codex 用 ChatGPT 登录时，打开对话要等 chatgpt.com 回应 Apps（最多 30 秒）
+  和插件推荐（每一轮 5 秒）；代理不通时对话一直加载、新任务一直“启动中”。`excel-codex desktop` 开着期间
+  关掉这两项（关窗口时随配置恢复），实测一轮从 45 秒降到约 5 秒；`--keep-apps` 可保留。
+- **系统时区不再来回跳**：代理在台湾、日本等节点间轮换时，新的出口时区要连续 3 次检查一致才采用；
+  桥接记住查过的出口 IP 的时区。Windows“自动设置时区”把时区改回本地时会再改回去，并提示去哪里关掉。
+  偶尔一次查询失败不再刷屏；代理节点连不上时说明是哪个代理（不显示密码），并提示 Codex 自己也要连
+  chatgpt.com。
 
-0.5.5 的变化（出口时区以 Cloudflare 看到的国家为准、关窗恢复 Windows 时区）见
-[v0.5.5 发布说明](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.5)；0.5.4 的新功能
+0.5.10 的变化（中转站名下的对话并到 `openai`）见
+[v0.5.10 发布说明](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.10)；0.5.9 的变化（普通版到 450k 才压缩、迁移过的对话关掉桥接后能接着聊）见
+[v0.5.9 发布说明](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.9)；0.5.8 的变化（被限流时最多等 5 分钟）见
+[v0.5.8 发布说明](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.8)；0.5.7 的变化（限流等待、
+旧的桥接对话启动时自动并进共享列表）见
+[v0.5.7 发布说明](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.7)；0.5.4 的新功能
 （和官方链路会话互通、指定生图模型、出口时区）见
 [v0.5.4 发布说明](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.4)。
 
 ## 下载
 
-- **Windows**：`excel-codex-bridge-0.5.6-windows-x64.zip`。解压后双击 `excel-codex.exe` 打开 Codex CLI，
+- **Windows**：`excel-codex-bridge-0.5.11-windows-x64.zip`。解压后双击 `excel-codex.exe` 打开 Codex CLI，
   双击 `excel-codex-desktop.cmd` 给桌面版用。
-- **macOS（Apple 芯片）**：`excel-codex-bridge-0.5.6-macos-arm64.tar.gz`
-- **macOS（Intel）**：`excel-codex-bridge-0.5.6-macos-x64.tar.gz`
+- **macOS（Apple 芯片）**：`excel-codex-bridge-0.5.11-macos-arm64.tar.gz`
+- **macOS（Intel）**：`excel-codex-bridge-0.5.11-macos-x64.tar.gz`
 - **Linux / WSL 或从源码运行**：下载 Source code，使用 `excel-codex.sh`（需要 Python 3.10+）。
-- **Linux / VPS 的 SUB2API 部署**：下载本版本 Source code，按 [部署文档](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.6/docs/sub2api.md) 构建 `packaging/sub2api/compose.yaml`。
+- **Linux / VPS 的 SUB2API 部署**：下载本版本 Source code，按 [部署文档](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.11/docs/sub2api.md) 构建 `packaging/sub2api/compose.yaml`。
 
 macOS 推荐在终端用 `curl` 下载，这样不会被"无法验证开发者"拦下（Intel 芯片把 `arm64` 换成 `x64`）：
 
 ```
-curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.6/excel-codex-bridge-0.5.6-macos-arm64.tar.gz | tar xz
-./excel-codex-bridge-0.5.6-macos-arm64/excel-codex status
+curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.11/excel-codex-bridge-0.5.11-macos-arm64.tar.gz | tar xz
+./excel-codex-bridge-0.5.11-macos-arm64/excel-codex status
 ```
 
 用浏览器下载的，解压后先运行一次 `xattr -dr com.apple.quarantine <解压出的目录>`。
@@ -51,42 +59,54 @@ curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.6
 
 ## Changes
 
-- **The bridge's earlier conversations move by themselves**: conversations started through the
-  bridge with 0.5.3 and earlier, or while Codex was not signed in, are filed under `excel-bridge`.
-  With the bridge off, the desktop app could not open them: "Model provider `excel-bridge` not
-  found". Now `excel-codex-desktop.cmd` and `excel-codex` move them into the shared list when they
-  start while Codex is fully quit; no command to run. So **start the bridge first, then the desktop
-  app**; while Codex runs nothing is moved, and the window says so.
-- **`threads migrate` in 0.5.4 and 0.5.5 did not finish the job**: it changed Codex's conversation
-  index only, but Codex rebuilds the index from the provider on the first line of each conversation
-  file, so the conversation went back under `excel-bridge` and still failed with the bridge off.
-  That line changes too now, and only its provider field: the rest of the file and its modification
-  time stay as they are. Conversations moved before are finished, and renaming or archiving a moved
-  conversation no longer moves it back.
-- `excel-codex threads migrate` and `undo` do nothing while Codex runs, since Codex would put the
-  change back. `EXCEL_BRIDGE_AUTO_MIGRATE=0` turns off the move at start.
+- **Long conversations no longer fail with `Invalid request body: request body is too large`**: a
+  request can now be up to 1 GiB once decompressed, up from 64 MiB. Long conversations (with pictures
+  above all) passed 64 MiB before the default 450k auto-compaction, so big tasks failed halfway. A
+  compressed request that was cut off is now a 400 rather than read as an empty one. SUB2API
+  deployments take up to 256 MiB.
+- **A network drop is no longer a 502 straight away**: when a proxy node went down, Codex retried five
+  times within seconds and showed `502 Bad Gateway: Could not connect to bps.openai.com
+  (ConnectError)`. Now the bridge keeps sending a request the backend has not answered yet, for up to
+  2 minutes: Codex sees nothing for the first 5 seconds and then shows it is working; once connected
+  it answers as usual, and after 2 minutes without a connection the turn ends and Codex does not
+  retry. `EXCEL_BRIDGE_CONNECT_WAIT` sets how long (`0` turns it off).
+- **The desktop app no longer sits on "loading"**: signed in with ChatGPT, Codex waits on chatgpt.com
+  for apps (up to 30 seconds) and plugin suggestions (5 seconds a turn) when a conversation opens, so
+  through a proxy that is down conversations kept loading and new tasks stayed on "starting".
+  `excel-codex desktop` turns both off while it runs (they come back with the config); a turn went
+  from 45 seconds to about 5 in testing. `--keep-apps` leaves them on.
+- **The system timezone no longer flips back and forth**: with a proxy taking turns between nodes
+  (Taiwan and Japan, say), another exit's timezone is taken once it holds for 3 checks in a row, and
+  the bridge remembers each exit IP's timezone. When Windows "Set time zone automatically" changes it
+  back, the window sets it again and says where to turn that off. A single failed check no longer
+  fills the window; a proxy node that cannot be reached is named (without its password), with a note
+  that Codex itself needs chatgpt.com too.
 
-For 0.5.5's changes (the exit timezone checked against the country Cloudflare sees, the Windows
-timezone put back on close), see the
-[v0.5.5 release notes](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.5); for what
-0.5.4 added (conversations shared with the official sign-in, choosing the image model, the exit
-timezone), see the [v0.5.4 release notes](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.4).
+For 0.5.10's changes (a relay's conversations moving under `openai`), see the
+[v0.5.10 release notes](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.10); for 0.5.9's changes (standard models compacting at 450k, moved conversations carrying on with the
+bridge off), see the [v0.5.9 release notes](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.9); for
+0.5.8's (up to 5 minutes' wait under the rate limit), the
+[v0.5.8 release notes](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.8); for 0.5.7's
+(the rate-limit wait, the bridge's earlier conversations moved into the shared list at start), the
+[v0.5.7 release notes](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.7); for what 0.5.4
+added (conversations shared with the official sign-in, choosing the image model, the exit timezone),
+the [v0.5.4 release notes](https://github.com/Kaixxrua/excel-codex-bridge/releases/tag/v0.5.4).
 
 ## Download
 
-- **Windows**: `excel-codex-bridge-0.5.6-windows-x64.zip`. Double-click `excel-codex.exe` for the
+- **Windows**: `excel-codex-bridge-0.5.11-windows-x64.zip`. Double-click `excel-codex.exe` for the
   Codex CLI, or `excel-codex-desktop.cmd` for the desktop app.
-- **macOS (Apple silicon)**: `excel-codex-bridge-0.5.6-macos-arm64.tar.gz`
-- **macOS (Intel)**: `excel-codex-bridge-0.5.6-macos-x64.tar.gz`
+- **macOS (Apple silicon)**: `excel-codex-bridge-0.5.11-macos-arm64.tar.gz`
+- **macOS (Intel)**: `excel-codex-bridge-0.5.11-macos-x64.tar.gz`
 - **Linux / WSL, or from source**: download the source code and use `excel-codex.sh` (Python 3.10+).
-- **Linux / VPS with SUB2API**: download this release's source and follow the [deployment guide](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.6/docs/sub2api.en.md).
+- **Linux / VPS with SUB2API**: download this release's source and follow the [deployment guide](https://github.com/Kaixxrua/excel-codex-bridge/blob/v0.5.11/docs/sub2api.en.md).
 
 On a Mac, downloading with `curl` avoids the "developer cannot be verified" block (Intel: replace
 `arm64` with `x64`):
 
 ```
-curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.6/excel-codex-bridge-0.5.6-macos-arm64.tar.gz | tar xz
-./excel-codex-bridge-0.5.6-macos-arm64/excel-codex status
+curl -fL https://github.com/Kaixxrua/excel-codex-bridge/releases/download/v0.5.11/excel-codex-bridge-0.5.11-macos-arm64.tar.gz | tar xz
+./excel-codex-bridge-0.5.11-macos-arm64/excel-codex status
 ```
 
 If you downloaded with a browser, run `xattr -dr com.apple.quarantine <extracted folder>` once.

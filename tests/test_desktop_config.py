@@ -13,7 +13,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from excel_codex_bridge import cli, desktop_config
+from excel_codex_bridge import cli, codex_threads, desktop_config
 
 from helpers import write_webview_session
 
@@ -116,6 +116,53 @@ class EnableTests(unittest.TestCase):
         self.assertNotIn(desktop_config.DISABLED_PREFIX, enabled)
         self.assertEqual(tomllib.loads(enabled)["profiles"]["fast"]["model"], "gpt-5.5")
 
+    def assert_quiet(self, original: str, enabled: str) -> dict:
+        data = self.assert_points_at_bridge(enabled)
+        self.assertIs(data["features"]["apps"], False)
+        self.assertIs(data["features"]["remote_plugin"], False)
+        self.assertTrue(desktop_config.features_quiet(enabled))
+        self.assertEqual(desktop_config.strip_managed(enabled), original)
+        # Again, with and without: the same text, and back to no change to the features.
+        self.assertEqual(enable(enabled, quiet_features=True), enabled)
+        self.assertFalse(desktop_config.features_quiet(enable(enabled)))
+        self.assertEqual(desktop_config.strip_managed(enable(enabled)), original)
+        return data
+
+    def test_apps_and_plugin_suggestions_can_be_turned_off(self):
+        for original in (USER_CONFIG, USER_CONFIG.replace("\n", "\r\n"), USER_CONFIG.rstrip("\n"), ""):
+            with self.subTest(original=original[-12:]):
+                enabled = enable(original, quiet_features=True)
+                self.assertIn("features.apps = false", enabled)
+                self.assert_quiet(original, enabled)
+                self.assertNotIn("features", tomllib.loads(enable(original)))
+
+    def test_the_users_own_features_table_gets_them(self):
+        table = '[features]\napps = true\n"remote_plugin" = true\nweb_search = true\n'
+        for original in (
+            USER_CONFIG + table,
+            (table + USER_CONFIG).replace("\n", "\r\n"),
+            USER_CONFIG + "[features] # mine\nweb_search = true",
+            USER_CONFIG + "[features]",
+            'features.apps = true\nfeatures.web_search = true\n' + USER_CONFIG,
+        ):
+            with self.subTest(original=original[-30:]):
+                enabled = enable(original, quiet_features=True)
+                data = self.assert_quiet(original, enabled)
+                if "web_search" in original:
+                    self.assertIs(data["features"]["web_search"], True)
+                if "apps = true" in original:
+                    self.assertIn(desktop_config.DISABLED_PREFIX + "apps = true", enabled.replace("features.", ""))
+
+    def test_features_elsewhere_are_left_alone(self):
+        original = '[profiles.fast.features]\napps = true\n'
+        data = tomllib.loads(enable(original, quiet_features=True))
+        self.assertIs(data["profiles"]["fast"]["features"]["apps"], True)
+        self.assertIs(data["features"]["apps"], False)
+        # An inline table cannot be added to.
+        inline = 'features = { web_search = true }\n'
+        self.assertEqual(enable(inline, quiet_features=True), enable(inline))
+        self.assertFalse(desktop_config.features_quiet(enable(inline)))
+
     def test_active_profile_with_its_own_model_is_reported(self):
         self.assertEqual(
             desktop_config.profile_override('profile = "fast"\n[profiles.fast]\nmodel = "o3"\n'), "fast"
@@ -158,6 +205,36 @@ class FileTests(unittest.TestCase):
         self.assertTrue(desktop_config.disable_file(self.path))
         self.assertEqual(self.path.read_text(), USER_CONFIG)
 
+    def test_quiet_round_trip(self):
+        original = (USER_CONFIG + "[features]\napps = true\n").replace("\n", "\r\n").encode()
+        self.path.write_bytes(original)
+        desktop_config.enable_file(self.path, port=8765, catalog=CATALOG, model="gpt-6-sol-excel",
+                                   quiet_features=True)
+        self.assertTrue(desktop_config.features_quiet(self.path.read_text()))
+        self.assertTrue(desktop_config.disable_file(self.path))
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_features_that_cannot_be_turned_off_do_not_stop_the_rest(self):
+        # `features.apps` as a table of its own, and an inline table: TOML allows no addition to either.
+        for original in ('[features.apps]\nenabled = true\n', 'features = { apps = true }\n'):
+            with self.subTest(original=original):
+                self.path.write_text(original)
+                desktop_config.enable_file(self.path, port=8765, catalog=CATALOG, model="gpt-6-sol-excel",
+                                           quiet_features=True)
+                text = self.path.read_text()
+                self.assertEqual(tomllib.loads(text)["model_provider"], "excel-bridge")
+                self.assertFalse(desktop_config.features_quiet(text))
+                self.assertTrue(desktop_config.disable_file(self.path))
+                self.assertEqual(self.path.read_text(), original)
+
+    def test_without_tomllib_our_own_lines_tell(self):
+        for original in ("", "[features]\n"):
+            with self.subTest(original=original):
+                enabled = enable(original, quiet_features=True)
+                with mock.patch.object(desktop_config, "_parse", return_value=None):
+                    self.assertTrue(desktop_config.features_quiet(enabled))
+                    self.assertFalse(desktop_config.features_quiet(enable(original)))
+
     def test_invalid_toml_is_left_untouched(self):
         self.path.write_text("approval_policy = \n")
         with self.assertRaises(desktop_config.ConfigError):
@@ -180,6 +257,10 @@ class DesktopCommandTests(unittest.TestCase):
             if hasattr(cli.signal, name):
                 sig = getattr(cli.signal, name)
                 self.addCleanup(cli.signal.signal, sig, cli.signal.getsignal(sig))
+        # This machine's own Codex, if it runs one, is none of these tests' business.
+        seen = mock.patch.object(codex_threads, "codex_seen", return_value=False)
+        self.codex_seen = seen.start()
+        self.addCleanup(seen.stop)
 
     def run_desktop(self, *extra, while_running=None):
         seen = {}
@@ -203,6 +284,29 @@ class DesktopCommandTests(unittest.TestCase):
         self.assertEqual(data["model_providers"]["excel-bridge"]["base_url"], "http://127.0.0.1:8799/v1")
         self.assertEqual(self.config.read_text(), USER_CONFIG)
 
+    def test_apps_and_plugin_suggestions_are_off_unless_asked_to_keep_them(self):
+        for extra, off in (((), True), (("--keep-apps",), False)):
+            with self.subTest(extra=extra), mock.patch.object(cli, "_print") as printed:
+                code, seen = self.run_desktop(*extra)
+                said = [call.args[0] for call in printed.call_args_list]
+                self.assertEqual(code, 0)
+                features = tomllib.loads(seen["config"]).get("features", {})
+                self.assertEqual(features, {"apps": False, "remote_plugin": False} if off else {})
+                self.assertEqual(cli._APPS_OFF in said, off)
+                self.assertNotIn(cli._APPS_LEFT_ON, said)
+                self.assertEqual(self.config.read_text(), USER_CONFIG)
+        self.assertTrue(cli._APPS_OFF.isascii() and cli._APPS_LEFT_ON.isascii())
+
+    def test_features_it_cannot_turn_off_are_said(self):
+        original = USER_CONFIG + "[features.apps]\nenabled = true\n"
+        self.config.write_text(original)
+        with mock.patch.object(cli, "_print") as printed:
+            code, seen = self.run_desktop()
+        self.assertEqual(code, 0)
+        self.assertEqual(tomllib.loads(seen["config"])["model_provider"], "excel-bridge")
+        self.assertIn(cli._APPS_LEFT_ON, [call.args[0] for call in printed.call_args_list])
+        self.assertEqual(self.config.read_text(), original)
+
     def test_signed_in_codex_shares_its_conversations(self):
         (self.config.parent / "auth.json").write_text('{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-test"}')
         with mock.patch.object(cli, "_print") as printed:
@@ -221,6 +325,28 @@ class DesktopCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(tomllib.loads(seen["config"])["model_provider"], "excel-bridge")
         self.assertIn(cli._SEPARATE, [call.args[0] for call in printed.call_args_list])
+
+    def test_it_says_to_quit_codex_fully_when_done(self):
+        for running in (True, False, None):
+            with self.subTest(running=running), mock.patch.object(cli, "_print") as printed:
+                self.codex_seen.return_value = running
+                code, _ = self.run_desktop()
+                said = [call.args[0] for call in printed.call_args_list]
+                self.assertEqual(code, 0)
+                self.assertIn(cli._QUIT_WHEN_DONE, said)
+                self.assertIn(cli._REOPEN_AFTER_RESTORE, said)
+                # Only when a Codex process is seen: not when the process list cannot be read.
+                self.assertEqual(cli._STILL_RUNNING in said, running is True)
+        self.assertIn("tray icon", cli._QUIT_WHEN_DONE)
+        self.assertIn("os error 10061", cli._REOPEN_AFTER_RESTORE)
+
+    def test_off_says_so_too(self):
+        self.run_desktop("--keep-config")
+        self.codex_seen.return_value = True
+        with mock.patch.object(cli, "_print") as printed:
+            self.assertEqual(cli.main(["desktop", "--off"]), 0)
+        said = [call.args[0] for call in printed.call_args_list]
+        self.assertEqual(said[1:], [cli._REOPEN_AFTER_RESTORE, cli._STILL_RUNNING])
 
     def test_keep_config_then_off(self):
         code, _ = self.run_desktop("--keep-config")

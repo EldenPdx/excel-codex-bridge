@@ -13,8 +13,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import sse
-from .server import MAX_BODY_BYTES
-from .sub2api import BodyTooLarge, GatewayGuard, GatewayKeys, SESSION_PATH, read_json, read_secret
+from .sub2api import (MAX_BODY_BYTES, BodyTooLarge, GatewayGuard, GatewayKeys,
+                      SESSION_PATH, read_json, read_secret)
 
 
 @dataclass(frozen=True)

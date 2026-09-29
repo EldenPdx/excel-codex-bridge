@@ -41,17 +41,26 @@ list with ``threads migrate`` (``--migrate desktop``: by starting ``desktop``,
 which moves it by itself).  A plain ``codex exec resume --last`` then carries
 it on with only Codex's own providers, the way the desktop app has them with
 the bridge off; its ``openai`` provider reaches the bridge through ``serve``.
+``--migrate relay`` starts it through a relay instead, set up the way a relay's
+Codex config template sets it up: a provider of its own named ``OpenAI`` (not
+Codex's ``openai``: names are case-sensitive), with ``serve`` in the relay's
+place.  ``threads migrate --from OpenAI`` then moves it under ``openai``.
 
 ``--images`` also attaches a picture (``codex exec -i``).  Like the real
 backend, the fake one refuses a user message with an inline picture; the
 bridge must then upload it once to the attachments endpoint, the way the
 add-in does, and name it by its file id from then on.
+
+``--network-drop`` cuts every connection to the backend for a while after the
+first, the way a proxy node that went away does: the bridge must keep trying,
+and Codex must see an answer, not the drop.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
 import itertools
 import json
@@ -61,6 +70,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import re
@@ -93,6 +103,8 @@ CODEX_ARGS = [
 ]
 # Carries the conversation above on (Codex lists only its current provider's).
 RESUME_ARGS = [*CODEX_ARGS[:-1], "resume", "--last", "Carry on."]
+# What a relay's Codex config template may call its provider.
+RELAY_PROVIDER = "OpenAI"
 PYTHON = "python" if sys.platform == "win32" else "python3"
 # Prints a marker only a real execution can produce, plus the PYTHONPATH Codex
 # gave the command.  Works in bash, PowerShell and cmd alike.
@@ -173,8 +185,13 @@ def exit_zone_for(now: dt.datetime) -> str:
 
 class FakeExcelBackend:
     def __init__(self, parallel: bool = False, imagegen: bool = False, refuse: str | None = None,
-                 exit_zone: str = "Pacific/Kiritimati") -> None:
+                 exit_zone: str = "Pacific/Kiritimati", rate_limited: int = 0,
+                 rate_limited_for: float = 0.0) -> None:
         self.requests: list[dict] = []
+        # Requests failed on the shared tokens-per-minute limit, before any other is answered:
+        # the first ``rate_limited``, and all in the first ``rate_limited_for`` seconds.
+        self.limited: list[dict] = []
+        self.limited_until: float | None = None
         # The proxy exit the bridge finds: this IP, in this timezone.
         self.exit_zone = exit_zone
         self.lookups: list[str] = []
@@ -230,6 +247,23 @@ class FakeExcelBackend:
             if inline_in_user_message(body):
                 self.refused.append(body)
                 return JSONResponse({"detail": "Invalid request body."}, status_code=422)
+            if self.limited_until is None:
+                self.limited_until = time.monotonic() + rate_limited_for
+            if len(self.limited) < rate_limited or time.monotonic() < self.limited_until:
+                self.limited.append(body)
+                limited = [
+                    sse("response.created", {"type": "response.created",
+                        "response": {"id": f"resp_limited_{len(self.limited)}", "status": "in_progress"}}),
+                    sse("response.failed", {"type": "response.failed", "response": {
+                        "id": f"resp_limited_{len(self.limited)}", "status": "failed", "error": {
+                            "code": "rate_limit_exceeded", "message": RATE_LIMITED}}}),
+                ]
+
+                async def failing():
+                    for event in limited:
+                        yield event
+
+                return StreamingResponse(failing(), media_type="text/event-stream")
             n = next(counter)
             self.requests.append(body)
             raw = json.dumps(body)
@@ -294,6 +328,90 @@ class FakeExcelBackend:
             return JSONResponse({"error": {"message": "not here"}}, status_code=404)
 
         self.app = app
+
+
+RATE_LIMITED = ("Rate limit reached for gpt-5.6-sol in organization org-e2e on tokens per min (TPM): "
+                "Limit 500000000, Used 499990000, Requested 150000. Please try again in 18ms.")
+# --rate-limited long: limited for longer than Codex, told to, waits for a silent stream.
+LONG_RATE_LIMIT_SECONDS = 40
+CODEX_IDLE_MS = 20000
+
+
+# --network-drop: every connection to the backend is cut for this long after the first one.
+NETWORK_DROP_SECONDS = 12
+
+
+class Gate:
+    """Passes connections on to the fake backend, but cuts requests to it for ``drop`` seconds after the first.
+
+    Only POSTs: the bridge's look-up of the exit IP on the same host goes through.
+    """
+
+    def __init__(self, port: int, drop: float) -> None:
+        self.target, self.drop = port, drop
+        self.cut = 0
+        self.down_until: float | None = None
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(64)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                client, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._handle, args=(client,), daemon=True).start()
+
+    def _down_for(self, data: bytes) -> bool:
+        if not data.startswith(b"POST"):
+            return False
+        now = time.monotonic()
+        if self.down_until is None:
+            self.down_until = now + self.drop
+        return now < self.down_until
+
+    def _cut(self, client: socket.socket) -> None:
+        self.cut += 1
+        # Reset rather than closed, the way a connection through a node that went away ends.
+        linger = struct.pack("HH" if sys.platform == "win32" else "ii", 1, 0)
+        with contextlib.suppress(OSError):
+            client.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, linger)
+        client.close()
+
+    def _handle(self, client: socket.socket) -> None:
+        try:
+            upstream = socket.create_connection(("127.0.0.1", self.target))
+        except OSError:
+            client.close()
+            return
+
+        def back() -> None:
+            with contextlib.suppress(OSError):
+                while data := upstream.recv(65536):
+                    client.sendall(data)
+            with contextlib.suppress(OSError):
+                client.shutdown(socket.SHUT_WR)
+
+        replies = threading.Thread(target=back, daemon=True)
+        replies.start()
+        with contextlib.suppress(OSError):
+            # On a kept-alive connection each request starts a read of its own.
+            while data := client.recv(65536):
+                if self._down_for(data):
+                    self._cut(client)
+                    break
+                upstream.sendall(data)
+        with contextlib.suppress(OSError):
+            upstream.shutdown(socket.SHUT_WR)
+        replies.join(timeout=30)
+        client.close()
+        upstream.close()
+
+    def close(self) -> None:
+        self.sock.close()
 
 
 def start_server(app) -> tuple[uvicorn.Server, int]:
@@ -447,20 +565,38 @@ def migrate_then_resume(launcher, args, root: Path, webview: Path, project: Path
     home = Path(env["CODEX_HOME"])
     # This machine may run a Codex of its own; this run's Codex home is used by nothing else.
     env = dict(env, EXCEL_BRIDGE_ASSUME_CODEX_QUIT="1")
-    first = shlex.split(args.first_launcher) if args.first_launcher else launcher
-    output, checks = run_launcher(first, args, webview, project, env)
+    if args.migrate == "relay":
+        # The relay's key, as its template has it in auth.json.
+        sign_codex_in(home)
+        output, checks = through_a_relay(launcher, args, root, webview, project, env)
+        filed_under = RELAY_PROVIDER
+    else:
+        first = shlex.split(args.first_launcher) if args.first_launcher else launcher
+        output, checks = run_launcher(first, args, webview, project, env)
+        filed_under = codex_config.PROVIDER_ID
     args.first_requests = len(args.backend.requests)
     before = codex_threads(home)
     filed = rollout_providers(home)
     checks += [
-        (len(before) == 1 and before[0][0] == "excel-bridge",
-         f"the first conversation should be filed under excel-bridge, got {before}"),
-        (filed == ["excel-bridge"], f"the first conversation's file should name excel-bridge, got {filed}"),
+        (len(before) == 1 and before[0][0] == filed_under,
+         f"the first conversation should be filed under {filed_under}, got {before}"),
+        (filed == [filed_under], f"the first conversation's file should name {filed_under}, got {filed}"),
     ]
     sign_codex_in(home)
     if args.migrate == "desktop":
         moved, moved_checks = desktop_moves_them(launcher, args, root, webview, project, env)
         expected = "Moved 1 conversation(s) from the bridge's own provider into the shared list"
+    elif args.migrate == "relay":
+        # The plain list points at them; `--from` moves them.
+        listed = run([*launcher, "threads"], cwd=project, env=env, timeout=120)
+        result = run([*launcher, "threads", "migrate", "--from", RELAY_PROVIDER], cwd=project, env=env, timeout=120)
+        moved = listed.stdout + result.stdout
+        moved_checks = [
+            (listed.returncode == 0 and f"Also filed under other providers: `{RELAY_PROVIDER}` (1)" in listed.stdout,
+             f"`threads` did not point at the conversation: {listed.stdout.strip()[-1500:]}"),
+            (result.returncode == 0, f"`threads migrate --from` exit code {result.returncode}"),
+        ]
+        expected = f"Moved 1 conversation(s) from `{RELAY_PROVIDER}` to `openai`"
     else:
         result = run([*launcher, "threads", "migrate"], cwd=project, env=env, timeout=120)
         moved, moved_checks = result.stdout, [(result.returncode == 0, f"`threads migrate` exit code {result.returncode}")]
@@ -468,11 +604,14 @@ def migrate_then_resume(launcher, args, root: Path, webview: Path, project: Path
     print(moved)
     after = codex_threads(home)
     refiled = rollout_providers(home)
-    official = codex_config.codex_model(args.model)
+    rebuilt = rollout_rebuilt(home)
+    # A 1M model too: OpenAI serves the same model without it.
+    official = codex_config.official_model(args.model)
     checks += moved_checks + [
         (expected in moved, f"the conversation was not moved: {moved.strip()[-1500:]}"),
         (after == [("openai", official)], f"it should be filed as ('openai', {official}), got {after}"),
         (refiled == ["openai"], f"its file should name openai now, got {refiled}"),
+        (rebuilt == after, f"Codex would rebuild its index row from the file as {rebuilt}, not {after}"),
         (len(list(home.glob("state_*.sqlite.before-excel-codex-*"))) == 1, "no copy of Codex's index"),
     ]
     args.shared = True
@@ -484,6 +623,45 @@ def migrate_then_resume(launcher, args, root: Path, webview: Path, project: Path
          "`resume --last` did not carry the moved conversation on"),
     ]
     return output, checks
+
+
+def through_a_relay(launcher, args, root: Path, webview: Path, project: Path, env: dict) -> tuple[str, list]:
+    """A conversation started through a relay's own provider named ``OpenAI``; ``serve`` stands in for the relay."""
+    with serving(launcher, args, root, webview, project, env, "relay.log") as (port, up):
+        codex = shutil.which("codex", path=env.get("PATH"))
+        if not (up and codex):
+            return "", [(up, "`serve` did not come up"), (bool(codex), "codex not found on PATH")]
+        table = f"model_providers.{RELAY_PROVIDER}"
+        overrides = [
+            "-c", f"model_provider='{RELAY_PROVIDER}'",
+            "-c", f"{table}.name='{RELAY_PROVIDER}'",
+            "-c", f"{table}.base_url='{codex_config.base_url(port)}'",
+            "-c", f"{table}.wire_api='responses'",
+            # The key comes from auth.json's OPENAI_API_KEY, as with the relay's template.
+            "-c", f"{table}.requires_openai_auth=true",
+            "-c", f"model='{codex_config.codex_model(args.model)}'",
+            # The bridge's model entries: Codex's own for this model hand it the tools in a
+            # form the bridge does not read (Responses Lite), so its call would reach no tool.
+            "-c", f"model_catalog_json='{codex_config.write_catalog(root / 'catalog')}'",
+        ]
+        result = run(codex_config.codex_command(codex, overrides, args.codex_args),
+                     cwd=project, env=loopback_direct(env), timeout=args.timeout)
+    return result.stdout, [
+        (result.returncode == 0, f"codex through the relay: exit code {result.returncode}: "
+                                 f"{result.stdout.strip()[-1500:]}"),
+    ]
+
+
+@contextlib.contextmanager
+def serving(launcher, args, root: Path, webview: Path, project: Path, env: dict, log: str):
+    """``serve`` on a port of its own while in the block: (port, whether it came up)."""
+    port = free_port()
+    bridge = in_background([*launcher, "serve", "--webview-dir", str(webview), "--port", str(port)],
+                           cwd=project, env=env, log=root / log)
+    try:
+        yield port, wait_healthy(bridge, port, args.timeout)
+    finally:
+        stop(bridge)
 
 
 def desktop_moves_them(launcher, args, root: Path, webview: Path, project: Path, env: dict) -> tuple[str, list]:
@@ -517,13 +695,10 @@ def resume_with_codex_providers_only(launcher, args, root: Path, webview: Path, 
     in for the official service.  A conversation still filed under
     ``excel-bridge`` fails here: "Model provider `excel-bridge` not found".
     """
-    port = free_port()
-    bridge = in_background([*launcher, "serve", "--webview-dir", str(webview), "--port", str(port)],
-                           cwd=project, env=env, log=root / "serve.log")
     checks = []
     output = ""
-    try:
-        checks.append((wait_healthy(bridge, port, args.timeout), "`serve` did not come up"))
+    with serving(launcher, args, root, webview, project, env, "serve.log") as (port, up):
+        checks.append((up, "`serve` did not come up"))
         codex = shutil.which("codex", path=env.get("PATH"))
         if codex and healthy(port):
             base = ["-c", f"openai_base_url='{codex_config.base_url(port)}'"]
@@ -542,8 +717,6 @@ def resume_with_codex_providers_only(launcher, args, root: Path, webview: Path, 
             ]
         else:
             checks.append((False, "codex not found on PATH" if not codex else "skipped codex"))
-    finally:
-        stop(bridge)
     return output, checks
 
 
@@ -588,11 +761,18 @@ def app_server_opens(codex: str, overrides: list[str], thread_ids: list[str], pr
     except (OSError, TimeoutError) as exc:
         return False, repr(exc)
     finally:
-        server.terminate()
+        # Gone for good before `codex exec resume`: a live app-server stays the conversation's writer.
+        # On Windows `codex` is a .cmd wrapper, and terminating it leaves Codex itself running.
+        with contextlib.suppress(OSError):
+            server.stdin.close()
         try:
-            server.wait(timeout=10)
+            server.wait(timeout=30)
         except subprocess.TimeoutExpired:
-            server.kill()
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(server.pid)], capture_output=True)
+            else:
+                server.kill()
+            server.wait(timeout=30)
     shown = [(item.get("id"), item.get("modelProvider")) for item in (listed.get("result") or {}).get("data") or []]
     if shown != [(thread_ids[0], "openai")]:
         return False, f"listed as {shown}"
@@ -619,6 +799,29 @@ def rollout_providers(home: Path) -> list[str]:
     for path in sorted((home / "sessions").rglob("rollout-*.jsonl")):
         with path.open(encoding="utf-8") as handle:
             found.append(json.loads(handle.readline())["payload"].get("model_provider"))
+    return found
+
+
+def rollout_rebuilt(home: Path) -> list[tuple[str, str]]:
+    """(provider, model) Codex takes from each conversation file when it rebuilds its index row.
+
+    As codex-rs state/src/extract.rs does: the provider from session_meta, then
+    the model, and the provider again, from each later line in turn.
+    """
+    found = []
+    for path in sorted((home / "sessions").rglob("rollout-*.jsonl")):
+        provider = model = None
+        for line in path.read_text(encoding="utf-8").splitlines():
+            item = json.loads(line)
+            payload = item.get("payload") or {}
+            if item.get("type") == "session_meta":
+                provider = payload.get("model_provider")
+            elif item.get("type") == "turn_context":
+                model = payload.get("model")
+            elif item.get("type") == "event_msg" and payload.get("type") == "thread_settings_applied":
+                model = payload["thread_settings"].get("model")
+                provider = payload["thread_settings"].get("model_provider_id")
+        found.append((provider, model))
     return found
 
 
@@ -659,18 +862,30 @@ def main() -> int:
                         help="also sign Codex in with ChatGPT; `refused` makes the backend turn it down")
     parser.add_argument("--shared", action="store_true",
                         help="sign Codex itself in, so the bridge stands in for its openai provider")
-    parser.add_argument("--migrate", nargs="?", const="command", choices=["command", "desktop"],
+    parser.add_argument("--migrate", nargs="?", const="command", choices=["command", "desktop", "relay"],
                         help="file a conversation the 0.5.3 way, move it into the shared list (by "
                         "`threads migrate`, or by starting `desktop`), then carry it on with the bridge's "
-                        "provider gone")
+                        "provider gone; `relay`: file it under a relay's own `OpenAI` provider and move it "
+                        "with `threads migrate --from OpenAI`")
+    parser.add_argument("--rate-limited", nargs="?", const="briefly", choices=("briefly", "long"),
+                        help="fail the first two requests on the shared tokens-per-minute limit, or (long) "
+                        f"all in the first {LONG_RATE_LIMIT_SECONDS} s with Codex dropping a stream silent for "
+                        f"{CODEX_IDLE_MS // 1000} s; the bridge waits them out")
+    parser.add_argument("--network-drop", action="store_true",
+                        help=f"cut every connection to the backend for {NETWORK_DROP_SECONDS} s after the first; "
+                        "the bridge keeps trying")
     parser.add_argument("--first-launcher",
                         help="with --migrate: the command that starts that conversation, e.g. a 0.5.3 checkout's")
     parser.add_argument("--timeout", type=int, default=900, help="seconds for each long step")
     parser.add_argument("launcher", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    # What a launcher printed may not fit the console's code page (cp1252 on Windows runners).
+    sys.stdout.reconfigure(errors="backslashreplace")
     launcher = args.launcher[1:] if args.launcher[:1] == ["--"] else args.launcher
     if not launcher:
         parser.error("give the launcher command after --")
+    if args.rate_limited == "long" and (args.shared or args.migrate):
+        parser.error("--rate-limited long sets the idle timeout of the bridge's own provider")
     if Path(launcher[0]).exists():
         launcher[0] = str(Path(launcher[0]).resolve())
 
@@ -686,15 +901,17 @@ def main() -> int:
     exit_zone = exit_zone_for(started_at)
     backend = FakeExcelBackend(parallel=args.parallel, imagegen=args.imagegen,
                                refuse="e2e-codex-account" if args.codex_login == "refused" else None,
-                               exit_zone=exit_zone)
+                               exit_zone=exit_zone, rate_limited=2 if args.rate_limited == "briefly" else 0,
+                               rate_limited_for=LONG_RATE_LIMIT_SECONDS if args.rate_limited == "long" else 0)
     server, port = start_server(backend.app)
+    gate = Gate(port, NETWORK_DROP_SECONDS) if args.network_drop else None
 
     env = dict(os.environ)
     env.update(
         CODEX_HOME=str(root / "codex-home"),
         EXCEL_BRIDGE_CODEX_AUTH=str(codex_auth),
         EXCEL_BRIDGE_HOME=str(root / "bridge-home"),
-        GHCP_EXCEL_RESPONSES_URL=f"http://127.0.0.1:{port}/basispoints/api/responses",
+        GHCP_EXCEL_RESPONSES_URL=f"http://127.0.0.1:{gate.port if gate else port}/basispoints/api/responses",
         EXCEL_BRIDGE_TIMEZONE="auto",
         EXCEL_BRIDGE_TIMEZONE_LOOKUP=f"http://127.0.0.1:{port}/geo/{{ip}}",
         EXCEL_BRIDGE_TIMEZONE_TRACE=f"http://127.0.0.1:{port}/cdn-cgi/trace",
@@ -704,6 +921,8 @@ def main() -> int:
     if args.shared and not args.migrate:
         sign_codex_in(Path(env["CODEX_HOME"]))
     args.codex_args = list(CODEX_ARGS)
+    if args.rate_limited == "long":
+        args.codex_args[-1:-1] = ["-c", f"model_providers.excel-bridge.stream_idle_timeout_ms={CODEX_IDLE_MS}"]
     args.backend, args.first_requests = backend, 0
     picture = png()
     if args.images:
@@ -718,6 +937,8 @@ def main() -> int:
     else:
         output, checks = run_launcher(launcher, args, webview, project, env)
     server.should_exit = True
+    if gate:
+        gate.close()
 
     upstream_model = excel_upstream.EXCEL_MODEL_UPSTREAMS[args.model]
     # A --first-launcher from before 0.5.4 does not move the timezone.
@@ -726,10 +947,12 @@ def main() -> int:
     dates = set(re.findall(r"<current_date>([^<]*)</current_date>", sent))
     exit_days = {exit_timezone.today_in(exit_zone, now=when)
                  for when in (started_at, dt.datetime.now(dt.timezone.utc))}
+    # Each bridge started looks the exit up once (--migrate starts a second to carry on);
+    # on Windows desktop's system sync does too.
+    lookups = 1 + bool(args.migrate) + (sys.platform == "win32" and (args.desktop or args.migrate == "desktop"))
     checks += [
-        # The bridge looks the exit up once; on Windows desktop's system sync does too.
-        (0 < len(backend.lookups) <= 2 and set(backend.lookups) == {EXIT_IP},
-         f"expected the exit IP looked up once or twice, got {backend.lookups}"),
+        (0 < len(backend.lookups) <= lookups and set(backend.lookups) == {EXIT_IP},
+         f"expected the exit IP looked up at most {lookups} time(s), got {backend.lookups}"),
         (zones == {exit_zone}, f"Codex's timezone should be the exit's ({exit_zone}), got {zones}"),
         (bool(dates) and dates <= exit_days, f"Codex's date should be the day at the exit {exit_days}, got {dates}"),
         (f"provider: {'openai' if args.shared else 'excel-bridge'}" in output, "Codex used another provider"),
@@ -804,6 +1027,32 @@ def main() -> int:
             (bool(sent) and all(len(parts) == 1 for parts in sent),
              f"expected the picture once in every request, got {[len(parts) for parts in sent]}"),
             (file_ids == ["file-e2e-1"], f"expected every request to name the upload, got {file_ids}"),
+        ]
+    if args.rate_limited:
+        bridge_log = root / "bridge-home" / "bridge.log"
+        waited = bridge_log.read_text(encoding="utf-8", errors="replace") if bridge_log.exists() else ""
+        waited += _desktop_log(root)
+        expected = 2 if args.rate_limited == "briefly" else 5
+        checks += [
+            (len(backend.limited) >= expected if args.rate_limited == "long" else len(backend.limited) == expected,
+             f"expected {expected} rate-limited requests, got {len(backend.limited)}"),
+            (bool(backend.limited) and bool(backend.requests) and backend.limited[0] == backend.requests[0],
+             "the bridge did not send the rate-limited request again as it was"),
+            (waited.count("the Excel backend is rate limited") == len(backend.limited),
+             "the bridge did not say it was waiting"),
+            (not any(said in output.lower() for said in ("rate limit", "reconnecting", "disconnected")),
+             "Codex saw the rate limit, or gave up on the stream"),
+        ]
+    if gate:
+        bridge_log = root / "bridge-home" / "bridge.log"
+        said = bridge_log.read_text(encoding="utf-8", errors="replace") if bridge_log.exists() else ""
+        said += _desktop_log(root)
+        checks += [
+            (gate.cut >= 3, f"expected the first connections cut, got {gate.cut}"),
+            ("trying again for up to" in said and "again after" in said,
+             "the bridge did not say it was trying again, or that it got through"),
+            (not any(seen in output.lower() for seen in ("reconnecting", "disconnected", "bad gateway")),
+             "Codex saw the drop"),
         ]
     failures = [message for ok, message in checks if not ok]
 

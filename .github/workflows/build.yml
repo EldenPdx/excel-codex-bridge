@@ -79,6 +79,20 @@ jobs:
         run: python tests/e2e/run_e2e.py --migrate -- ./excel-codex.sh
       - name: e2e (excel-codex.sh desktop, the bridge's own conversations moved at start)
         run: python tests/e2e/run_e2e.py --migrate desktop -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh, a 1M conversation moved onto the same model's official version)
+        run: python tests/e2e/run_e2e.py --migrate --model gpt-5.6-sol-1m-excel -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh, a relay's `OpenAI` conversations moved by threads migrate --from)
+        run: python tests/e2e/run_e2e.py --migrate relay -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh, the shared rate limit waited out)
+        run: python tests/e2e/run_e2e.py --rate-limited -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh, a rate limit longer than Codex waits for a silent stream)
+        run: python tests/e2e/run_e2e.py --rate-limited long -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh desktop, the shared rate limit waited out)
+        run: python tests/e2e/run_e2e.py --desktop --shared --rate-limited -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh, a network drop waited out)
+        run: python tests/e2e/run_e2e.py --network-drop -- ./excel-codex.sh
+      - name: e2e (excel-codex.sh desktop, a network drop waited out)
+        run: python tests/e2e/run_e2e.py --desktop --shared --network-drop -- ./excel-codex.sh
 
   windows:
     needs: test
@@ -132,6 +146,20 @@ jobs:
         run: python tests/e2e/run_e2e.py --migrate -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.exe desktop, the bridge's own conversations moved at start)
         run: python tests/e2e/run_e2e.py --migrate desktop -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe, a 1M conversation moved onto the same model's official version)
+        run: python tests/e2e/run_e2e.py --migrate --model gpt-5.6-sol-1m-excel -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe, a relay's `OpenAI` conversations moved by threads migrate --from)
+        run: python tests/e2e/run_e2e.py --migrate relay -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe, the shared rate limit waited out)
+        run: python tests/e2e/run_e2e.py --rate-limited -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe, a rate limit longer than Codex waits for a silent stream)
+        run: python tests/e2e/run_e2e.py --rate-limited long -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe desktop, the shared rate limit waited out)
+        run: python tests/e2e/run_e2e.py --desktop --shared --rate-limited -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe, a network drop waited out)
+        run: python tests/e2e/run_e2e.py --network-drop -- dist/excel-codex/excel-codex.exe
+      - name: e2e (excel-codex.exe desktop, a network drop waited out)
+        run: python tests/e2e/run_e2e.py --desktop --shared --network-drop -- dist/excel-codex/excel-codex.exe
       - name: e2e (excel-codex.cmd)
         run: python tests/e2e/run_e2e.py -- excel-codex.cmd
 
@@ -204,6 +232,10 @@ jobs:
         run: python tests/e2e/run_e2e.py --desktop --codex-login refused -- dist/excel-codex/excel-codex
       - name: e2e (excel-codex desktop, conversations shared with Codex's own sign-in)
         run: python tests/e2e/run_e2e.py --desktop --shared -- dist/excel-codex/excel-codex
+      - name: e2e (excel-codex desktop, the shared rate limit waited out)
+        run: python tests/e2e/run_e2e.py --desktop --shared --rate-limited -- dist/excel-codex/excel-codex
+      - name: e2e (excel-codex, a rate limit longer than Codex waits for a silent stream)
+        run: python tests/e2e/run_e2e.py --rate-limited long -- dist/excel-codex/excel-codex
 
       - name: Package
         run: |

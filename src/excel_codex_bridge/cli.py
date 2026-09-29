@@ -509,11 +509,19 @@ def _undo_on_exit(undo):
     return handler
 
 
-# The desktop app reads its model list only at startup, so it keeps offering
-# the Excel models after the config is restored; requests then go to OpenAI.
+# The desktop app reads its config and model list only at startup, and a
+# conversation it has open keeps the route it was opened with: to the bridge,
+# gone once this window is.
 _REOPEN_AFTER_RESTORE = (
-    "  Quit and reopen the Codex desktop app too: until then it still lists the bridge's models,\n"
-    "  and the 1M ones fail there with \"not supported when using Codex with a ChatGPT account\"."
+    "  Now fully quit the Codex desktop app and open it again (Windows: right-click its tray icon > Quit;\n"
+    "  closing its window leaves it running), and reload IDE windows that use Codex. Until then the\n"
+    "  conversations opened meanwhile still go to the bridge and fail with \"connection refused\"\n"
+    "  (os error 10061), and the app still offers the bridge's models (1M ones fail without it)."
+)
+_STILL_RUNNING = "  Codex is still running right now: quit it as above before carrying on."
+_QUIT_WHEN_DONE = (
+    "  When done, fully quit Codex too (Windows: its tray icon > Quit) before using it without the\n"
+    "  bridge: conversations opened meanwhile keep going to this window until then."
 )
 _SHARED = (
     "  Conversations are shared with Codex's official sign-in: earlier ones carry on through the\n"
@@ -523,30 +531,51 @@ _SEPARATE = (
     "  Codex is not signed in, so the bridge is a provider of its own: conversations started now\n"
     "  are listed only while it is on. `codex login` once to share them with the official sign-in."
 )
+# Signed in with ChatGPT, Codex waits on chatgpt.com for these when a conversation opens
+# (apps, up to 30 s) and on every turn (plugin suggestions, 5 s).
+_APPS_OFF = (
+    "  Codex's apps and plugin suggestions are off while this runs: they wait on chatgpt.com, so a\n"
+    "  slow proxy kept conversations loading. --keep-apps leaves them on."
+)
+_APPS_LEFT_ON = (
+    "  Codex's apps and plugin suggestions stay on: config.toml sets [features] in a way this cannot\n"
+    "  change. Through a slow proxy they can keep conversations loading for up to 30 s."
+)
 
 
 def _move_bridge_threads(home: Path) -> None:
     """Move the bridge's own conversations into the shared list, if Codex is not running.
 
     With the bridge off, Codex cannot open them otherwise ("Model provider
-    `excel-bridge` not found").  EXCEL_BRIDGE_AUTO_MIGRATE=0 leaves that to
-    `excel-codex threads migrate`.
+    `excel-bridge` not found").  Conversations an earlier excel-codex moved get
+    OpenAI's models in their file too.  EXCEL_BRIDGE_AUTO_MIGRATE=0 leaves that
+    to `excel-codex threads migrate`.
     """
     from . import codex_threads
 
     record_dir = codex_config.state_dir()
     try:
         count = len(codex_threads.bridge_threads(home, record_dir))
-        if not count:
+        unfinished = len(codex_threads.unfinished_threads(home, record_dir))
+        if not count and not unfinished:
             return
         if os.environ.get("EXCEL_BRIDGE_AUTO_MIGRATE", "").strip() == "0":
-            _print(f"  {count} conversation(s) under the bridge's own provider open only while it is on:\n"
-                   "  `excel-codex threads migrate` moves them into the shared list.")
+            if count:
+                _print(f"  {count} conversation(s) under the bridge's own provider open only while it is on:\n"
+                       "  `excel-codex threads migrate` moves them into the shared list.")
+            if unfinished:
+                _print(f"  {unfinished} conversation(s) moved by an earlier excel-codex still name the bridge's models in\n"
+                       "  their file: `excel-codex threads migrate` finishes them.")
             return
         if codex_threads.codex_running():
-            _print(f"  {count} conversation(s) under the bridge's own provider open only while it is on. They move\n"
-                   "  into the shared list when this starts while Codex (desktop app, IDE, `codex` in a\n"
-                   "  terminal) is fully quit, or with `excel-codex threads migrate` then.")
+            if count:
+                _print(f"  {count} conversation(s) under the bridge's own provider open only while it is on. They move\n"
+                       "  into the shared list when this starts while Codex (desktop app, IDE, `codex` in a\n"
+                       "  terminal) is fully quit, or with `excel-codex threads migrate` then.")
+            if unfinished:
+                _print(f"  {unfinished} conversation(s) moved by an earlier excel-codex still name the bridge's models in\n"
+                       "  their file. They are finished when this starts while Codex is fully quit, or with\n"
+                       "  `excel-codex threads migrate` then.")
             return
         result = codex_threads.migrate(home, record_dir)
     except (codex_threads.Refused, OSError, sqlite3.Error) as exc:
@@ -555,8 +584,22 @@ def _move_bridge_threads(home: Path) -> None:
     if result.threads:
         _print(f"  Moved {len(result.threads)} conversation(s) from the bridge's own provider into the shared list,\n"
                "  so they open with the bridge off too (`excel-codex threads undo` puts them back).")
+    if result.finished:
+        _print(f"  Finished {len(result.finished)} conversation(s) moved by an earlier excel-codex: with the bridge\n"
+               "  off they carry on with OpenAI's models now.")
+    if _had_1m(result):
+        _print(_1M_MOVED)
     if result.left:
         _print(f"  {len(result.left)} conversation(s) could not be moved; `excel-codex threads` lists them.")
+
+
+_1M_MOVED = ("  1M conversations among them carry on with the same model's official version; pick\n"
+             "  a 1M model again while the bridge is on.")
+
+
+def _had_1m(result) -> bool:
+    return any((thread.model or "").endswith(excel_upstream.LONG_CONTEXT_SUFFIX)
+               for thread in [*result.threads, *result.finished])
 
 
 def cmd_desktop(args) -> int:
@@ -570,6 +613,7 @@ def cmd_desktop(args) -> int:
         _print(f"Restored {config}." if changed else f"Nothing to undo in {config}.")
         if changed:
             _print(_REOPEN_AFTER_RESTORE)
+            _say_if_codex_runs()
         return 0
 
     _apply_proxy(args)
@@ -587,7 +631,8 @@ def cmd_desktop(args) -> int:
     shared = codex_config.codex_signed_in(desktop_config.codex_home())
     try:
         backup = desktop_config.enable_file(
-            config, port=args.port, catalog=catalog, model=args.model, shared=shared
+            config, port=args.port, catalog=catalog, model=args.model, shared=shared,
+            quiet_features=not args.keep_apps,
         )
     except (desktop_config.ConfigError, OSError, UnicodeError) as exc:
         _print(f"Could not update {config}: {exc}")
@@ -607,7 +652,10 @@ def cmd_desktop(args) -> int:
 
     _print(f"Codex desktop app and IDE extension now use the Excel bridge ({codex_config.codex_model(args.model)}).")
     _print(f"  Updated {config}" + (f"; the original is saved as {backup.name}" if backup else ""))
-    profile = desktop_config.profile_override(config.read_text(encoding="utf-8-sig"))
+    text = config.read_text(encoding="utf-8-sig")
+    if not args.keep_apps:
+        _print(_APPS_OFF if desktop_config.features_quiet(text) else _APPS_LEFT_ON)
+    profile = desktop_config.profile_override(text)
     if profile:
         _print(f"  Note: your active profile '{profile}' sets its own model and may override this.")
     _print("  Fully quit and reopen the Codex desktop app (or reload the IDE window) to pick it up.")
@@ -618,6 +666,7 @@ def cmd_desktop(args) -> int:
         _print("  Keep this window open. `excel-codex desktop --off` puts your config back.")
     else:
         _print("  Keep this window open; closing it or pressing Ctrl+C puts your config back.")
+    _print(_QUIT_WHEN_DONE)
     _print(_pictures_line())
     _print(f"Listening on {codex_config.base_url(args.port)}")
     _watch_for_updates()
@@ -631,33 +680,60 @@ def cmd_desktop(args) -> int:
         if not args.keep_config:
             _print(f"Restored {config}.")
             _print(_REOPEN_AFTER_RESTORE)
+            _say_if_codex_runs()
     del keep
     return 0
+
+
+def _say_if_codex_runs() -> None:
+    from . import codex_threads
+
+    if codex_threads.codex_seen():
+        _print(_STILL_RUNNING)
 
 
 # ─── timezone ─────────────────────────────────────────────────────────────────
 
 def _redacted(url: str | None) -> str:
-    if not url:
-        return "no proxy"
-    scheme, _, rest = url.partition("://")
-    return f"{scheme}://{rest.rpartition('@')[2]}" if rest else url
+    from . import system_timezone
+
+    return system_timezone.redacted(url)
+
+
+# ASCII only: piped on Windows, output takes the ANSI code page.
+_CODEX_NEEDS_CHATGPT = (
+    "  Codex itself reaches chatgpt.com through this proxy too (sign-in, apps, plugins): while it\n"
+    "  cannot, new tasks can hang on \"starting\" and conversations on loading. Pick a steady proxy\n"
+    "  node for chatgpt.com and auth.openai.com.")
 
 
 def _describe_sync(result: dict) -> str:
+    from . import system_timezone
+
     status = result.get("status")
     if status == "error":
-        return f"Error: {result.get('error')}"
+        text = f"Error: {result.get('error')}"
+        return f"{text}\n{_CODEX_NEEDS_CHATGPT}" if result.get("unreachable") else text
     if status == "skipped":
         return f"Skipped: {result.get('reason')}"
     windows = result.get("windows_timezone")
+    exit_windows = result.get("exit_windows_timezone") or windows
     before = result.get("previous_timezone")
     country = result.get("exit_country")
     text = (f"{result.get('route')} -> {result.get('exit_host')} via {_redacted(result.get('proxy'))}: "
             f"exit {result.get('exit_ip')}" + (f" (Cloudflare: {country})" if country else "")
-            + f" is in {result.get('iana_timezone')}" + (f" ({windows})" if windows else ""))
+            + f" is in {result.get('iana_timezone')}" + (f" ({exit_windows})" if exit_windows else ""))
+    if status == "updated" and result.get("reverted"):
+        why = ("Windows \"Set time zone automatically\" is on and changes it back: turn it off in\n"
+               "  Settings > Time & language > Date & time" if result.get("automatic")
+               else "Something changed it back (Windows \"Set time zone automatically\", or another program)")
+        return (f"{text}\n  Windows timezone had gone back to {before}; set {windows} again.\n"
+                f"  {why}, or use --timezone off. Later changes back are put right without a message.")
     if status == "updated":
         return f"{text}\n  Windows timezone changed from {before} to {windows}."
+    if status == "waiting":
+        return (f"{text}\n  Windows stays on {windows}: the proxy's exit moves between places, and another\n"
+                f"  exit's timezone is taken once it holds for {system_timezone.SETTLE_CHECKS} checks in a row.")
     if status == "unchanged":
         return f"{text}\n  Windows timezone is already {before}."
     here = before or _dt.datetime.now().astimezone().strftime("UTC%z")
@@ -724,7 +800,11 @@ def _keep_windows_timezone():
     from . import system_timezone
 
     _print("Windows timezone: kept on Codex's proxy exit while this window is open and put back when it\n"
-           "  closes (--timezone off leaves it alone).")
+           "  closes (--timezone off leaves it alone). Times in this window stay in the timezone it\n"
+           "  started in.")
+    if system_timezone.automatic_timezone():
+        _print("  Windows \"Set time zone automatically\" is on and may change it back; turn it off in\n"
+               "  Settings > Time & language > Date & time.")
     return system_timezone.Keeper(lambda result: _print(f"Windows timezone: {_describe_sync(result)}")).start()
 
 
@@ -753,14 +833,93 @@ def _thread_line(thread) -> str:
     return f"    {title}" + (f"  ({thread.model})" if thread.model else "")
 
 
+def _providers_line(counts: dict[str, int]) -> str:
+    listed = ", ".join(f"`{name}` ({count})" for name, count in counts.items())
+    return f"  Codex files conversations under: {listed or 'nothing yet'} (names are case-sensitive)."
+
+
+def _other_providers(home: Path) -> None:
+    """Point at conversations under providers other than ``openai`` and the bridge's own."""
+    from . import codex_threads
+
+    try:
+        counts = codex_threads.providers(home)
+    except (codex_threads.Refused, OSError, sqlite3.Error):
+        return
+    others = {name: count for name, count in counts.items()
+              if name and name not in (codex_config.OPENAI_PROVIDER_ID, codex_config.PROVIDER_ID)}
+    if others:
+        listed = ", ".join(f"`{name}` ({count})" for name, count in others.items())
+        # ASCII only: piped on Windows, output takes the ANSI code page.
+        _print(f"Also filed under other providers: {listed}. If Codex cannot open those (\"Model provider\n"
+               "`<provider>` not found\"), `excel-codex threads migrate --from <provider>` moves them under `openai`\n"
+               "(Codex quit).")
+
+
+def _threads_from(action: str | None, source: str, home: Path, record_dir: Path) -> int:
+    """``threads [migrate] --from <provider>``: conversations under another provider."""
+    from . import codex_threads
+
+    if source == codex_config.OPENAI_PROVIDER_ID:
+        _print("Conversations under `openai` are in the list Codex's official sign-in and the bridge share already.")
+        return 0
+    try:
+        threads = codex_threads.threads_under(home, source)
+        counts = {} if threads else codex_threads.providers(home)
+        if action == "migrate" and threads:
+            # Not signed in: `migrate` refuses first, saying why.
+            if codex_config.codex_signed_in(home) and codex_threads.codex_running():
+                _print(_QUIT_CODEX)
+                return 1
+            result = codex_threads.migrate(home, record_dir, source=source)
+    except (codex_threads.Refused, OSError, sqlite3.Error) as exc:
+        _print(f"Nothing was changed: {exc}")
+        return 1
+
+    if not threads:
+        _print(f"No conversations are filed under `{source}`" + ("; nothing to move." if action == "migrate" else "."))
+        _print(_providers_line(counts))
+        return 0
+    if action != "migrate":
+        _print(f"{len(threads)} conversation(s) are filed under `{source}`:")
+        for thread in threads[:10]:
+            _print(_thread_line(thread))
+        if len(threads) > 10:
+            _print(f"    ... and {len(threads) - 10} more")
+        _print(f"If Codex cannot open them (\"Model provider `{source}` not found\"), this moves them under `openai`,\n"
+               "the list Codex's official sign-in and the bridge share (quit Codex first):")
+        _print(f"    excel-codex threads migrate --from {source}")
+        return 0
+    if result.threads:
+        _print(f"Moved {len(result.threads)} conversation(s) from `{source}` to `openai`: they carry on with Codex's")
+        _print("  official sign-in, or through the bridge while it is on.")
+        _print(f"  Conversations started with `{source}` from now on are filed under it again.")
+        if _had_1m(result):
+            _print(_1M_MOVED)
+        _print(f"  Codex's conversation index was copied to {result.backup} first.")
+    if result.left:
+        _print(f"Could not move {len(result.left)} conversation(s): their file is missing or not laid out as expected.")
+        for thread in result.left[:10]:
+            _print(_thread_line(thread))
+    if not result.threads:
+        return 1
+    _print(_REOPEN_FOR_LIST)
+    _print("  `excel-codex threads undo` puts them back.")
+    return 0
+
+
 def cmd_threads(args) -> int:
     from . import codex_threads
 
     home = desktop_config.codex_home()
     record_dir = codex_config.state_dir()
+    source = getattr(args, "source", None)
+    if source and source != codex_config.PROVIDER_ID and args.action != "undo":
+        return _threads_from(args.action, source, home, record_dir)
     try:
         threads = [] if args.action == "undo" else codex_threads.bridge_threads(home, record_dir)
-        if args.action == "migrate" and threads:
+        unfinished = [] if args.action == "undo" else codex_threads.unfinished_threads(home, record_dir)
+        if args.action == "migrate" and (threads or unfinished):
             # Not signed in: `migrate` refuses first, saying why.
             if codex_config.codex_signed_in(home) and codex_threads.codex_running():
                 _print(_QUIT_CODEX)
@@ -776,18 +935,24 @@ def cmd_threads(args) -> int:
         return 1
 
     if args.action == "migrate":
-        if not threads:
+        if not threads and not unfinished:
             _print("No conversations are filed under the bridge's own provider; nothing to move.")
             return 0
         if result.threads:
             _print(f"Moved {len(result.threads)} conversation(s) into the list shared with Codex's official sign-in;")
             _print("  they open with the bridge off too.")
+        if result.finished:
+            _print(f"Finished {len(result.finished)} conversation(s) moved by an earlier excel-codex: with the bridge off")
+            _print("  they carry on with OpenAI's models now.")
+        if _had_1m(result):
+            _print(_1M_MOVED)
+        if result.threads or result.finished:
             _print(f"  Codex's conversation index was copied to {result.backup} first.")
         if result.left:
             _print(f"Could not move {len(result.left)} conversation(s): their file is missing or not laid out as expected.")
             for thread in result.left[:10]:
                 _print(_thread_line(thread))
-        if not result.threads:
+        if not result.threads and not result.finished:
             return 1
         _print(_REOPEN_FOR_LIST)
         _print("  `excel-codex threads undo` puts them back.")
@@ -796,17 +961,22 @@ def cmd_threads(args) -> int:
         if not undone.restored and not undone.kept:
             _print("Nothing to undo: `excel-codex threads migrate` has not moved any conversations.")
             return 0
-        _print(f"Put back {undone.restored} conversation(s) under the bridge's own provider.")
+        _print(f"Put back {undone.restored} conversation(s) under the provider they were filed under before.")
         if undone.kept:
             _print(f"  {undone.kept} changed since (continued with another model, or deleted) and were left as they are.")
         _print(_REOPEN_FOR_LIST)
         return 0
 
     shared = codex_config.codex_signed_in(home)
+    if unfinished:
+        _print(f"{len(unfinished)} conversation(s) moved by an earlier excel-codex still name the bridge's models in their\n"
+               "file, so with the bridge off Codex may go back to those and fail. `excel-codex threads migrate`\n"
+               "finishes them (Codex quit), and so do `excel-codex desktop` and `excel-codex` when they start.")
     if not threads:
         _print("No conversations are filed under the bridge's own provider.")
         if shared:
             _print("  Conversations with and without the bridge are all in one list.")
+        _other_providers(home)
         return 0
     _print(f"{len(threads)} conversation(s) are filed under the bridge's own provider "
            "(from excel-codex 0.5.3 and earlier, or while Codex was not signed in):")
@@ -821,6 +991,7 @@ def cmd_threads(args) -> int:
     else:
         _print("Codex is not signed in, so the bridge is still their provider and lists them while it is on.\n"
                "After `codex login`, they move into the list shared with it.")
+    _other_providers(home)
     return 0
 
 
@@ -896,6 +1067,10 @@ def _parser() -> argparse.ArgumentParser:
         "--keep-config", action="store_true", help="leave the config in place when this window closes"
     )
     desktop.add_argument(
+        "--keep-apps", action="store_true",
+        help="leave Codex's apps and plugin suggestions on (they wait on chatgpt.com)",
+    )
+    desktop.add_argument(
         "--skip-session-check", action="store_true", help="start even if no session is found yet"
     )
 
@@ -925,12 +1100,16 @@ def _parser() -> argparse.ArgumentParser:
     threads = sub.add_parser(
         "threads", help="show conversations filed under the bridge's own provider, which need the bridge on"
     )
+    from_help = ("another provider whose conversations Codex cannot open (\"Model provider `<name>` not found\"), "
+                 "such as `OpenAI`, as a relay's config template may name it; case-sensitive")
+    threads.add_argument("--from", dest="source", metavar="PROVIDER", help=from_help)
     moves = threads.add_subparsers(dest="action")
-    moves.add_parser(
+    migrate = moves.add_parser(
         "migrate",
         help="move them into the list shared with Codex's official sign-in now; with Codex quit "
         "(`desktop` does it by itself)",
     )
+    migrate.add_argument("--from", dest="source", metavar="PROVIDER", default=argparse.SUPPRESS, help=from_help)
     moves.add_parser("undo", help="put back what `threads migrate` moved")
     sub.add_parser("sub2api", add_help=False, help="opt-in SUB2API sidecar and SSH session sync")
     return parser

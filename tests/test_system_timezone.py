@@ -133,7 +133,7 @@ class LookupTests(unittest.TestCase):
 
 class SyncTests(Folder):
     def run_sync(self, *, probe=False, routes=None, ips=None, current="China Standard Time", lookup_fails=False,
-                 stopped=None):
+                 stopped=None, settle=None, zone="Taipei Standard Time", automatic=None):
         self.lookups = 0
 
         def lookup(client, exit):
@@ -147,14 +147,17 @@ class SyncTests(Folder):
              mock.patch.object(system_timezone, "find_exit",
                                side_effect=[ip if isinstance(ip, Exit) else Exit(ip) for ip in ips or ["1.1.1.1"] * 2]), \
              mock.patch.object(system_timezone, "lookup", side_effect=lookup), \
-             mock.patch.object(system_timezone, "windows_zone_for", return_value="Taipei Standard Time"), \
+             mock.patch.object(system_timezone, "_cached", return_value=None) if settle else mock.MagicMock(), \
+             mock.patch.object(system_timezone, "windows_zone_for", return_value=zone), \
              mock.patch.object(system_timezone, "current_zone", return_value=current), \
+             mock.patch.object(system_timezone, "automatic_timezone", return_value=automatic), \
              mock.patch.object(system_timezone, "set_zone") as setter:
             try:
-                result = system_timezone.sync(probe=probe, stopped=stopped)
+                self.result = system_timezone.sync(probe=probe, stopped=stopped, settle=settle)
             finally:
                 self.set_calls = setter.call_count
-        return result["status"]
+                self.set_to = [call.args[0] for call in setter.call_args_list]
+        return self.result["status"]
 
     def test_the_exit_timezone_is_set(self):
         self.assertEqual(self.run_sync(), "updated")
@@ -224,6 +227,48 @@ class SyncTests(Folder):
         self.assertEqual(self.lookups, 1)
 
 
+class SettleTests(SyncTests):
+    """``desktop``'s keeper: exits that alternate between countries, and Windows changing it back."""
+
+    def test_an_exit_that_moves_back_and_forth_does_not_flip_windows(self):
+        settle = system_timezone.Settle(checks=3)
+        self.assertEqual(self.run_sync(settle=settle), "updated")
+        self.assertEqual(settle.kept, "Taipei Standard Time")
+        # A node in Japan, then Taiwan again, then Japan: Windows stays on Taipei.
+        for zone in ("Tokyo Standard Time", "Taipei Standard Time", "Tokyo Standard Time", "Tokyo Standard Time"):
+            status = self.run_sync(settle=settle, zone=zone, current="Taipei Standard Time")
+            self.assertEqual(self.set_calls, 0)
+        self.assertEqual(status, "waiting")
+        self.assertEqual(self.result["windows_timezone"], "Taipei Standard Time")
+        self.assertEqual(self.result["exit_windows_timezone"], "Tokyo Standard Time")
+        # Three checks in a row in Japan: now it moves.
+        self.assertEqual(self.run_sync(settle=settle, zone="Tokyo Standard Time", current="Taipei Standard Time"),
+                         "updated")
+        self.assertEqual(self.set_to, ["Tokyo Standard Time"])
+        self.assertNotIn("reverted", self.result)
+        self.assertEqual(settle.kept, "Tokyo Standard Time")
+
+    def test_windows_changing_it_back_is_put_right_and_said(self):
+        settle = system_timezone.Settle()
+        self.run_sync(settle=settle)
+        # No second look at the exit: the kept timezone was settled already.
+        status = self.run_sync(settle=settle, ips=["1.1.1.1"], current="China Standard Time", automatic=True)
+        self.assertEqual(status, "updated")
+        self.assertEqual(self.set_to, ["Taipei Standard Time"])
+        self.assertEqual((self.result["reverted"], self.result["automatic"]), (True, True))
+        text = cli._describe_sync(self.result)
+        self.assertIn("had gone back to China Standard Time; set Taipei Standard Time again", text)
+        self.assertIn('"Set time zone automatically" is on', text)
+        text.encode("ascii")
+
+    def test_windows_changing_it_back_while_the_exit_moves_puts_back_the_kept_one(self):
+        settle = system_timezone.Settle()
+        self.run_sync(settle=settle)
+        self.run_sync(settle=settle, zone="Tokyo Standard Time", ips=["1.1.1.1"], current="China Standard Time")
+        self.assertEqual(self.set_to, ["Taipei Standard Time"])
+        self.assertTrue(self.result["reverted"])
+
+
 class RestoreTests(Folder):
     def test_the_timezone_from_before_the_first_change_is_kept(self):
         with mock.patch.object(system_timezone.sys, "platform", "win32"), \
@@ -252,11 +297,8 @@ class RestoreTests(Folder):
 
 
 class KeeperTests(Folder):
-    def test_it_reports_the_first_result_changes_and_new_errors(self):
-        results = [
-            {"status": "unchanged"}, {"status": "unchanged"}, Refused("offline"), Refused("offline"),
-            Refused("tzutil failed"), {"status": "unchanged"}, {"status": "updated"}, {"status": "unchanged"},
-        ]
+    def keep(self, *results) -> list[dict]:
+        results = list(results)
         reported = []
         keeper = system_timezone.Keeper(reported.append, interval=0)
 
@@ -270,10 +312,51 @@ class KeeperTests(Folder):
 
         with mock.patch.object(system_timezone, "sync", side_effect=sync):
             keeper.start()._thread.join(5)
+        return reported
+
+    def test_it_reports_the_first_result_changes_and_lasting_errors(self):
+        reported = self.keep(
+            {"status": "unchanged"}, {"status": "unchanged"}, Refused("offline"), Refused("offline"),
+            Refused("offline"), Refused("tzutil failed"), Refused("tzutil failed"), {"status": "unchanged"},
+            {"status": "updated"}, {"status": "unchanged"},
+        )
         self.assertEqual([(r["status"], r.get("error")) for r in reported], [
             ("unchanged", None), ("error", "offline"), ("error", "tzutil failed"), ("unchanged", None),
             ("updated", None)])
         self.assertEqual(system_timezone.last_result()["error"], "tzutil failed")
+
+    def test_an_error_in_one_check_only_is_not_reported(self):
+        reported = self.keep({"status": "unchanged"}, Refused("could not reach chatgpt.com (EOF)"),
+                             {"status": "unchanged"}, {"status": "unchanged"})
+        self.assertEqual([r["status"] for r in reported], ["unchanged"])
+
+    def test_errors_that_differ_only_in_their_details_are_one(self):
+        reported = self.keep(Refused("could not reach chatgpt.com (EOF)"), Refused("could not reach chatgpt.com (timeout)"),
+                             Refused("could not reach chatgpt.com (EOF)"), {"status": "unchanged"})
+        self.assertEqual([r["status"] for r in reported], ["error", "unchanged"])
+
+    def test_changes_back_and_waiting_are_said_once(self):
+        reported = self.keep({"status": "updated"}, {"status": "updated", "reverted": True},
+                             {"status": "updated", "reverted": True}, {"status": "waiting"}, {"status": "unchanged"},
+                             {"status": "waiting"})
+        self.assertEqual([(r["status"], r.get("reverted")) for r in reported],
+                         [("updated", None), ("updated", True), ("waiting", None)])
+
+    def test_an_unreachable_exit_says_codex_needs_it_too(self):
+        def fail(request):
+            raise httpx.ConnectError("[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol")
+
+        with httpx.Client(transport=httpx.MockTransport(fail)) as client, self.assertRaises(Refused) as caught:
+            system_timezone.find_exit(client, "chatgpt.com", "http://user:secret@127.0.0.1:7890")
+        self.assertIsInstance(caught.exception, system_timezone.Unreachable)
+        message = str(caught.exception)
+        self.assertIn("could not reach chatgpt.com through the proxy http://127.0.0.1:7890", message)
+        self.assertIn("closed during the TLS handshake", message)
+        self.assertNotIn("secret", message)
+        reported = self.keep(caught.exception, {"status": "unchanged"})
+        text = cli._describe_sync(reported[0])
+        self.assertIn("Codex itself reaches chatgpt.com through this proxy too", text)
+        text.encode("ascii")
 
     def test_put_back_stops_then_restores(self):
         system_timezone._remember("China Standard Time")

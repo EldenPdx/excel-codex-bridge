@@ -5,11 +5,13 @@ import gzip
 import json
 import time
 import unittest
+import zlib
+from unittest import mock
 
 import httpx
 import zstandard
 
-from excel_codex_bridge import excel_upstream
+from excel_codex_bridge import excel_upstream, server
 from excel_codex_bridge.server import create_app
 from excel_codex_bridge.session import SessionReader
 
@@ -311,6 +313,56 @@ class ResponsesRouteTests(unittest.TestCase):
                 )
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(harness.upstream_json()["model"], "gpt-5.6-sol")
+
+    def test_bodies_past_64_mb_go_through(self):
+        # A long conversation with its pictures passes 64 MB before Codex compacts it.
+        payload = json.dumps({"model": "gpt-5.6-sol-excel", "input": "x" * (70 * 1024 * 1024),
+                              "stream": True}).encode()
+        for encoding, data in (
+            ("zstd", zstandard.ZstdCompressor().compress(payload)),
+            ("gzip", gzip.compress(payload, compresslevel=1)),
+            ("identity", payload),
+        ):
+            with self.subTest(encoding=encoding):
+                harness = BridgeHarness(ok_stream)
+                response = harness.request(
+                    "POST", "/v1/responses", content=data,
+                    headers={"content-encoding": encoding, "content-type": "application/json"},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertGreater(len(harness.upstream_requests[0].content), 70 * 1024 * 1024)
+
+    def test_bodies_past_the_limit_are_a_413_decompressed_or_not(self):
+        payload = json.dumps({"model": "gpt-5.6-sol-excel", "input": "x" * 4096, "stream": True}).encode()
+        for encoding, data in (
+            ("zstd", zstandard.ZstdCompressor().compress(payload)),
+            ("gzip", gzip.compress(payload)),
+            ("deflate", zlib.compress(payload)),
+            ("identity", payload),
+        ):
+            with self.subTest(encoding=encoding), mock.patch.object(server, "MAX_BODY_BYTES", 1024):
+                if encoding != "identity":
+                    self.assertLess(len(data), 1024)
+                harness = BridgeHarness(ok_stream)
+                response = harness.request("POST", "/v1/responses", content=data,
+                                           headers={"content-encoding": encoding})
+                self.assertEqual(response.status_code, 413)
+                self.assertEqual(response.json()["error"]["message"],
+                                 "Request body is too large (over 1024 bytes decompressed)")
+                self.assertEqual(harness.upstream_requests, [])
+
+    def test_a_cut_off_compressed_body_is_a_400(self):
+        payload = json.dumps({"model": "gpt-5.6-sol-excel", "input": "ping" * 1000}).encode()
+        for encoding, data in (
+            ("zstd", zstandard.ZstdCompressor().compress(payload)),
+            ("gzip", gzip.compress(payload)),
+        ):
+            with self.subTest(encoding=encoding):
+                harness = BridgeHarness(ok_stream)
+                response = harness.request("POST", "/v1/responses", content=data[: len(data) // 2],
+                                           headers={"content-encoding": encoding})
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("Invalid request body", response.json()["error"]["message"])
 
     def test_invalid_json_is_a_400(self):
         harness = BridgeHarness(ok_stream)

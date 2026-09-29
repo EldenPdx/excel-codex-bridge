@@ -144,6 +144,7 @@ excel-codex --login codex                      use Codex's own sign-in only (nev
 excel-codex login                             open Excel's ChatGPT pane to sign in or refresh
 excel-codex desktop                           route the Codex desktop app / IDE extension here
 excel-codex threads migrate                   move the bridge's own conversations into the shared list (done at start too)
+excel-codex threads migrate --from OpenAI     move a relay provider's (OpenAI) conversations under openai
 ```
 
 Launcher options: `--login <auto|codex|excel>`, `--model`, `--proxy`, `--timezone <auto|off>`,
@@ -154,7 +155,7 @@ Launcher options: `--login <auto|codex|excel>`, `--model`, `--proxy`, `--timezon
 
 Every model comes in two versions: the same upstream model with a different context length.
 
-| 272k version | 1M version | Upstream model |
+| Standard version (500k) | 1M version | Upstream model |
 | --- | --- | --- |
 | `gpt-5.6-sol` (default) | `gpt-5.6-sol-1m-excel` | `gpt-5.6-sol` |
 | `gpt-5.6-terra` | `gpt-5.6-terra-1m-excel` | `gpt-5.6-terra` |
@@ -163,18 +164,24 @@ Every model comes in two versions: the same upstream model with a different cont
 | `gpt-6-luna` | `gpt-6-luna-1m-excel` | `gpt-6-luna` |
 | `gpt-6-astra` | `gpt-6-astra-1m-excel` | `gpt-6-astra` |
 
-- From 0.5.4 the 272k versions use OpenAI's own names in Codex (the model list shows them as, for
+- From 0.5.4 the standard versions use OpenAI's own names in Codex (the model list shows them as, for
   example, "6-Sol Excel"), so a conversation carries on whether the bridge is on or off, see
   [Session sharing](#session-sharing). The earlier names such as `gpt-6-sol-excel` still work; they
   are just no longer in the model list. OpenAI has no 1M versions, so their names stay.
 
-- **272k version**: 272k context; Codex compacts automatically at 180k.
+- **Standard version**: 500k context; Codex compacts automatically at 450k (272k and 180k up to
+  0.5.8).
 - **1M version**: 918k context; Codex compacts automatically at about 826k. 918k is the limit measured
   on the real backend: it accepts up to about 918k input tokens per request and answers
   `context_length_exceeded` beyond that. gpt-5.6-sol, gpt-6-sol, gpt-6-luna and gpt-6-astra measured
   the same; gpt-5.6-terra and gpt-5.6-luna use the same limit.
-- Each turn of a long conversation sends more context and uses more of your plan, so pick the 272k
+- Each turn of a long conversation sends more context and uses more of your plan, so pick the standard
   version when you don't need the length.
+- The standard versions share OpenAI's names, and the official sign-in goes by OpenAI's own context
+  windows. With the bridge on a conversation grows to 450k before it is compacted; carried on with
+  the bridge off, Codex first compacts what goes beyond OpenAI's window, and whether the official
+  backend accepts a compaction that long has not been tested. Before closing the bridge on a long
+  conversation, compact it once with the bridge on (`/compact`).
 
 Reasoning effort `low` / `medium` / `high` / `xhigh`, default `medium`.
 
@@ -237,6 +244,18 @@ Details:
 - To keep it on: `excel-codex desktop --keep-config`, and later `excel-codex desktop --off`
   (also the fix if the window was killed before it could restore the config).
 - Other model: `excel-codex desktop --model gpt-5.6-terra`; other port: `--port`.
+- While the window is open, Codex's apps and plugin suggestions (`features.apps`,
+  `features.remote_plugin`) are off; they come back with the config. Signed in with ChatGPT, Codex
+  waits on chatgpt.com for both when a conversation opens (apps, up to 30 seconds) and on every turn
+  (plugin suggestions, 5 seconds), so with a proxy node that is down the desktop app sits on
+  "loading". `--keep-apps` leaves them on.
+
+**The desktop app keeps loading a conversation, or a new task stays on "starting"**: most likely
+Codex itself cannot reach chatgpt.com (its sign-in, apps and plugins go there), and those requests
+do not go through the bridge. From 0.5.11 the apps and plugin suggestions are off while the bridge
+window is open, which leaves at most about 5 seconds on a conversation's first turn (Codex reading
+the account's settings). If it is still slow, use a steady proxy node for chatgpt.com and
+auth.openai.com; `could not reach chatgpt.com through the proxy` in the bridge window means this.
 
 **Error `The '…' model is not supported when using Codex with a ChatGPT account`** (after signing
 out of Codex it becomes `401 Unauthorized: Missing bearer or basic authentication` for
@@ -257,6 +276,15 @@ Fix: open `excel-codex-desktop.cmd`, fully quit the desktop app (File → Quit, 
 tray; after closing the window it may still run in the background) and reopen it. Each message then
 shows a line like `"POST /v1/responses HTTP/1.1" 200` in the bridge window (0.4.2 and later); if
 nothing shows up, the request still bypasses the bridge.
+
+**After the bridge is closed, a conversation fails with `stream disconnected before completion:
+… (os error 10061)` (connection refused) and "Reconnecting x/5"**: the bridge window was closed
+but Codex kept running. A conversation opened while the bridge was on keeps the bridge's local
+address (`127.0.0.1:<port>`), where nothing listens any more. Closing the desktop app's window is not
+enough: on Windows it keeps running in the tray. Quit it from its tray icon (`Cmd+Q` on macOS),
+reload IDE windows that use Codex, then open Codex again and it uses the official sign-in. The bridge
+window says so when it closes; closed with Ctrl+C while it still sees a Codex process, it adds
+`Codex is still running right now`.
 
 Fully manual alternative: run `excel-codex serve` and add the output of `excel-codex print-config`
 to `config.toml`; remove those lines to go back.
@@ -305,23 +333,60 @@ cannot open them: "Model provider `excel-bridge` not found". When Codex is signe
   conversation files. So **start the bridge first, then the desktop app**; or quit Codex and run
   `excel-codex threads migrate`.
 - Moved conversations are filed under `openai`, with OpenAI's model names (`gpt-6-sol-excel` →
-  `gpt-6-sol`; the 1M versions stay as they are). They open and carry on with the bridge off, and
-  renaming or archiving them no longer moves them back.
+  `gpt-6-sol`). OpenAI has no 1M versions, so a 1M conversation carries on with the same model's
+  official version (`gpt-6-sol-1m-excel` → `gpt-6-sol`); pick a 1M model again in the model
+  menu to use one with the bridge on. They open and carry on with the bridge off (through the
+  official sign-in or a relay), and renaming or archiving them no longer moves them back.
 
 What changes:
 
 - Codex's conversation index (the threads table in `~/.codex/state_<n>.sqlite`). It is copied first,
   to `state_<n>.sqlite.before-excel-codex-<time>` in the same folder.
-- The provider on the first line of each of those conversation files (under `~/.codex/sessions`).
-  Codex rebuilds the index from that line, so a change to the index alone is put back to
-  `excel-bridge`; that is all `threads migrate` did in 0.5.4 and 0.5.5, and conversations it moved
-  are finished now. Only that one field changes: the rest of the file, the conversation itself and
-  the file's modification time stay as they are.
+- Where each of those conversation files (under `~/.codex/sessions`) says what Codex rebuilds the
+  index from: the provider on the first line, and the model and provider on the later
+  `turn_context` and `thread_settings_applied` lines. A change to the index alone is put back to
+  `excel-bridge` or the bridge's model names when Codex rebuilds it. Each value is changed in place:
+  the rest of the file, the conversation itself and the file's modification time stay as they are.
+- Conversations moved by earlier versions are finished: 0.5.4 and 0.5.5 changed the index only;
+  0.5.6 to 0.5.8 left the model names on the later lines, and the 1M ones, so with the bridge off
+  Codex could go back to the bridge's model names and fail, through the official sign-in or a relay.
+  The next start of the bridge while Codex is fully quit finishes them; the window says
+  `Finished N conversation(s) moved by an earlier excel-codex`.
 - `excel-codex threads` lists the conversations still under `excel-bridge`. `excel-codex threads undo`
   (also with Codex quit) undoes the move: conversations it changed, and Codex has not changed since,
   go back under `excel-bridge`.
 - To keep it from moving them at start, set `EXCEL_BRIDGE_AUTO_MIGRATE=0` and run
   `excel-codex threads migrate` when you want.
+
+### A relay's conversations
+
+"Model provider `OpenAI` not found" (or another name) usually means a conversation started through
+a relay. Some relays hand out a Codex config (SUB2API does, for an API key) with a provider of their
+own named `OpenAI`: `model_provider = "OpenAI"` plus an `[model_providers.OpenAI]` table.
+That is not Codex's own `openai`: **provider names are case-sensitive**. Conversations started
+through it are filed under `OpenAI`, and once `config.toml` no longer has that table (back to the
+official sign-in, a config rewritten by an account-switching tool, or the relay's config removed),
+Codex cannot open them. The bridge has nothing to do with it, but from 0.5.10 it can move them
+under `openai`:
+
+```bash
+excel-codex threads                          # ends with how many conversations other providers have
+excel-codex threads --from OpenAI            # lists the conversations under OpenAI
+excel-codex threads migrate --from OpenAI    # moves them under openai (quit Codex fully first)
+```
+
+- It changes them the way the section above does: Codex's conversation index is copied first, and
+  only the provider (and the bridge's model names) are changed in place in the conversation files.
+  `excel-codex threads undo` puts them back under `OpenAI`.
+- The name must be exactly the one Codex keeps; when `--from` finds nothing, it lists the provider
+  names Codex has.
+- Once moved, they carry on through the official sign-in, or through the bridge while it is on.
+  Conversations started through `OpenAI` from then on are filed under it again.
+- To keep a relay's conversations in the one list for good, set the relay up as Codex's own provider:
+  remove `model_provider = "OpenAI"` and the `[model_providers.OpenAI]` table, add
+  `openai_base_url = "https://your-relay/v1"`, and sign Codex in with the relay's key
+  (`codex login --with-api-key` reads it from standard input). **Do not pair a relay's
+  `openai_base_url` with a ChatGPT sign-in**: Codex would send the ChatGPT sign-in to the relay.
 
 ## Exit timezone
 
@@ -353,6 +418,17 @@ Notes:
 - Only the exit IP is sent to these lookup services, through the same proxy; nothing else is sent.
   The answer for an IP is cached.
 - `--timezone off` (or `EXCEL_BRIDGE_TIMEZONE=off`) turns both off.
+- A proxy that takes turns between nodes (say Taiwan and Japan) does not make the system timezone
+  flip back and forth: another exit's timezone is taken once it holds for 3 checks in a row (one a
+  minute, so about 2 minutes), and the window says once that it is waiting. The bridge also keeps
+  each exit IP's timezone for 12 hours, so switching back needs no new lookup.
+- With Windows "Set time zone automatically" on, Windows changes the timezone back to the local
+  one. The window sets it again and, the first time, says why; you can turn that setting off in
+  Settings > Time & language > Date & time.
+- Apart from the first check at start, a single failed check is not reported in the window: the
+  same error is reported when it comes twice in a row, and the recovery after it. A proxy node that
+  cannot be reached shows as `could not reach … through the proxy` (without the proxy's password).
+- Times in the window's log stay in the timezone the window started in.
 - `excel-codex timezone` shows the exit timezone and the current state;
   `excel-codex timezone sync --probe` looks up without changing anything.
 - A country you did not expect, such as `(Cloudflare: TW)`, means your proxy sends OpenAI's traffic
@@ -400,6 +476,45 @@ The add-in's token lasts about 10 days. The bridge checks it before every reques
 the local cache when it has expired or is about to; on Windows it also
 [refreshes it through Excel](#automatic-sign-in-windows) when less than 24 hours are left. **No
 restart** of the bridge or Codex is needed. `excel-codex status` shows the time left.
+
+## Rate limits
+
+Everyone using the add-in shares one tokens-per-minute budget per model. When it is used up, the
+backend fails the request at once with `rate limit exceeded`, saying to try again in a few
+milliseconds; Codex does, five times within a second, and the turn fails ("Reconnecting 5/5").
+
+So the bridge waits first: when a request is rate limited before any of the answer has come, it
+sends the same request again after 1, 2, 4, 8 and 15 seconds (then every 15 seconds), for up to 5
+minutes. Meanwhile Codex just shows it is working (the bridge tells it every 10 seconds that the
+response is still going, so its five-minute idle timeout does not fire), and the bridge window
+(`bridge.log` for the CLI) says `the Excel backend is rate limited … trying again in N s`. If it is
+still rate limited after 5 minutes, Codex shows `The Excel backend is still rate limited after 5
+minutes …` and the turn ends; send the message again later. Codex does not retry that itself, or
+each of its retries would wait another 5 minutes. You can interrupt in Codex at any time.
+
+- A request that fails after its answer has begun is not sent again, so nothing is repeated; other
+  errors reach Codex as they came.
+- `EXCEL_BRIDGE_RATE_LIMIT_WAIT=<seconds>` sets how long to wait: `300` by default, at most `1800`;
+  `0` for no wait, the error then reaching Codex as it came (it retries five times, quickly, its own
+  way).
+
+## Network drops
+
+When a proxy node goes down or the network drops out, requests cannot reach `bps.openai.com`, and
+Codex retries five times within seconds before showing `502 Bad Gateway: Could not connect to
+bps.openai.com (ConnectError)`. From 0.5.11 the bridge keeps trying itself:
+
+- A request the backend has not answered yet (no connection, TLS handshake cut off, and so on) is
+  sent again after 0.5, 1, 2, 4, 8 and 15 seconds (then every 15 seconds), for up to 2 minutes.
+  Codex sees nothing for the first 5 seconds; after that it just shows it is working, the bridge
+  telling it every 10 seconds that the response is still going. Once connected it answers as usual.
+- If there is still no connection after 2 minutes, Codex shows `Still no connection after 2
+  minutes …` and the turn ends; send the message again once the network is back. Codex does not
+  retry that itself. You can interrupt in Codex at any time.
+- A request that fails after the backend has answered (a read timeout, say) is not sent again, so
+  nothing is repeated.
+- `EXCEL_BRIDGE_CONNECT_WAIT=<seconds>` sets how long to keep trying: `120` by default, at most
+  `1800`; `0` for no second try, the error then reaching Codex as it came.
 
 ## Pictures
 
@@ -486,6 +601,9 @@ running from source, `git pull` is enough.
 ## Limitations
 
 - Responses API only; there is no `/responses/compact` endpoint.
+- A request can be up to 1 GiB once decompressed. Up to 0.5.10 the limit was 64 MiB, which long
+  conversations (with pictures above all) passed before the 450k auto-compaction, failing with
+  `Invalid request body: request body is too large`.
 - The Excel backend adds a fixed prefix of about 22k tokens to every request (mostly served from
   cache); usage counts against your ChatGPT plan, and more sessions at once use it up faster.
 - It relies on a private backend of the Excel add-in and may break whenever OpenAI changes it.
@@ -514,6 +632,8 @@ running from source, `git pull` is enough.
 | `EXCEL_BRIDGE_AUTO_MIGRATE` | `0` keeps the bridge from moving its own conversations into the shared list at start, see [The bridge's own conversations](#the-bridges-own-conversations) |
 | `EXCEL_BRIDGE_TIMEZONE` | `auto` (default) / `off`, same as `--timezone`, see [Exit timezone](#exit-timezone) |
 | `EXCEL_BRIDGE_IMAGE_MODEL` | The model Codex's image tool asks the backend for, default `gpt-image-2` (same as `--image-model`), see [Image generation](#image-generation) |
+| `EXCEL_BRIDGE_RATE_LIMIT_WAIT` | Seconds to wait out a rate limit before Codex gets the error: `300` (5 minutes) by default, `0` for none, at most `1800`; see [Rate limits](#rate-limits) |
+| `EXCEL_BRIDGE_CONNECT_WAIT` | Seconds to keep trying when the backend cannot be reached: `120` (2 minutes) by default, `0` for no second try, at most `1800`; see [Network drops](#network-drops) |
 | `CODEX_HOME` | Codex config folder whose `config.toml` `desktop` edits. Default `~/.codex` |
 | `GHCP_EXCEL_WEBVIEW2_DATA_DIR` | Windows WebView2 data root (same as `--webview-dir`) |
 | `GHCP_EXCEL_WEBKIT_WEBSITE_DATA_DIR` | macOS WebKit data folder |

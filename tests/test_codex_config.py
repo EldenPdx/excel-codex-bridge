@@ -48,7 +48,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(len(windows), 12)
         for base in ("5.6-sol", "5.6-terra", "5.6-luna", "6-sol", "6-luna", "6-astra"):
             with self.subTest(base=base):
-                self.assertEqual(windows[f"gpt-{base}"], 272_000)
+                self.assertEqual(windows[f"gpt-{base}"], 500_000)
                 self.assertEqual(windows[f"gpt-{base}-1m-excel"], 918_000)
         self.assertEqual(
             {m["slug"]: m["display_name"] for m in models if m["slug"].startswith("gpt-6-sol")},
@@ -76,7 +76,8 @@ class CatalogTests(unittest.TestCase):
 
     def test_long_context_aliases_compact_near_their_window(self):
         models = {m["slug"]: m for m in codex_config.catalog_payload()["models"]}
-        self.assertEqual(models["gpt-6-sol"]["auto_compact_token_limit"], 180_000)
+        self.assertEqual(models["gpt-6-sol"]["auto_compact_token_limit"], 450_000)
+        self.assertEqual(models["gpt-6-sol"]["max_context_window"], 500_000)
         self.assertEqual(models["gpt-6-sol-1m-excel"]["auto_compact_token_limit"], 826_000)
         self.assertEqual(models["gpt-6-sol-1m-excel"]["max_context_window"], 918_000)
         self.assertIn("918,000 token context", models["gpt-6-sol-1m-excel"]["description"])

@@ -132,7 +132,7 @@ docker exec excel-sub2api excel-sub2api session-status
 转发模式下，模型和 Responses 接口从目标 SUB2API 分组取得结果；`GET /admin/session` 只报告转发模式已配置，`POST/DELETE` 返回 409，不接收会话。
 
 不提供 Chat Completions、Anthropic Messages、`/responses/compact`、WebSocket、管理面板。
-请求与解压后体积均限 64 MiB，管理请求限 64 KiB。上游 401/403/429、`Retry-After`
+请求与解压后体积均限 256 MiB，管理请求限 64 KiB。上游 401/403/429、`Retry-After`
 沿用桥接错误语义；token 过期后重新登录并同步即可。不要启动多个 Uvicorn worker
 共享同一端口，因为不同进程的内存会话不会同步。
 
