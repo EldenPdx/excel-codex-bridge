@@ -190,6 +190,7 @@ TLS 证书校验始终开启。Codex 到桥接走 `127.0.0.1`，启动器会自�
 
 1. 双击免安装包里的 **`excel-codex-desktop.cmd`**（或运行 `excel-codex desktop`），
    它会检查会话（需要时自动登录）、把 `config.toml` 指向桥接，并在 `127.0.0.1:8765` 上运行桥接。
+   打开前会先查一次新版本，有就自动更新后再打开，见[自动更新](#自动更新windows-免安装版)。
 2. **完全退出再打开 Codex 桌面版**（IDE 插件则重新加载窗口），模型列表里就是桥接的模型（显示名带 Excel）。
    Codex 登录过的话，以前的对话也在列表里，可以直接接着聊，见[会话互通](#会话互通)。
 3. 用的时候保持这个窗口开着（可以最小化）。**关掉窗口或按 Ctrl+C，`config.toml` 按原样恢复。**
@@ -235,8 +236,25 @@ auth.openai.com 换一个稳定的代理节点；桥接窗口里出现 `could no
 加载窗口，再打开 Codex 就走官方链路了。桥接窗口关闭时会提示这一点；按 Ctrl+C 关闭时如果还看得到 Codex
 进程，会多一句 `Codex is still running right now`。
 
+**等了几分钟后报 `stream disconnected before completion: idle timeout waiting for SSE`，并显示“正在重新连接 x/5”**：
+Codex 连续 5 分钟没收到任何数据，就当作断线重发请求，每次重发又要等 5 分钟。0.5.15 及更早版本在三种情况下会
+让它空等：压缩长对话时（压缩请求不带工具，桥接不会告诉 Codex 还在进行）、模型写很长的工具调用时（调用写完
+才转给 Codex）、后端接了请求却迟迟不开始回复时。0.5.16 起这些时候桥接也每 15 秒告诉 Codex 还在进行，升级即可。
+升级后还出现，看看桥接窗口是不是被暂停了：在 Windows 的控制台窗口里点一下会进入选择文字状态（标题前出现
+“选择”），这时桥接一写日志就会停住，按 Esc 或回车恢复。
+
+**升级后模型菜单还是旧的：只有 5.6-Sol、6-Astra、5.6-Terra、5.6-Luna，没有 6-Sol、6-Luna 和 1M 版**：
+这是 0.5.1 及更早版本的模型列表。桌面版只在启动时读取模型列表，常见原因：
+
+- 桌面版从那时起一直没有完全退出过（关掉窗口后它还在托盘里运行）：从托盘图标右键退出，再打开。
+  0.5.15 起桥接窗口启动时如果看到 Codex 在运行，会提示 `Codex is running right now`；
+- 打开的是旧文件夹里的 `excel-codex-desktop.cmd`（比如桌面快捷方式还指向旧版）：0.5.15 起桥接窗口里
+  `now use the Excel bridge 0.5.15` 这一行写着正在运行的版本；
+- 全手动用法（`serve` + `print-config`）：0.5.14 及更早版本的 `serve` 不更新模型列表文件，升级后
+  重新运行一次 `print-config`；0.5.15 起 `serve` 启动时会自己更新。
+
 也可以全手动：`excel-codex serve` 常驻桥接，再把 `excel-codex print-config` 输出的片段加进
-`config.toml`，不用时删掉。
+`config.toml`，不用时删掉。`serve` 每次启动都会把片段指向的模型列表文件更新成当前版本的（0.5.15 起）。
 
 ## 会话互通
 
@@ -417,6 +435,38 @@ Codex 会把本机的时区和日期写进每个对话（`<environment_context>`
 - `EXCEL_BRIDGE_CONNECT_WAIT=<秒>` 改最多等多久：默认 `120`，最多 `1800`；`0` 不重试，
   报错照原样交给 Codex。
 
+## 子代理
+
+Codex 的子代理（多代理 v2 的 `collaboration.spawn_agent` / `send_message` / `followup_task`）可以用。
+0.5.11 及更早会出这两种问题，老会话更常见：
+
+- **子代理报“加密内容无法解码”**：桥接转交的调用没有注明参数是明文，Codex 就把发给子代理的任务标成
+  “加密内容”，Excel 后端解不开。这些消息留在对话历史里，所以老会话反复出错，新会话没用过子代理就没有。
+- **工具调用越来越容易失败**：桥接记不起原始调用时（重启后，或 SUB2API 多人共用、缓存被挤掉时）会重建它，
+  这时丢了 `collaboration.` 前缀，或者把模型没转换成功的 `run_officejs` 调用又包一层。模型照着历史学，
+  就越错越多，而且只收到一句笼统的“格式不对”。
+
+0.5.12 起：
+
+- 桥接转交的每个调用都注明参数是明文，子代理收到的是普通文字。
+- 老会话里被误标成加密的消息，在发给后端前还原成文字，不用新开会话。
+- 重建的调用保留完整的工具名；没转换成功的调用原样回放、不再多包一层，并告诉模型具体错在哪里
+  （比如“`spawn_agent` 不在工具目录里，目录里叫 `collaboration.spawn_agent`”）。
+
+真正由别的后端加密的内容（比如关掉桥接、用官方登录接着聊时留下的）Excel 后端读不了。后端因此报错时，
+桥接把这些内容换成一句说明再发一次，窗口里写 `the Excel backend could not read what another backend encrypted`。
+
+## 不带本工具模型目录的 Codex（中转站配置、Cockpit）
+
+用中转站的 Codex 配置模板、Cockpit Tools 或自己写的 provider 连桥接（包括 SUB2API）时，Codex 没有本工具
+的模型目录，对 gpt-5.6 / gpt-6 用它自带的设置：工具不放在请求的 `tools` 里，而是放进一条 `additional_tools`
+输入（Responses Lite），并且只给模型 code mode 的 `exec`（在里面写 JavaScript 调用 shell 等工具）和 `wait`。
+0.5.13 及更早的桥接读不到这些工具，模型的每次调用都报 `exec is not a tool in the catalog`。
+
+0.5.14 起桥接从这条输入里读出工具和指令，模型通过 `exec` 调用工具，和官方登录时一样。模型直接调用
+`exec_command` 这类嵌在 `exec` 里的工具时，会被告知改用 `exec`；反过来，在官方 code mode 里开始的对话换到
+本工具的模型目录后，模型照着历史去调用 `exec`，也会被告知直接调用目录里的工具。
+
 ## 图片
 
 Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图都能用，不需要任何设置。桥接这样转交：
@@ -473,10 +523,31 @@ Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图�
 - 用 `excel-codex` 启动 Codex 时：Codex 退出后显示。双击打开的窗口会停住，按回车再关。
 
 这个请求只发给 `api.github.com`，除了 User-Agent 里的版本号不带任何信息，代理设置和访问上游时相同。
-查不到就不提示，不影响使用。设置 `EXCEL_BRIDGE_UPDATE_CHECK=0` 可以关掉。
+查不到就不提示，不影响使用。设置 `EXCEL_BRIDGE_UPDATE_CHECK=0` 可以关掉（自动更新也一起关掉）。
 
-更新时先关掉正在运行的桥接窗口和 Codex，再把新版解压到原目录覆盖（或换个目录）。设置和状态不在安装目录里，
+手动更新时先关掉正在运行的桥接窗口和 Codex，再把新版解压到原目录覆盖（或换个目录）。设置和状态不在安装目录里，
 不会丢。从源码运行的 `git pull` 即可。
+
+### 自动更新（Windows 免安装版）
+
+从 0.5.13 起，双击 `excel-codex-desktop.cmd` 会先查一次新版本，有就先更新、再用新版打开：
+
+1. 下载新版的 Windows 压缩包，用 GitHub API 列出的 SHA-256 校验；
+2. 解压到安装目录下的 `.update` 文件夹，先运行一次新版的 `excel-codex.exe`，确认它能启动；
+3. 当前程序退出后，把 `excel-codex.exe`、`_internal` 和 `excel-codex-desktop.cmd` 换成新版，再打开新版。
+
+窗口里会显示下载进度，按 Esc 可以这次先跳过，直接打开当前版本。任何一步不成功（下载失败、校验不对、
+新版起不来、文件被占用），都会照常打开当前版本，失败的更新一小时后再试。同一目录的 excel-codex
+还在别的窗口里运行时不会替换，关掉它再双击即可，已经下载的不用重下。
+
+- 0.5.12 及更早的版本没有这个功能，需要手动更新一次。
+- 只有 `excel-codex-desktop.cmd` 会自动更新。直接双击 `excel-codex.exe`、macOS 版和源码运行仍然只提示。
+  在免安装版里运行 `excel-codex update` 可以提前下载好，下次双击 `excel-codex-desktop.cmd` 时装上。
+- 目录名里的版本号不会跟着变，以启动时的提示或 `excel-codex --version` 为准。
+- 设置 `EXCEL_BRIDGE_AUTO_UPDATE=0` 只提示、不自动更新。
+- GitHub 下载慢时，可以把 `EXCEL_BRIDGE_DOWNLOAD_MIRROR` 设为镜像前缀（形如 `https://<镜像>/`，
+  会拼在 GitHub 下载链接前面）。下载的文件仍按 GitHub API 列出的 SHA-256 校验，镜像改动过就不会装。
+- 发布包没有代码签名：校验能挡住下载损坏和被改动的镜像，挡不住 GitHub 仓库本身被攻破。
 
 ## 限制
 
@@ -505,7 +576,9 @@ Codex 里贴的截图、`codex -i 图片.png` 和模型用 `view_image` 看图�
 | `EXCEL_BRIDGE_PROXY` | 出站代理（同 `--proxy`） |
 | `EXCEL_BRIDGE_HOME` | 状态目录：模型目录 JSON、`bridge.log`、登录用工作簿，以及让重启后仍能原样回放历史工具调用的 `tool-calls.sqlite3`（保留 60 天）。默认 `%LOCALAPPDATA%\excel-codex-bridge` 或 `~/.excel-codex-bridge` |
 | `EXCEL_BRIDGE_AUTO_SIGNIN` | 设为 `0` 时不自动打开 Excel（同 `--no-auto-signin`） |
-| `EXCEL_BRIDGE_UPDATE_CHECK` | 设为 `0` 时不检查更新 |
+| `EXCEL_BRIDGE_UPDATE_CHECK` | 设为 `0` 时不检查更新，也不自动更新 |
+| `EXCEL_BRIDGE_AUTO_UPDATE` | 设为 `0` 时 `excel-codex-desktop.cmd` 只提示新版本、不自动更新，见[自动更新](#自动更新windows-免安装版) |
+| `EXCEL_BRIDGE_DOWNLOAD_MIRROR` | 自动更新下载时拼在 GitHub 下载链接前面的镜像前缀，仍按 GitHub 列出的 SHA-256 校验 |
 | `EXCEL_BRIDGE_AUTO_MIGRATE` | 设为 `0` 时启动不自动迁移桥接自己名下的对话，见[桥接自己名下的对话](#桥接自己名下的对话) |
 | `EXCEL_BRIDGE_TIMEZONE` | `auto`（默认）/ `off`，同 `--timezone`，见[出口时区](#出口时区) |
 | `EXCEL_BRIDGE_IMAGE_MODEL` | 生图工具向后端请求的模型，默认 `gpt-image-2`（同 `--image-model`），见[生图](#生图) |

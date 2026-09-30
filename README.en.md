@@ -226,7 +226,8 @@ the bridge for as long as you need it:
 
 1. Double-click **`excel-codex-desktop.cmd`** from the release zip (or run `excel-codex desktop`).
    It checks the session (signing in if needed), points `config.toml` at the bridge and runs the
-   bridge on `127.0.0.1:8765`.
+   bridge on `127.0.0.1:8765`. First it checks for a newer release and, if there is one, installs
+   it and opens that instead, see [Automatic update](#automatic-update-windows-release-zip).
 2. **Fully quit and reopen the Codex desktop app** (or reload the IDE window); the model list
    shows the bridge's models (their display names say Excel). If Codex is signed in, earlier
    conversations are in the list too and carry on, see [Session sharing](#session-sharing).
@@ -286,8 +287,33 @@ reload IDE windows that use Codex, then open Codex again and it uses the officia
 window says so when it closes; closed with Ctrl+C while it still sees a Codex process, it adds
 `Codex is still running right now`.
 
+**After a few minutes a turn fails with `stream disconnected before completion: idle timeout waiting
+for SSE` and "Reconnecting x/5"**: Codex takes five minutes without any data as a broken connection and
+sends the request again, which then waits five minutes of its own. Up to 0.5.15 the bridge left it waiting
+three ways: while a long conversation was compacted (a compaction declares no tools, and the bridge did
+not tell Codex it was still going), while the model wrote a long tool call (passed on only once whole),
+and while the backend took the request but was slow to start answering. From 0.5.16 the bridge tells
+Codex every 15 seconds that the answer is still going then too; update. If it still happens, check whether
+the bridge window is paused: clicking into a console window on Windows starts selecting text (the title
+starts with "Select"), and the bridge stops at its next log line until Esc or Enter.
+
+**After an update the model menu is the old one: only 5.6-Sol, 6-Astra, 5.6-Terra and 5.6-Luna,
+without 6-Sol, 6-Luna and the 1M versions**. That is the model list of 0.5.1 and earlier. The
+desktop app reads the model list only when it starts. Common causes:
+
+- The desktop app has not been fully quit since then (after closing its window it keeps running in
+  the tray): quit it from its tray icon and open it again. From 0.5.15 the bridge window says
+  `Codex is running right now` when it starts while it sees Codex running.
+- The `excel-codex-desktop.cmd` opened is in an old folder (a desktop shortcut still pointing at an
+  old release, for instance): from 0.5.15 the bridge window's `now use the Excel bridge 0.5.15` line
+  says which release runs.
+- Fully manual use (`serve` plus `print-config`): `serve` in 0.5.14 and earlier does not update the
+  model list file, so run `print-config` once more after updating; from 0.5.15 `serve` updates it
+  when it starts.
+
 Fully manual alternative: run `excel-codex serve` and add the output of `excel-codex print-config`
-to `config.toml`; remove those lines to go back.
+to `config.toml`; remove those lines to go back. Each time `serve` starts it brings the model list
+file those lines point at up to date with its release (0.5.15 and later).
 
 ## Session sharing
 
@@ -516,6 +542,50 @@ bps.openai.com (ConnectError)`. From 0.5.11 the bridge keeps trying itself:
 - `EXCEL_BRIDGE_CONNECT_WAIT=<seconds>` sets how long to keep trying: `120` by default, at most
   `1800`; `0` for no second try, the error then reaching Codex as it came.
 
+## Subagents
+
+Codex's subagents (multi-agent v2's `collaboration.spawn_agent` / `send_message` / `followup_task`)
+work. 0.5.11 and earlier had two problems with them, more often in older conversations:
+
+- **The subagent fails with "encrypted content could not be decoded"**: the calls the bridge passed on
+  did not say their arguments were plain text, so Codex labelled the task it gave the subagent as
+  encrypted content, which the Excel backend cannot decrypt. Those messages stay in the conversation,
+  so an older conversation kept failing, while a new one that had not used a subagent did not.
+- **Tool calls failing more and more often**: when the bridge cannot recall the original call (after a
+  restart, or under SUB2API when many users push it out of the cache) it rebuilds it, and it dropped the
+  `collaboration.` prefix, or wrapped a `run_officejs` call the model got wrong in another one. The model
+  copies its history, so it went wrong more and more, told only that the format was wrong.
+
+From 0.5.12:
+
+- Every call the bridge passes on says its arguments are plain text, so the subagent gets its task as
+  text.
+- Messages an older conversation has labelled encrypted go to the backend as text again; no need for a
+  new conversation.
+- A rebuilt call keeps the tool's full name; a call that could not be converted is replayed as it was,
+  not wrapped again, and the model is told what exactly was wrong (say, "`spawn_agent` is not a tool in
+  the catalog; the catalog calls it `collaboration.spawn_agent`").
+
+What another backend really encrypted (left, say, by carrying a conversation on with the bridge off and
+the official sign-in) the Excel backend cannot read. When the backend fails on it, the bridge replaces
+it with a note and sends the request again; the window says `the Excel backend could not read what
+another backend encrypted`.
+
+## Codex without this tool's model catalog (relay configs, Cockpit)
+
+When Codex reaches the bridge (SUB2API included) through a relay's Codex config template, Cockpit
+Tools or a provider of your own, it has no model catalog of this tool's and uses its own settings for
+gpt-5.6 / gpt-6: the tools are not in the request's `tools` but in an `additional_tools` input item
+(Responses Lite), and the model gets only code mode's `exec` (JavaScript that calls the shell and the
+other tools) and `wait`. 0.5.13 and earlier did not read those tools, so every call the model made
+failed with `exec is not a tool in the catalog`.
+
+From 0.5.14 the bridge reads the tools and instructions from that item, and the model calls tools
+through `exec`, as with the official sign-in. A model that calls a tool nested in `exec` directly (such
+as `exec_command`) is told to go through `exec`; the other way round, when a conversation begun in the
+official code mode carries on with this tool's model catalog and the model calls `exec` as its history
+did, it is told to call the catalog's tools directly.
+
 ## Pictures
 
 Screenshots pasted into Codex, `codex -i picture.png` and the model's `view_image` all work, with
@@ -592,11 +662,41 @@ and, if there is one, shows its version, what changed and the download link:
 
 The request goes only to `api.github.com`, carries nothing but the version in its User-Agent, and
 uses the same proxy settings as the bridge. If GitHub cannot be reached, nothing is shown and nothing
-else changes. Set `EXCEL_BRIDGE_UPDATE_CHECK=0` to turn it off.
+else changes. Set `EXCEL_BRIDGE_UPDATE_CHECK=0` to turn it off (the automatic update goes with it).
 
-To update, close any running bridge window and Codex, then extract the new release over the old folder
-(or into a new one). Settings and state are not kept in the install folder, so nothing is lost. When
-running from source, `git pull` is enough.
+To update by hand, close any running bridge window and Codex, then extract the new release over the old
+folder (or into a new one). Settings and state are not kept in the install folder, so nothing is lost.
+When running from source, `git pull` is enough.
+
+### Automatic update (Windows release zip)
+
+From 0.5.13 on, double-clicking `excel-codex-desktop.cmd` first checks for a newer release and, if
+there is one, updates before it opens:
+
+1. It downloads the new Windows zip and checks it against the SHA-256 that GitHub's API lists for it.
+2. It unpacks it into a `.update` folder inside the install folder and runs the new `excel-codex.exe`
+   once, to make sure it starts.
+3. Once the current program has exited, it swaps in the new `excel-codex.exe`, `_internal` and
+   `excel-codex-desktop.cmd`, then opens the new version.
+
+The window shows the download's progress; Esc skips the update this time and opens the current
+version. If any step fails (the download, the checksum, the new version not starting, a file in use),
+the current version opens as usual, and a failed update is tried again an hour later. While
+excel-codex from the same folder is still running in another window, nothing is swapped: close it and
+double-click again, and what was downloaded is used without downloading it again.
+
+- 0.5.12 and earlier cannot do this yet; update those by hand once.
+- Only `excel-codex-desktop.cmd` updates itself. Double-clicking `excel-codex.exe`, the macOS builds
+  and running from source still just show the notice. In the release zip, `excel-codex update`
+  downloads it ahead of time, to be installed the next time `excel-codex-desktop.cmd` starts.
+- The folder's name keeps the old version number; the startup message and `excel-codex --version`
+  tell the version you have.
+- `EXCEL_BRIDGE_AUTO_UPDATE=0` keeps the notice but installs nothing.
+- If downloads from GitHub are slow, set `EXCEL_BRIDGE_DOWNLOAD_MIRROR` to a mirror's prefix (such
+  as `https://<mirror>/`, put in front of the GitHub download link). The file is still checked
+  against the SHA-256 GitHub's API lists, so a mirror that changed it is not installed.
+- The builds are not code-signed: the checksum catches a broken download or an altered mirror, not a
+  compromise of the GitHub repository itself.
 
 ## Limitations
 
@@ -628,7 +728,9 @@ running from source, `git pull` is enough.
 | `EXCEL_BRIDGE_PROXY` | Outbound proxy (same as `--proxy`) |
 | `EXCEL_BRIDGE_HOME` | State folder for the model catalog JSON, `bridge.log`, the sign-in workbook, and `tool-calls.sqlite3`, which lets earlier tool calls replay exactly after a restart (kept 60 days). Default `%LOCALAPPDATA%\excel-codex-bridge` or `~/.excel-codex-bridge` |
 | `EXCEL_BRIDGE_AUTO_SIGNIN` | `0` keeps the tool from opening Excel (same as `--no-auto-signin`) |
-| `EXCEL_BRIDGE_UPDATE_CHECK` | `0` turns off the update check |
+| `EXCEL_BRIDGE_UPDATE_CHECK` | `0` turns off the update check, and with it the automatic update |
+| `EXCEL_BRIDGE_AUTO_UPDATE` | `0` keeps `excel-codex-desktop.cmd` to the notice, without installing, see [Automatic update](#automatic-update-windows-release-zip) |
+| `EXCEL_BRIDGE_DOWNLOAD_MIRROR` | A mirror prefix put in front of the GitHub download link for the automatic update; still checked against GitHub's SHA-256 |
 | `EXCEL_BRIDGE_AUTO_MIGRATE` | `0` keeps the bridge from moving its own conversations into the shared list at start, see [The bridge's own conversations](#the-bridges-own-conversations) |
 | `EXCEL_BRIDGE_TIMEZONE` | `auto` (default) / `off`, same as `--timezone`, see [Exit timezone](#exit-timezone) |
 | `EXCEL_BRIDGE_IMAGE_MODEL` | The model Codex's image tool asks the backend for, default `gpt-image-2` (same as `--image-model`), see [Image generation](#image-generation) |

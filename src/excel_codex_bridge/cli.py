@@ -21,6 +21,7 @@ from pathlib import Path
 
 from . import __version__, codex_config, desktop_config, excel_signin, excel_upstream, exit_timezone, images, updates
 from . import image_generation
+from . import self_update
 from . import session
 from .session import SessionReader
 
@@ -82,6 +83,13 @@ def _write_catalog(directory: Path | None = None) -> Path:
     return codex_config.write_catalog(directory)
 
 
+def _refresh_catalog() -> None:
+    try:
+        _write_catalog()
+    except OSError as exc:
+        logging.getLogger(__name__).warning("could not update the model list for Codex: %s", exc)
+
+
 def _image_model(value: str) -> str:
     value = value.strip()
     if not image_generation.valid_model(value):
@@ -112,7 +120,7 @@ def _announce_update(release: updates.Release | None, stream=None) -> None:
     if release is None:
         return
     stream = stream or sys.stdout
-    text = updates.notice(release)
+    text = updates.notice(release, installs_itself=self_update.installs_itself())
     try:
         print(text, file=stream, flush=True)
     except UnicodeEncodeError:  # output redirected to a file in a narrow code page
@@ -125,6 +133,34 @@ def _watch_for_updates() -> None:
     check = _update_check()
     if check is not None:
         updates.watch(check, _announce_update)
+
+
+def cmd_update(args) -> int:
+    app = self_update.install_dir()
+    if args.launcher:
+        # excel-codex-desktop.cmd, before it starts the bridge: never in its way.
+        if app is None or not self_update.enabled():
+            return 0
+        try:
+            return self_update.installer(app, codex_config.state_dir()).launcher()
+        except Exception as exc:
+            _print(f"Could not check for updates ({type(exc).__name__}: {exc}); starting the current version.")
+            return 0
+    if app is not None:
+        return self_update.installer(app, codex_config.state_dir()).by_hand()
+    release = updates.fetch_latest()
+    if release is None:
+        _print("Could not read the latest release from GitHub (offline, or behind a proxy?).")
+        return 1
+    if not updates.is_newer(release.version):
+        _print(f"You have the newest release ({__version__}).")
+        return 0
+    _announce_update(release)
+    if _frozen():
+        _print("  Only the Windows package installs updates itself; download this one and replace your folder.")
+    else:
+        _print("  Running from the source code: `git pull` updates it.")
+    return 0
 
 
 # ─── automatic sign-in through Excel ──────────────────────────────────────────
@@ -205,6 +241,8 @@ def cmd_serve(args) -> int:
         _exit_when_stdin_closes()
     reader = _reader(args)
     if not args.log_file:
+        # A config from `print-config` points at this file; keep its model list this release's.
+        _refresh_catalog()
         _, message = _describe_session(reader.refresh(force=True))
         _print(message)
         _print(_pictures_line())
@@ -519,6 +557,11 @@ _REOPEN_AFTER_RESTORE = (
     "  (os error 10061), and the app still offers the bridge's models (1M ones fail without it)."
 )
 _STILL_RUNNING = "  Codex is still running right now: quit it as above before carrying on."
+_RUNNING_AT_START = (
+    "  Codex is running right now: until it is fully quit (Windows: right-click its tray icon > Quit)\n"
+    "  and opened again, it keeps the model list it started with, such as an older bridge's without\n"
+    "  the 1M and 6-Sol models."
+)
 _QUIT_WHEN_DONE = (
     "  When done, fully quit Codex too (Windows: its tray icon > Quit) before using it without the\n"
     "  bridge: conversations opened meanwhile keep going to this window until then."
@@ -650,7 +693,8 @@ def cmd_desktop(args) -> int:
 
     keep = _undo_on_exit(undo)
 
-    _print(f"Codex desktop app and IDE extension now use the Excel bridge ({codex_config.codex_model(args.model)}).")
+    _print(f"Codex desktop app and IDE extension now use the Excel bridge {__version__} "
+           f"({codex_config.codex_model(args.model)}).")
     _print(f"  Updated {config}" + (f"; the original is saved as {backup.name}" if backup else ""))
     text = config.read_text(encoding="utf-8-sig")
     if not args.keep_apps:
@@ -659,6 +703,7 @@ def cmd_desktop(args) -> int:
     if profile:
         _print(f"  Note: your active profile '{profile}' sets its own model and may override this.")
     _print("  Fully quit and reopen the Codex desktop app (or reload the IDE window) to pick it up.")
+    _say_if_codex_runs(_RUNNING_AT_START)
     _print(_SHARED if shared else _SEPARATE)
     if shared:
         _move_bridge_threads(desktop_config.codex_home())
@@ -685,11 +730,11 @@ def cmd_desktop(args) -> int:
     return 0
 
 
-def _say_if_codex_runs() -> None:
+def _say_if_codex_runs(message: str = _STILL_RUNNING) -> None:
     from . import codex_threads
 
     if codex_threads.codex_seen():
-        _print(_STILL_RUNNING)
+        _print(message)
 
 
 # ─── timezone ─────────────────────────────────────────────────────────────────
@@ -1111,6 +1156,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     migrate.add_argument("--from", dest="source", metavar="PROVIDER", default=argparse.SUPPRESS, help=from_help)
     moves.add_parser("undo", help="put back what `threads migrate` moved")
+    update = sub.add_parser(
+        "update",
+        help="download the newest release; the Windows package installs it the next time "
+        "excel-codex-desktop.cmd starts, which checks by itself",
+    )
+    update.add_argument("--launcher", action="store_true", help=argparse.SUPPRESS)
     sub.add_parser("sub2api", add_help=False, help="opt-in SUB2API sidecar and SSH session sync")
     return parser
 
@@ -1149,7 +1200,7 @@ def _main(argv: list[str]) -> int:
     if argv and argv[0] == "sub2api":
         from .sub2api_cli import main as sub2api_main
         return sub2api_main(argv[1:])
-    known = {"codex", "desktop", "serve", "status", "login", "print-config", "timezone", "threads",
+    known = {"codex", "desktop", "serve", "status", "login", "print-config", "timezone", "threads", "update",
              "-h", "--help", "--version"}
     if not argv or argv[0] not in known:
         argv = ["codex", *argv]
@@ -1172,4 +1223,6 @@ def _main(argv: list[str]) -> int:
         return cmd_timezone(args)
     if args.command == "threads":
         return cmd_threads(args)
+    if args.command == "update":
+        return cmd_update(args)
     return cmd_codex(args, codex_args)

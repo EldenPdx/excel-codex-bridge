@@ -1095,8 +1095,204 @@ class ExcelUpstreamTests(unittest.TestCase):
             {"exec_command": "function"},
         )
 
-        self.assertIn("transport envelope was malformed", replay[1]["output"])
+        self.assertIn("its code field did not hold a JSON object", replay[1]["output"])
+        self.assertNotIn("{reason}", replay[1]["output"])
         self.assertNotEqual(replay[1]["output"], "unsupported call: run_officejs")
+
+    COLLABORATION = {
+        "collaboration.spawn_agent": "function",
+        "exec_command": "function",
+        "apply_patch": "custom",
+    }
+
+    def _leaked_replay(self, code: object, call_id: str) -> list:
+        return excel_upstream.translate_input_items(
+            [
+                self._transport_call(call_id, code),
+                {"type": "function_call_output", "call_id": call_id,
+                 "output": "unsupported call: run_officejs"},
+            ],
+            self.COLLABORATION,
+        )
+
+    def test_leaked_relay_call_is_replayed_as_it_was_not_wrapped_again(self):
+        code = {"name": "spawn_agent", "arguments": {"message": "hi", "task_name": "helper"}}
+        leaked = self._transport_call("call_leaked_spawn", code)
+        replay = self._leaked_replay(code, "call_leaked_spawn")
+
+        self.assertEqual(replay[0]["name"], "run_officejs")
+        self.assertEqual(replay[0]["arguments"], leaked["arguments"])
+        self.assertEqual(replay[0]["id"], "fc_call_leaked_spawn")
+        self.assertEqual(json.loads(json.loads(replay[0]["arguments"])["code"])["name"], "spawn_agent")
+        self.assertIn(
+            "spawn_agent is not a tool in the catalog; the catalog calls it collaboration.spawn_agent",
+            replay[1]["output"],
+        )
+
+    def test_rejected_relay_calls_say_why(self):
+        def nested(inner: object, times: int) -> dict:
+            for _ in range(times):
+                inner = {"name": "run_officejs", "arguments": {"code": json.dumps(inner)}}
+            return inner
+
+        cases = {
+            "its code field did not hold a JSON object": "console.log(1)",
+            "it wrapped run_officejs inside run_officejs more than twice": nested(
+                {"name": "exec_command", "arguments": {"cmd": "pwd"}}, 3
+            ),
+            "the object in its code field named no tool": {"arguments": {"cmd": "pwd"}},
+            "shell is not a tool in the catalog": {"name": "shell", "arguments": {}},
+            "apply_patch is a custom tool: its text goes in input": {
+                "name": "apply_patch", "arguments": {"patch": "x"}
+            },
+            "the arguments for exec_command were not a JSON object": {
+                "name": "exec_command", "arguments": "pwd"
+            },
+        }
+        for index, (reason, code) in enumerate(cases.items()):
+            with self.subTest(reason=reason):
+                replay = self._leaked_replay(code, f"call_reason_{index}")
+                self.assertEqual(len(replay), 2)
+                self.assertIn(reason, replay[1]["output"])
+
+        bare = excel_upstream.translate_input_items(
+            [
+                {"type": "function_call", "call_id": "call_reason_bare",
+                 "name": "run_officejs", "arguments": "[1]"},
+                {"type": "function_call_output", "call_id": "call_reason_bare",
+                 "output": "unsupported call: run_officejs"},
+            ],
+            self.COLLABORATION,
+        )
+        self.assertIn("its arguments were not a JSON object", bare[1]["output"])
+
+    def test_converted_calls_say_their_arguments_are_plain(self):
+        source = {
+            "model": "gpt-5.6-sol-excel",
+            "input": "Spawn a helper.",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "message": {"type": "string"},
+                                    "task_name": {"type": "string"},
+                                },
+                                "required": ["message", "task_name"],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+        call = excel_upstream.extract_native_client_tool_call(
+            {
+                "output": [
+                    self._transport_call(
+                        "call_plain_spawn",
+                        {
+                            "name": "collaboration.spawn_agent",
+                            "arguments": {"message": "hi", "task_name": "helper"},
+                        },
+                    )
+                ]
+            },
+            source,
+        )
+
+        self.assertEqual(call["name"], "spawn_agent")
+        self.assertEqual(call["namespace"], "collaboration")
+        self.assertEqual(call["encrypted_function_args"], [])
+
+        replay = excel_upstream.translate_input_items(
+            [
+                {**call, "call_id": "call_plain_spawn_replayed"},
+                {"type": "function_call_output", "call_id": "call_plain_spawn_replayed",
+                 "output": "spawned"},
+            ],
+            {"collaboration.spawn_agent": "function"},
+        )
+        self.assertNotIn("encrypted_function_args", json.dumps(replay))
+        self.assertEqual(replay[0]["name"], "run_officejs")
+        envelope = json.loads(json.loads(replay[0]["arguments"])["code"])
+        self.assertEqual(envelope["name"], "collaboration.spawn_agent")
+        self.assertEqual(envelope["arguments"], {"message": "hi", "task_name": "helper"})
+
+    def test_messages_to_other_agents_are_replayed_readable(self):
+        sealed = "gAAAAA" + "x" * 60 + "=="
+        replay = excel_upstream.translate_input_items(
+            [
+                {
+                    "type": "agent_message",
+                    "author": "/root",
+                    "recipient": "/root/helper",
+                    "content": [
+                        {"type": "input_text", "text": "Message Type: NEW_TASK\nPayload:\n"},
+                        {"type": "encrypted_content", "encrypted_content": "Count the rows."},
+                        {"type": "encrypted_content", "encrypted_content": sealed},
+                    ],
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_readable_output",
+                    "output": [{"type": "encrypted_content", "encrypted_content": "3 rows"}],
+                },
+            ]
+        )
+
+        self.assertEqual(
+            replay[0]["content"][1], {"type": "input_text", "text": "Count the rows."}
+        )
+        self.assertEqual(
+            replay[0]["content"][2], {"type": "encrypted_content", "encrypted_content": sealed}
+        )
+        self.assertEqual(replay[1]["output"], [{"type": "input_text", "text": "3 rows"}])
+
+    def test_without_sealed_content(self):
+        sealed = "gAAAAA" + "y" * 60
+        body = {
+            "input": [
+                {"type": "reasoning", "summary": [], "encrypted_content": sealed},
+                {"type": "agent_message", "content": [
+                    {"type": "input_text", "text": "Payload:"},
+                    {"type": "encrypted_content", "encrypted_content": sealed},
+                ]},
+                {"type": "function_call_output", "call_id": "c", "output": [
+                    {"type": "encrypted_content", "encrypted_content": sealed},
+                ]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            ]
+        }
+
+        kept = excel_upstream.without_sealed_content(body)
+
+        self.assertEqual([item["type"] for item in kept["input"]],
+                         ["agent_message", "function_call_output", "message"])
+        self.assertNotIn(sealed, json.dumps(kept))
+        self.assertEqual(kept["input"][0]["content"][0], {"type": "input_text", "text": "Payload:"})
+        self.assertIn("another backend", kept["input"][1]["output"][0]["text"])
+        plain = {"input": [body["input"][3]]}
+        self.assertIs(excel_upstream.without_sealed_content(plain), plain)
+
+    def test_rebuilt_relay_call_keeps_the_namespace(self):
+        replay = excel_upstream.translate_input_items(
+            [
+                {"type": "function_call", "call_id": "call_rebuilt_spawn",
+                 "namespace": "collaboration", "name": "spawn_agent",
+                 "arguments": json.dumps({"message": "hi", "task_name": "helper"})},
+            ],
+            {"collaboration.spawn_agent": "function"},
+        )
+
+        envelope = json.loads(json.loads(replay[0]["arguments"])["code"])
+        self.assertEqual(envelope["name"], "collaboration.spawn_agent")
+        self.assertNotIn("namespace", replay[0])
 
     def test_nested_plugin_tools_are_forwarded_in_catalog(self):
         source = {
@@ -1160,6 +1356,7 @@ class ExcelUpstreamTests(unittest.TestCase):
         )
         self.assertEqual(tool_call["name"], "js")
         self.assertEqual(tool_call["namespace"], "computer_use")
+        self.assertEqual(tool_call["encrypted_function_args"], [])
         self.assertEqual(
             json.loads(tool_call["arguments"]),
             {"code": "await computer.use()"},
@@ -2305,6 +2502,183 @@ class ExcelSessionPersistenceTests(unittest.TestCase):
                 restored.tools_version_id(),
                 "tools-excel-core-test",
             )
+
+
+
+EXEC_TOOL = {
+    "type": "custom",
+    "name": "exec",
+    "description": "Run JavaScript code to orchestrate/compose tool calls\n"
+    "declare const tools: { exec_command(args: { cmd: string; }): Promise<unknown>; };",
+    "format": {"type": "grammar", "syntax": "lark", "definition": "start: SOURCE\nSOURCE: /[\\s\\S]+/\n"},
+}
+WAIT_TOOL = {"type": "function", "name": "wait", "strict": False,
+             "parameters": {"type": "object", "properties": {"cell_id": {"type": "string"}},
+                            "required": ["cell_id"]}}
+SPAWN_TOOL = {"type": "function", "name": "spawn_agent", "strict": False,
+              "parameters": {"type": "object", "properties": {"message": {"type": "string"}}}}
+
+
+def lite_body(*history: dict, **extra) -> dict:
+    """A request the way Codex sends it with Responses Lite (its own entries for gpt-5.6 and gpt-6)."""
+    return {
+        "model": "gpt-5.6-sol",
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+        "input": [
+            {"type": "additional_tools", "id": "at_1", "role": "developer", "tools": [
+                {"type": "namespace", "name": "functions", "description": "", "tools": [EXEC_TOOL, WAIT_TOOL]},
+                {"type": "namespace", "name": "collaboration", "description": "Sub-agents.",
+                 "tools": [SPAWN_TOOL]},
+            ]},
+            {"type": "message", "id": "msg_base", "role": "developer",
+             "content": [{"type": "input_text", "text": "You are Codex, based on GPT-5."}]},
+            {"type": "message", "role": "developer",
+             "content": [{"type": "input_text", "text": "<permissions instructions>"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Run the check."}]},
+            *history,
+        ],
+        **extra,
+    }
+
+
+class ResponsesLiteTests(unittest.TestCase):
+    def test_tools_and_instructions_come_out_of_the_input(self):
+        body = excel_upstream.from_responses_lite(lite_body())
+
+        self.assertEqual(body["instructions"], "You are Codex, based on GPT-5.")
+        self.assertEqual(
+            body["tools"],
+            [EXEC_TOOL, WAIT_TOOL, {"type": "namespace", "name": "collaboration", "description": "Sub-agents.",
+                                    "tools": [SPAWN_TOOL]}],
+        )
+        self.assertEqual(
+            [part["text"] for item in body["input"] for part in item["content"]],
+            ["<permissions instructions>", "Run the check."],
+        )
+        self.assertEqual(
+            excel_upstream.client_tool_types(body),
+            {"exec": "custom", "wait": "function", "collaboration.spawn_agent": "function"},
+        )
+        self.assertFalse(body["parallel_tool_calls"])
+
+    def test_other_requests_are_left_as_they_are(self):
+        body = {"model": "gpt-5.6-sol-excel", "input": "hi", "tools": [WAIT_TOOL], "instructions": "Be brief."}
+        self.assertIs(excel_upstream.from_responses_lite(body), body)
+        listed = {"model": "gpt-5.6-sol", "tools": [WAIT_TOOL], "input": lite_body()["input"][1:]}
+        self.assertIs(excel_upstream.from_responses_lite(listed), listed)
+
+    def test_tools_already_there_are_kept_and_not_repeated(self):
+        own_wait = {**WAIT_TOOL, "description": "the request's own"}
+        body = excel_upstream.from_responses_lite(
+            lite_body(tools=[own_wait], instructions="Given instructions."))
+
+        self.assertEqual([tool["name"] for tool in body["tools"]], ["wait", "exec", "collaboration"])
+        self.assertEqual(body["tools"][0], own_wait)
+        # Instructions already given stay; the developer message stays in the conversation too.
+        self.assertEqual(body["instructions"], "Given instructions.")
+        self.assertEqual(body["input"][0]["id"], "msg_base")
+
+    def test_the_prepared_request_reads_like_one_with_tools(self):
+        lite = excel_upstream.prepare_responses_body(excel_upstream.from_responses_lite(lite_body()))
+        usual = excel_upstream.prepare_responses_body({
+            "model": "gpt-5.6-sol",
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "instructions": "You are Codex, based on GPT-5.",
+            "tools": [EXEC_TOOL, WAIT_TOOL, {"type": "namespace", "name": "collaboration",
+                                             "description": "Sub-agents.", "tools": [SPAWN_TOOL]}],
+            "input": lite_body()["input"][2:],
+        })
+
+        self.assertEqual(lite, usual)
+        self.assertNotIn("additional_tools", json.dumps(lite))
+        catalog = lite["input"][1]["content"][0]["text"]
+        self.assertIn('{"type":"custom","name":"exec"', catalog)
+        self.assertIn("code mode", catalog)
+        self.assertIn(excel_upstream.CODE_MODE_EXAMPLE, catalog)
+        reminder = lite["input"][2]["content"][0]["text"]
+        self.assertIn(excel_upstream.CODE_MODE_EXAMPLE, reminder)
+        self.assertIn("transport exec", reminder)
+
+    def test_an_exec_call_through_the_transport_becomes_codex_exec(self):
+        source = excel_upstream.from_responses_lite(lite_body())
+        script = 'const r = await tools.exec_command({cmd: "pwd"});\ntext(r.output);'
+        response = {"output": [{
+            "type": "function_call", "id": "fc_exec", "call_id": "call_exec", "name": "run_officejs",
+            "arguments": json.dumps({"code": json.dumps({"name": "exec", "input": script})}),
+        }]}
+
+        calls = excel_upstream.extract_native_client_tool_calls(response, source)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual((calls[0]["type"], calls[0]["name"], calls[0]["input"]), ("custom_tool_call", "exec", script))
+        self.assertNotIn("namespace", calls[0])
+
+    def test_functions_prefix_names_the_plain_tool(self):
+        source = excel_upstream.from_responses_lite(lite_body())
+        response = {"output": [{
+            "type": "function_call", "id": "fc_wait", "call_id": "call_wait", "name": "run_officejs",
+            "arguments": json.dumps({"code": json.dumps({"name": "functions.wait",
+                                                         "arguments": {"cell_id": "1"}})}),
+        }]}
+
+        calls = excel_upstream.extract_native_client_tool_calls(response, source)
+
+        self.assertEqual([(call["type"], call["name"]) for call in calls], [("function_call", "wait")])
+
+    def _rejected(self, code: dict, allowed_tools: dict) -> str:
+        replay = excel_upstream.translate_input_items(
+            [
+                {"type": "function_call", "call_id": "call_no_tool", "name": "run_officejs",
+                 "arguments": json.dumps({"code": json.dumps(code)})},
+                {"type": "function_call_output", "call_id": "call_no_tool",
+                 "output": "unsupported call: run_officejs"},
+            ],
+            allowed_tools,
+        )
+        return replay[1]["output"]
+
+    def test_a_tool_called_directly_in_code_mode_is_pointed_at_exec(self):
+        said = self._rejected({"name": "exec_command", "arguments": {"cmd": "pwd"}},
+                              {"exec": "custom", "wait": "function"})
+        self.assertIn("exec_command is not a tool in the catalog: Codex runs in code mode here", said)
+        self.assertIn(excel_upstream.CODE_MODE_EXAMPLE, said)
+
+    def test_exec_without_code_mode_is_pointed_at_the_catalog_tools(self):
+        # A conversation begun in code mode (Codex's own entries), carried on with the bridge's.
+        for shell in ("exec_command", "shell_command"):
+            with self.subTest(shell=shell):
+                said = self._rejected({"name": "exec", "input": "text(1)"},
+                                      {shell: "function", "apply_patch": "custom"})
+                self.assertIn("exec is not a tool in the catalog: it belongs to Codex's code mode", said)
+                self.assertIn(f"({shell} for shell commands)", said)
+
+    def test_catalog_text_without_code_mode_is_unchanged(self):
+        source = {"model": "gpt-5.6-sol-excel", "input": "hi", "tools": [
+            {"type": "function", "name": "exec_command", "parameters": {"type": "object"}},
+            {"type": "custom", "name": "apply_patch"},
+        ]}
+        catalog = excel_upstream._client_tool_protocol_instructions(source)
+        reminder = excel_upstream._client_tool_protocol_reminder(source)
+
+        self.assertIn(
+            "catalog contains a suitable tool. For repository inspection, invoke a suitable catalog shell tool "
+            "(for example exec_command) through run_officejs. Transport has two layers",
+            catalog,
+        )
+        self.assertIn(
+            '{"name":"TOOL_NAME","input":"RAW_INPUT"}. Do not put JavaScript, OfficeJS, a second run_officejs '
+            "envelope, or a functions.run_officejs wrapper inside code. The field is named code for "
+            "compatibility; it is not JavaScript. Serialize the complete inner object",
+            catalog,
+        )
+        self.assertNotIn("code mode", catalog + reminder)
+        self.assertIn(
+            "The code field is not JavaScript; serialize the inner JSON and escape backslashes and quotes in "
+            'shell commands. Example inner code: {"name":"exec_command","arguments":{"cmd":"pwd"}}. Do not merely',
+            reminder,
+        )
 
 
 if __name__ == "__main__":

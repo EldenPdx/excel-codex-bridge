@@ -9,12 +9,12 @@ the ``function_call`` / ``custom_tool_call`` Codex actually declared, one for
 each call when the model makes several at once.
 
 Two additions of this project's own keep Codex from sending a request again
-when the answer already arrived: Codex takes a stream without
-``response.completed`` as broken and retries it with the finished items in
-the history, and the model then tends to repeat them word for word. So a
-stream the upstream cuts off after its last finished item is completed here,
-and while the upstream is silent ``response.in_progress`` is repeated so that
-Codex's five-minute idle timeout does not fire during long thinking.
+when the answer already arrived or is still coming.  Codex takes a stream
+without ``response.completed`` as broken and retries it with the finished
+items in the history, and the model then tends to repeat them word for word,
+so a stream the upstream cuts off after its last finished item is completed
+here.  And Codex drops a stream it hears nothing from for five minutes, so
+``kept_alive`` fills any silence towards it with ``response.in_progress``.
 """
 
 from __future__ import annotations
@@ -31,18 +31,20 @@ from . import sse as format_translation
 log = logging.getLogger("excel_codex_bridge")
 
 KEEPALIVE_SECONDS = 15.0
+OPENING_EVENTS = {"response.created", "response.in_progress", "response.queued"}
 _TERMINAL_EVENTS = {"response.completed", "response.failed", "response.incomplete"}
 
 
-async def _with_ticks(messages, every: float):
-    """Yield from ``messages``, and ``None`` each time nothing came for ``every`` seconds."""
-    iterator = messages.__aiter__()
+async def _with_ticks(items, wait):
+    """Yield from ``items``, and ``None`` each time nothing came within ``wait()`` seconds (``None``: no limit)."""
+    iterator = items.__aiter__()
     pending = None
     try:
         while True:
             if pending is None:
                 pending = asyncio.ensure_future(iterator.__anext__())
-            done, _ = await asyncio.wait({pending}, timeout=every)
+            limit = wait()
+            done, _ = await asyncio.wait({pending}, timeout=None if limit is None else max(limit, 0.0))
             if not done:
                 yield None
                 continue
@@ -59,6 +61,93 @@ async def _with_ticks(messages, every: float):
         aclose = getattr(iterator, "aclose", None)
         if aclose is not None:
             await aclose()
+
+
+def _event(block: bytes) -> tuple[str, dict | None, bool]:
+    """(the event's type, its response, whether it is whole) for one SSE event's bytes."""
+    name, data = format_translation.parse_sse_block(block.decode("utf-8", "replace"))
+    if data is None:
+        return str(name or "").strip().lower(), None, False
+    if data == "[DONE]":
+        return "", None, True
+    try:
+        payload = json.loads(data)
+    except ValueError:
+        return str(name or "").strip().lower(), None, False
+    if not isinstance(payload, dict):
+        return str(name or "").strip().lower(), None, True
+    response = payload.get("response")
+    kind = str(name or payload.get("type") or "").strip().lower()
+    return kind, response if isinstance(response, dict) else None, True
+
+
+async def kept_alive(chunks, opening: dict, every: float | None = None):
+    """The SSE bytes of ``chunks`` event by event, with something for the client at least every ``every`` seconds.
+
+    Codex drops a stream it hears nothing from for five minutes and sends the
+    request again.  A stream goes quiet while the model thinks (a compaction,
+    which declares no tools, too), while a tool call is held back until it is
+    whole, and before the backend's first event; that silence gets
+    ``response.in_progress``.  Nothing having opened the stream yet,
+    ``opening`` is announced as ``response.created`` instead, and the
+    backend's own opening events are then left out, so the client hears the
+    stream open once.  After the last event, silence stays silence.
+    """
+    every = KEEPALIVE_SECONDS if every is None else every
+    loop = asyncio.get_running_loop()
+    sent_at = loop.time()
+    buffer = b""
+    announced = finished = False
+    beat: bytes | None = None  # response.in_progress, once the stream has opened
+
+    def until_beat() -> float | None:
+        return None if finished else sent_at + every - loop.time()
+
+    def in_progress(response: dict) -> bytes:
+        return format_translation.sse_encode(
+            "response.in_progress", {"type": "response.in_progress", "response": response}
+        )
+
+    cut_off: Exception | None = None
+    try:
+        async for chunk in _with_ticks(chunks, until_beat):
+            if chunk is None:
+                if beat is None:
+                    announced = True
+                    beat = in_progress(opening)
+                    yield format_translation.sse_encode(
+                        "response.created", {"type": "response.created", "response": opening}
+                    )
+                else:
+                    yield beat
+                sent_at = loop.time()
+                continue
+            if buffer.endswith(b"\r") and chunk.startswith(b"\n"):
+                buffer = buffer[:-1]
+            start = max(len(buffer) - 1, 0)  # a blank line may begin at the old end
+            buffer += chunk.replace(b"\r\n", b"\n")
+            end = buffer.find(b"\n\n", start)
+            while end != -1:
+                block, buffer = buffer[: end + 2], buffer[end + 2:]
+                end = buffer.find(b"\n\n")
+                kind, response, _ = _event(block)
+                if kind in OPENING_EVENTS:
+                    if announced:
+                        continue
+                    beat = in_progress(response or opening)
+                elif kind in _TERMINAL_EVENTS:
+                    finished = True
+                yield block
+                sent_at = loop.time()
+    except Exception as exc:  # noqa: BLE001 - raised again below
+        cut_off = exc
+    # The connection can break right after an event, before the blank line
+    # that ends it: that event is still whole.  A cut-off one is left out, as
+    # the client could not read it either.
+    if buffer.strip() and _event(buffer)[2]:
+        yield buffer.rstrip(b"\n") + b"\n\n"
+    if cut_off is not None:
+        raise cut_off
 
 
 def _completed_event_bytes(response_payload: dict) -> bytes:
@@ -119,11 +208,7 @@ def _tool_call_item_event_bytes(tool_call: dict, *, output_index: int) -> list[b
     ]
 
 
-def excel_tool_stream_transform(
-    source_body: dict,
-    *,
-    keepalive_every: float = KEEPALIVE_SECONDS,
-):
+def excel_tool_stream_transform(source_body: dict):
     allowed_tools = excel_upstream.client_tool_types(source_body)
     if not allowed_tools:
         return None
@@ -145,7 +230,6 @@ def excel_tool_stream_transform(
         delta_template: dict = {}
         done_seen = False
         started_response: dict | None = None
-        keepalive: bytes | None = None
         items_added = 0
         finished_items: list[tuple[int, dict]] = []
         finished = False
@@ -242,14 +326,7 @@ def excel_tool_stream_transform(
 
         cut_off: httpx.TransportError | None = None
         try:
-            async for message in _with_ticks(
-                format_translation.iter_sse_messages(byte_iter), keepalive_every
-            ):
-                if message is None:
-                    if keepalive is not None and not finished:
-                        yield keepalive
-                    continue
-                event_name, data = message
+            async for event_name, data in format_translation.iter_sse_messages(byte_iter):
                 if data == "[DONE]":
                     done_seen = True
                     continue
@@ -265,14 +342,8 @@ def excel_tool_stream_transform(
 
                 if event_type in {"response.created", "response.in_progress"}:
                     response = payload.get("response")
-                    if isinstance(response, dict):
-                        if started_response is None:
-                            started_response = dict(response)
-                        if keepalive is None or event_type == "response.in_progress":
-                            keepalive = format_translation.sse_encode(
-                                "response.in_progress",
-                                {"type": "response.in_progress", "response": response},
-                            )
+                    if isinstance(response, dict) and started_response is None:
+                        started_response = dict(response)
                 elif event_type == "response.output_item.added":
                     items_added += 1
                 elif event_type == "response.output_item.done":

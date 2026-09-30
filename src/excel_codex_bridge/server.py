@@ -34,7 +34,7 @@ from . import image_generation
 from . import images
 from . import session
 from . import sse
-from .excel_stream import excel_tool_stream_transform
+from .excel_stream import OPENING_EVENTS, excel_tool_stream_transform, kept_alive
 from .session import SessionReader
 
 log = logging.getLogger("excel_codex_bridge")
@@ -82,7 +82,6 @@ _RECONNECT_ERRORS = (
 )
 # The code of a failure Codex should try again itself, through the ordinary path.
 UPSTREAM_ERROR_CODE = "upstream_error"
-_STREAM_OPENING = {"response.created", "response.in_progress", "response.queued"}
 # How much of a stream is read looking for its first event past the opening ones.
 _STREAM_HEAD_LIMIT = 4 * 1024 * 1024
 _TRY_AGAIN = re.compile(r"(?i)try again in\s*(\d+(?:\.\d+)?)\s*(ms|s|seconds?)\b")
@@ -405,7 +404,7 @@ def _stream_event(block: bytes) -> tuple[bool, dict | None, str | None]:
         return False, None, None
     kind = str(name or payload.get("type") or "").strip().lower()
     response = payload.get("response") if isinstance(payload.get("response"), dict) else None
-    if kind in _STREAM_OPENING:
+    if kind in OPENING_EVENTS:
         return True, response, None
     error = response.get("error") if kind == "response.failed" and response is not None else None
     if isinstance(error, dict) and error.get("code") in RATE_LIMIT_CODES:
@@ -671,7 +670,8 @@ class Bridge:
                 code="model_not_found",
                 param="model",
             )
-        body = {**body, "model": model_id}
+        # Codex's own entries for this model send the tools the Responses Lite way.
+        body = {**excel_upstream.from_responses_lite(body), "model": model_id}
         return await self._signed_in(
             lambda headers: self._send_with_pictures(headers, body), stream=bool(body.get("stream"))
         )
@@ -788,13 +788,14 @@ class Bridge:
         response = await self._send_once(headers, body, original)
         if response.status_code != 400 or "encrypted content" not in _error_text(response).lower():
             return response
-        # A conversation that went on with the bridge off carries reasoning another
-        # backend encrypted; without it the history still reads the same.
-        kept = excel_upstream.without_encrypted_reasoning(body)
+        # A conversation that went on with the bridge off carries reasoning (and
+        # messages between agents) another backend encrypted; without them the
+        # history still reads the same.
+        kept = excel_upstream.without_sealed_content(body)
         if kept is body:
             return response
         log.warning(
-            "the Excel backend could not read reasoning from another backend (%s); "
+            "the Excel backend could not read what another backend encrypted (%s); "
             "sending the conversation without it",
             _error_text(response),
         )
@@ -833,8 +834,10 @@ class Bridge:
                 await upstream.aclose()
             log.warning("upstream returned HTTP %s", upstream.status_code)
             return self._rejected(upstream)
-        # Still trying to reach the backend: Codex hears of a response now, to wait with it.
-        opening = None if upstream is not None else {
+        # The response Codex is told of when the backend has not opened one: at
+        # once while the bridge is still trying to reach it, to wait with it, and
+        # when it stays silent before its first event.
+        opening = {
             "id": f"resp_{uuid.uuid4().hex}", "object": "response", "created_at": int(time.time()),
             "status": "in_progress", "model": upstream_body.get("model"), "output": [],
         }
@@ -842,10 +845,11 @@ class Bridge:
         transform = excel_tool_stream_transform(source_body)
 
         async def relay():
-            source = _PastRateLimits(upstream, send, rate_limit_wait(), reconnect=reconnect, opening=opening,
+            source = _PastRateLimits(upstream, send, rate_limit_wait(), reconnect=reconnect,
+                                     opening=opening if upstream is None else None,
                                      rejected=self._rejected, timeout=self.client.timeout)
+            chunks = kept_alive(transform(source) if transform is not None else source, opening)
             try:
-                chunks = transform(source) if transform is not None else source
                 async for chunk in chunks:
                     yield chunk
             except httpx.TransportError as exc:
@@ -854,6 +858,7 @@ class Bridge:
                 # response.completed and retries on its own.
                 log.warning("upstream stream ended abnormally: %s", type(exc).__name__)
             finally:
+                await chunks.aclose()
                 await source.aclose()
 
         return StreamingResponse(
